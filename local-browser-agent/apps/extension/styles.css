@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { margin: 0; background: Canvas; color: CanvasText; }
+main { padding: 14px; }
+.popup { width: 330px; }
+h1 { margin: 0 0 10px; font-size: 17px; }
+h2 { margin-top: 18px; font-size: 14px; }
+.status { padding: 9px 10px; border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 8px; }
+.status.ok { border-color: #2b8a3e; }
+.status.error { border-color: #c92a2a; }
+label { display: block; margin: 12px 0 5px; font-size: 12px; font-weight: 650; }
+input { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); font: inherit; letter-spacing: .2em; }
+.actions { display: flex; gap: 8px; margin-top: 10px; }
+button { flex: 1; border: 0; border-radius: 8px; padding: 9px 12px; font: inherit; font-weight: 650; cursor: pointer; background: #1677ff; color: white; }
+button.secondary { background: color-mix(in srgb, CanvasText 12%, transparent); color: CanvasText; }
+button.wide { width: 100%; margin-top: 10px; }
+.hint { font-size: 11px; opacity: .72; line-height: 1.45; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px; border-radius: 8px; background: color-mix(in srgb, CanvasText 7%, transparent); font-size: 11px; }

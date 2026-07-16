@@ -60,6 +60,7 @@ function defaultOptions() {
     node: process.env.NODE || "node",
     workspace: process.env.AGENT_WORKSPACE || "",
     extraRoots: process.env.AGENT_EXTRA_ROOTS || "",
+    extraRootsJson: process.env.AGENT_EXTRA_ROOTS_JSON || "",
     mode: process.env.AGENT_MODE || "safe",
     policy: process.env.AGENT_POLICY || "balanced",
     port: process.env.PORT || DEFAULT_PORT,
@@ -78,33 +79,25 @@ function defaultOptions() {
 }
 
 function usage() {
-  console.log(`Local Coding Agent universal CLI
+  console.log(`Local Coding Agent CLI
 
 Usage:
-  lca
-  lca run
-  node scripts/local-coding-agent.mjs setup [options]
-  node scripts/local-coding-agent.mjs install
-  node scripts/local-coding-agent.mjs start [options]
-  node scripts/local-coding-agent.mjs stop
-  node scripts/local-coding-agent.mjs status
-  node scripts/local-coding-agent.mjs workspace
-  node scripts/local-coding-agent.mjs figma [connect|status|tools|open]
-  node scripts/local-coding-agent.mjs keys
-  node scripts/local-coding-agent.mjs cli
-  node scripts/local-coding-agent.mjs doctor
-  node scripts/local-coding-agent.mjs profile [options]
-  node scripts/local-coding-agent.mjs url
-  node scripts/local-coding-agent.mjs logs
-  node scripts/local-coding-agent.mjs config                 # interactive TUI
-  node scripts/local-coding-agent.mjs config show|path|set <key> <value>|unset <key>
-  node scripts/local-coding-agent.mjs key set|clear
-  node scripts/local-coding-agent.mjs update
-  node scripts/local-coding-agent.mjs skills list|validate
+  lca start [--background] [--no-tunnel]
+  lca stop
+  lca status
+  lca doctor
+  lca add [path]
+  lca remove [path]
+  lca reset [path]
+  lca profile
+  lca url
+  lca setup
+  lca config
+  lca figma [connect|status|tools|open]
+  lca update
 
-Common options:
+Options:
   --workspace <path>          Workspace root the agent may access
-  --extra-roots <paths>       Extra roots, semicolon-separated
   --mode <safe|full>          Command guardrail mode
   --policy <strict|balanced|full>
   --port <port>               MCP server port
@@ -121,19 +114,9 @@ Tunnel options:
   --profile-dir <path>        Tunnel profile directory
   --runtime-key-env <name>    Env var containing Runtime API key
   --runtime-key <key>         Runtime API key for this process
-  --choose-os                 With setup, show OS picker instead of auto-detect
-  --save                      With setup, save provided options to config
-  --force                     With update, continue even when local changes exist
 
-Fast path:
-  scripts\\lca.cmd setup       # Windows
-  bash scripts/lca setup       # macOS/Linux
-  node scripts/local-coding-agent.mjs setup
-  lca                         # From any repo, set workspace to git root and run
-
-One-shot examples:
-  node scripts/local-coding-agent.mjs start --workspace "<path-to-repo>" --no-tunnel
-  CONTROL_PLANE_API_KEY=sk-proj-... node scripts/local-coding-agent.mjs start --workspace /path/repo --tunnel-id tunnel_...
+Project commands default to the current Git root when [path] is omitted.
+Use \`lca start --background\` to keep the agent running as a daemon.
 `);
 }
 
@@ -156,7 +139,7 @@ Use --choose-os only when you want instruction mode for another OS.
 
 function parseArgs(argv) {
   if (argv.length === 0) {
-    return { command: "run", rest: [], flags: {} };
+    return { command: "help", rest: [], flags: {} };
   }
   if (argv[0] === "--help" || argv[0] === "-h") {
     return { command: "help", rest: [], flags: { help: true } };
@@ -285,7 +268,51 @@ export function normalize(opts) {
   out.tunnelBin = out.tunnelBin || defaultOptions().tunnelBin;
   out.node = out.node || "node";
   out.noTunnel = toBool(out.noTunnel);
+  let projects = normalizeProjectRoots(out);
+  if (out.workspace) {
+    const primary = resolve(out.workspace);
+    projects = [primary, ...projects.filter((project) => project !== primary)];
+  }
+  out.projects = projects;
+  out.workspace = projects[0] || "";
+  out.extraRoots = projects.slice(1).join(";");
+  delete out.extraRootsJson;
   return out;
+}
+
+export function normalizeProjectRoots(opts = {}) {
+  const candidates = [];
+  if (Array.isArray(opts.projects) && opts.projects.length) {
+    candidates.push(...opts.projects);
+  } else {
+    if (opts.workspace) candidates.push(opts.workspace);
+    const json = String(opts.extraRootsJson || "").trim();
+    let parsedJson = false;
+    if (json) {
+      try {
+        const parsed = JSON.parse(json);
+        if (Array.isArray(parsed)) {
+          candidates.push(...parsed);
+          parsedJson = true;
+        }
+      } catch {
+        // Fall back to the legacy semicolon-separated value.
+      }
+    }
+    if (!parsedJson) candidates.push(...String(opts.extraRoots || "").split(";"));
+  }
+  const seen = new Set();
+  const roots = [];
+  for (const candidate of candidates) {
+    const text = String(candidate || "").trim();
+    if (!text) continue;
+    const project = resolve(text);
+    const key = process.platform === "win32" ? project.toLowerCase() : project;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    roots.push(project);
+  }
+  return roots;
 }
 
 export function setupSecurityDefaults(flags = {}) {
@@ -462,8 +489,10 @@ function validate(opts, { requireWorkspace = false, requireTunnel = false } = {}
   const port = Number(opts.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be a TCP port.");
   if (requireWorkspace) {
-    if (!opts.workspace) throw new Error("Missing workspace. Run `setup` or pass --workspace.");
-    if (!existsSync(opts.workspace)) throw new Error(`Workspace does not exist: ${opts.workspace}`);
+    if (!opts.projects?.length) throw new Error("No projects configured. Run `lca add [path]` or `lca reset [path]` first.");
+    for (const project of opts.projects) {
+      if (!isDirectory(project)) throw new Error(`Project directory does not exist: ${project}`);
+    }
   }
   if (requireTunnel && !opts.noTunnel) {
     if (!opts.tunnelId) throw new Error("Missing tunnel ID. Run `setup` or pass --tunnel-id.");
@@ -479,7 +508,7 @@ function configId(opts) {
   const serverPath = join(SERVER_DIR, SERVER_SCRIPT);
   const figmaBridgePath = join(SERVER_DIR, "figma-desktop.mjs");
   const material = JSON.stringify({
-    workspace: resolve(opts.workspace || ""),
+    projects: opts.projects || [],
     mode: opts.mode,
     policy: opts.policy,
     extraRoots: opts.extraRoots || "",
@@ -1098,7 +1127,7 @@ async function setup(flags) {
 
     printStep(4, 9, "Configure agent defaults");
     cfg.node = cfg.node || "node";
-    cfg.workspace = await promptLine(rl, "Default workspace root", cfg.workspace || process.cwd());
+    cfg.workspace = await promptLine(rl, "First project root", cfg.workspace || process.cwd());
     const securityDefaults = setupSecurityDefaults(flags);
     cfg.mode = (await promptChoice(rl, "Mode", [{ id: "full", label: "full" }, { id: "safe", label: "safe" }], securityDefaults.mode)).id;
     cfg.policy = (await promptChoice(rl, "Policy", [
@@ -1148,8 +1177,9 @@ async function setup(flags) {
 
     printStep(8, 9, "Save config and install lca command");
     cfg.runtimeKey = "";
-    validate(cfg);
-    await saveConfig(stripRuntimeFields(cfg));
+    const normalizedCfg = normalize(cfg);
+    validate(normalizedCfg);
+    await saveConfig(stripRuntimeFields(normalizedCfg));
     const cliPath = await installCliCommand();
 
     printStep(9, 9, "Verify");
@@ -1157,14 +1187,8 @@ async function setup(flags) {
     await status({ json: false });
     console.log("\nSetup complete.");
     console.log("Daily use:");
-    if (process.platform === "win32") {
-      console.log("  Open a new terminal");
-      console.log("  cd /d <path-to-your-repo>");
-      console.log("  lca");
-    } else {
-      console.log("  cd /path/to/repo");
-      console.log("  lca");
-    }
+    console.log("  lca add /path/to/another-project");
+    console.log("  lca start --background");
     console.log(`Health: http://127.0.0.1:${cfg.port}/healthz`);
   } finally {
     rl.close();
@@ -1276,6 +1300,7 @@ async function start(flags) {
       AGENT_POLICY: opts.policy,
       AGENT_CONFIG_ID: id,
       AGENT_EXTRA_ROOTS: opts.extraRoots || "",
+      AGENT_EXTRA_ROOTS_JSON: JSON.stringify(opts.projects.slice(1)),
       MCP_AUTH_TOKEN: opts.authToken || ""
     };
     const stdio = flags.background ? ["ignore", "ignore", "ignore"] : "inherit";
@@ -1407,6 +1432,7 @@ async function status(flags) {
     pid_path: PID_PATH,
     log_path: LOG_PATH,
     mcp_url: `http://127.0.0.1:${opts.port}/mcp`,
+    projects: opts.projects,
     server: health || null,
     pids: {
       server: state.serverPid || null,
@@ -1419,6 +1445,8 @@ async function status(flags) {
   else {
     console.log(`Config:    ${data.config_path}`);
     console.log(`MCP URL:   ${data.mcp_url}`);
+    console.log(`Projects:  ${data.projects.length}`);
+    for (const project of data.projects) console.log(`  - ${project}`);
     console.log(`Server:    ${health ? `ONLINE ${health.version || ""} (${health.mode || "mode?"}/${health.policy || "policy?"}) pid=${health.pid || "?"}` : "offline"}`);
     console.log(`Tunnel:    ${data.pids.tunnel_alive ? `running pid=${data.pids.tunnel}` : "unknown/offline"}`);
   }
@@ -1431,7 +1459,8 @@ async function doctor(flags) {
   add("server directory", existsSync(SERVER_DIR), SERVER_DIR);
   add("server.mjs", existsSync(join(SERVER_DIR, SERVER_SCRIPT)), join(SERVER_DIR, SERVER_SCRIPT));
   add("server node_modules", existsSync(join(SERVER_DIR, "node_modules")), join(SERVER_DIR, "node_modules"));
-  add("workspace", Boolean(opts.workspace && existsSync(opts.workspace)), opts.workspace || "(not set)");
+  add("projects configured", opts.projects.length > 0, opts.projects.length ? `${opts.projects.length} project(s)` : "none; run lca add [path]");
+  for (const project of opts.projects) add("project", isDirectory(project), project);
   add("tunnel-client", opts.noTunnel || existsSync(opts.tunnelBin), opts.noTunnel ? "disabled" : opts.tunnelBin);
   add("runtime key", opts.noTunnel || Boolean(process.env[opts.runtimeKeyEnv] || opts.runtimeKey), opts.noTunnel ? "disabled" : opts.runtimeKeyEnv);
   const rg = await capture(process.platform === "win32" ? "rg.exe" : "rg", ["--version"]);
@@ -1499,11 +1528,12 @@ async function promptConfigWizard() {
       } else if (action.id === "show") {
         console.log(JSON.stringify(redactConfigForDisplay(cfg), null, 2));
       } else if (action.id === "save") {
-        validate(cfg);
-        await saveConfig(stripRuntimeFields(cfg));
+        const normalizedCfg = normalize(cfg);
+        validate(normalizedCfg);
+        await saveConfig(stripRuntimeFields(normalizedCfg));
         saved = true;
         console.log("Saved config.");
-        const restarted = await restartIfRunning(beforeCfg, cfg);
+        const restarted = await restartIfRunning(beforeCfg, normalizedCfg);
         if (!restarted) console.log("Agent is not running; next `lca` will use the new config.");
         break;
       } else if (action.id === "cancel") {
@@ -1703,6 +1733,83 @@ async function runCurrentWorkspace(flags) {
   return start({ ...flags, workspace });
 }
 
+async function resolveProjectArgument(rest, flags = {}) {
+  if (rest.length > 1) throw new Error("Expected at most one project path.");
+  return resolve(rest[0] || flags.workspace || await detectWorkspaceRoot());
+}
+
+function effectiveProjectCommandOptions(flags = {}) {
+  const configFlags = { ...flags };
+  delete configFlags.workspace;
+  delete configFlags.extraRoots;
+  return effectiveOptions(configFlags);
+}
+
+function projectConfig(opts, projects) {
+  const roots = normalizeProjectRoots({ projects });
+  return normalize({
+    ...opts,
+    projects: roots,
+    workspace: roots[0] || "",
+    extraRoots: roots.slice(1).join(";")
+  });
+}
+
+function printProjectList(projects) {
+  console.log(`Projects: ${projects.length}`);
+  for (const project of projects) console.log(`  - ${project}`);
+}
+
+async function addProjectCommand(rest, flags) {
+  const before = effectiveProjectCommandOptions(flags);
+  const project = await resolveProjectArgument(rest, flags);
+  if (!isDirectory(project)) throw new Error(`Project directory does not exist: ${project}`);
+  if (before.projects.includes(project)) {
+    console.log(`Already added: ${project}`);
+    printProjectList(before.projects);
+    return;
+  }
+  const next = projectConfig(before, [...before.projects, project]);
+  await saveConfig(stripRuntimeFields(next));
+  console.log(`Added: ${project}`);
+  printProjectList(next.projects);
+  const restarted = await restartIfRunning(before, next);
+  if (!restarted) console.log("Agent is offline. Start it with: lca start --background");
+}
+
+async function removeProjectCommand(rest, flags) {
+  const before = effectiveProjectCommandOptions(flags);
+  const project = await resolveProjectArgument(rest, flags);
+  if (!before.projects.includes(project)) {
+    console.log(`Not registered: ${project}`);
+    printProjectList(before.projects);
+    return;
+  }
+  const next = projectConfig(before, before.projects.filter((item) => item !== project));
+  await saveConfig(stripRuntimeFields(next));
+  console.log(`Removed: ${project}`);
+  printProjectList(next.projects);
+  const running = await runningStatusForConfig(before);
+  if (!running.running) return;
+  if (!next.projects.length) {
+    console.log("No projects remain; stopping the running agent.");
+    await stop(before);
+    return;
+  }
+  await restartIfRunning(before, next);
+}
+
+async function resetProjectsCommand(rest, flags) {
+  const before = effectiveProjectCommandOptions(flags);
+  const project = await resolveProjectArgument(rest, flags);
+  if (!isDirectory(project)) throw new Error(`Project directory does not exist: ${project}`);
+  const next = projectConfig(before, [project]);
+  await saveConfig(stripRuntimeFields(next));
+  console.log(`Reset projects to: ${project}`);
+  const restarted = await restartIfRunning(before, next);
+  if (!restarted) console.log("Agent is offline. Start it with: lca start --background");
+}
+
 function isDirectory(path) {
   try {
     return statSync(path).isDirectory();
@@ -1859,6 +1966,9 @@ async function main() {
   if (command === "install") return installDeps(effectiveOptions(flags));
   if (command === "cli") return cliCommand();
   if (command === "keys") return keysCommand();
+  if (command === "add") return addProjectCommand(rest, flags);
+  if (command === "remove") return removeProjectCommand(rest, flags);
+  if (command === "reset") return resetProjectsCommand(rest, flags);
   if (command === "workspace") return workspaceCommand(flags);
   if (command === "figma") return figmaCommand(rest, flags);
   if (command === "start") return start(flags);

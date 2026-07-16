@@ -1,0 +1,38 @@
+{
+  "name": "local-browser-agent",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "description": "Local MCP server and Chromium extension for visual review, Cheerio scraping, and browser control.",
+  "bin": {
+    "lba": "scripts/lba.mjs"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:server": "node scripts/build.mjs server",
+    "build:extension": "node scripts/build.mjs extension",
+    "dev:server": "tsx apps/server/src/index.ts",
+    "start": "node dist/server/index.mjs",
+    "lba": "node scripts/lba.mjs",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "cheerio": "^1.2.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.6",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

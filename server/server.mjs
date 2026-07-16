@@ -764,14 +764,14 @@ function registerCompanionTools(mcp) {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         query: z.string().optional().describe("Search text, usually what the user typed after @. @/ or empty returns top-level context."),
-        path: z.string().optional().describe("Root dir to search. Defaults to the active workspace root."),
+        path: z.string().optional().describe("Specific project root or subdirectory to search. Omit to search every configured project root."),
         include: z.array(z.enum(["file", "folder", "symbol", "skill"])).optional().describe("Context kinds to include."),
         limit: z.number().int().min(1).max(100).optional()
       }
     },
-    async ({ query = "", path: rel = ".", include, limit = 30 }) => {
-      const rootDir = resolvePath(rel);
-      const result = await workspaceSearchData(rootDir, query, { include, limit });
+    async ({ query = "", path: rel, include, limit = 30 }) => {
+      const rootDirs = rel ? [resolvePath(rel)] : ROOTS;
+      const result = await workspaceSearchData(rootDirs, query, { include, limit });
       return structuredJsonResult(result);
     }
   );
@@ -804,15 +804,15 @@ function registerCompanionTools(mcp) {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         input: z.string().min(1).describe("User task text, may include @mentions and /commands."),
-        path: z.string().optional().describe("Workspace root to resolve @mentions against."),
+        path: z.string().optional().describe("Specific project root or subdirectory to resolve @mentions against. Omit to use every configured project root."),
         mode: z.enum(WORKFLOW_COMMANDS.map((c) => c.name)).optional().describe("Workflow/mode override."),
         selected_context: z.array(z.string().min(1)).optional().describe("Already-selected file/folder paths from the UI."),
         include_context_pack: z.boolean().optional().describe("Ask ChatGPT to call workspace_snapshot/context tools first.")
       }
     },
-    async ({ input, path: rel = ".", mode, selected_context = [], include_context_pack = true }) => {
-      const rootDir = resolvePath(rel);
-      const result = await composeLcaPrompt(input, rootDir, { mode, selectedContext: selected_context, includeContextPack: include_context_pack });
+    async ({ input, path: rel, mode, selected_context = [], include_context_pack = true }) => {
+      const rootDirs = rel ? [resolvePath(rel)] : ROOTS;
+      const result = await composeLcaPrompt(input, rootDirs, { mode, selectedContext: selected_context, includeContextPack: include_context_pack });
       return structuredJsonResult(result);
     }
   );
@@ -843,6 +843,7 @@ function registerLcaInputTool(mcp, name, title, description) {
       const payload = {
         initial_input,
         workspace: PRIMARY_ROOT,
+        projects: ROOTS,
         shortcuts: WORKFLOW_COMMANDS
           .filter(({ name }) => COMPANION_QUICK_ACTIONS.has(name))
           .map(({ command, label, description, type, name }) => ({ command, label, description, type, name }))
@@ -860,6 +861,7 @@ function normalizePickerQuery(value, prefix = "@") {
   if (prefix && text.startsWith(prefix)) text = text.slice(prefix.length);
   if (text === "/" || text === "./") return "";
   if (text.startsWith("/") && prefix === "@") text = text.slice(1);
+  try { text = decodeURIComponent(text); } catch { /* Incomplete percent escape while the user is typing. */ }
   return text.trim();
 }
 
@@ -895,6 +897,12 @@ function scoreSearchCandidate(rawQuery, fields, { base = 0, emptyScore = 1 } = {
     score += fuzzy;
   }
   return score;
+}
+
+function exactSearchBonus(query, candidate, bonus = 500) {
+  const left = String(query || "").trim().toLowerCase();
+  const right = String(candidate || "").trim().toLowerCase();
+  return left && left === right ? bonus : 0;
 }
 
 function bestFuzzyWordScore(token, words) {
@@ -937,53 +945,157 @@ function normalizeInclude(include, fallback) {
   return new Set(Array.isArray(include) && include.length ? include : fallback);
 }
 
-async function workspaceSearchData(rootDir, query, { include, limit = 30 } = {}) {
+function configuredRootForPath(abs) {
+  const matches = ROOTS.filter((root) => isWithinRoots(abs, [root]));
+  return matches.sort((a, b) => b.length - a.length)[0] || abs;
+}
+
+function projectRootLabels(roots = ROOTS) {
+  const parts = roots.map((root) => path.resolve(root).split(path.sep).filter(Boolean));
+  const labels = new Map();
+  roots.forEach((root, index) => {
+    let depth = 1;
+    let label = parts[index].slice(-depth).join("/") || root;
+    while (depth < parts[index].length) {
+      const collisions = parts.filter((segments) => segments.slice(-depth).join("/") === label).length;
+      if (collisions === 1) break;
+      depth++;
+      label = parts[index].slice(-depth).join("/") || root;
+    }
+    labels.set(comparePath(root), label);
+  });
+  return labels;
+}
+
+function encodeMentionPath(value) {
+  return String(value || "").split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+function projectRelativePath(projectRoot, abs) {
+  const rel = path.relative(projectRoot, abs).split(path.sep).join("/");
+  return rel || ".";
+}
+
+function normalizeWorkspaceSearchRoots(rootDirs) {
+  const input = Array.isArray(rootDirs) ? rootDirs : [rootDirs];
+  const seen = new Set();
+  const roots = [];
+  for (const root of input) {
+    if (!root) continue;
+    const resolved = path.resolve(root);
+    const key = comparePath(resolved);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    roots.push(resolved);
+  }
+  return roots.length ? roots : ROOTS;
+}
+
+async function workspaceSearchData(rootDirs, query, { include, limit = 30 } = {}) {
   const q = normalizePickerQuery(query, "@");
   const wanted = normalizeInclude(include, ["file", "folder", "symbol", "skill"]);
+  const searchRoots = normalizeWorkspaceSearchRoots(rootDirs);
+  const labels = projectRootLabels();
   const candidates = [];
+  const engines = [];
   const maxList = Math.max(4000, limit * 120);
-  const listed = await listRepoFilesFast(rootDir, maxList);
+  const maxPerRoot = Math.max(1000, Math.ceil(maxList / searchRoots.length));
 
-  if (wanted.has("file")) {
-    for (const abs of listed.files) {
-      const rel = toRel(abs);
-      const base = path.basename(rel);
-      const score = scoreSearchCandidate(q, [rel, base], { emptyScore: 20 - pathDepth(rel) });
-      if (q && score <= 0) continue;
-      candidates.push({ type: "file", path: rel, label: rel, detail: `file · ${path.dirname(rel) === "." ? "root" : path.dirname(rel)}`, score });
-    }
-  }
+  for (const rootDir of searchRoots) {
+    const projectRoot = configuredRootForPath(rootDir);
+    const project = labels.get(comparePath(projectRoot)) || path.basename(projectRoot) || projectRoot;
+    const listed = await listRepoFilesFast(rootDir, maxPerRoot);
+    engines.push(listed.engine);
 
-  if (wanted.has("folder")) {
-    const dirs = new Set();
-    for (const abs of listed.files) {
-      const rel = path.relative(rootDir, abs).split(path.sep).join("/");
-      const parts = rel.split("/").filter(Boolean);
-      for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+    if (wanted.has("folder")) {
+      const scopeRel = projectRelativePath(projectRoot, rootDir);
+      const scopeLabel = scopeRel === "." ? `${project}/` : `${project}/${scopeRel}/`;
+      const scopeMention = scopeLabel.replace(/\/$/, "");
+      const scopeScore = scoreSearchCandidate(q, [project, scopeRel, scopeLabel, rootDir], { base: 12, emptyScore: 36 - pathDepth(scopeRel) }) + exactSearchBonus(q, scopeMention);
+      if (!q || scopeScore > 12) {
+        candidates.push({
+          type: "folder",
+          path: toRel(rootDir),
+          label: scopeLabel,
+          mention: encodeMentionPath(scopeMention),
+          detail: `project root · ${projectRoot}`,
+          project,
+          project_root: projectRoot,
+          score: scopeScore
+        });
+      }
     }
-    for (const rel of dirs) {
-      const label = `${rel}/`;
-      const score = scoreSearchCandidate(q, [rel, label, path.basename(rel)], { base: 4, emptyScore: 24 - pathDepth(rel) });
-      if (q && score <= 0) continue;
-      candidates.push({ type: "folder", path: rel, label, detail: "folder", score });
-    }
-  }
 
-  if (wanted.has("symbol")) {
-    const symbols = await scanSymbols(rootDir, { maxFiles: 600, maxMatches: 2000 });
-    for (const sym of symbols) {
-      const score = scoreSearchCandidate(q, [sym.name, sym.kind, sym.path], { base: 8, emptyScore: 0 });
-      if (!q || score <= 8) continue;
-      candidates.push({
-        type: "symbol",
-        path: sym.path,
-        line: sym.line,
-        symbol: sym.name,
-        kind: sym.kind,
-        label: `${sym.name} — ${sym.path}:${sym.line}`,
-        detail: `${sym.kind} symbol`,
-        score
-      });
+    if (wanted.has("file")) {
+      for (const abs of listed.files) {
+        const rel = projectRelativePath(projectRoot, abs);
+        const display = `${project}/${rel}`;
+        const base = path.basename(rel);
+        const score = scoreSearchCandidate(q, [display, rel, toRel(abs), base, project], { emptyScore: 20 - pathDepth(rel) }) + exactSearchBonus(q, display);
+        if (q && score <= 0) continue;
+        candidates.push({
+          type: "file",
+          path: toRel(abs),
+          label: display,
+          mention: encodeMentionPath(display),
+          detail: `file · ${project} · ${path.dirname(rel) === "." ? "root" : path.dirname(rel)}`,
+          project,
+          project_root: projectRoot,
+          score
+        });
+      }
+    }
+
+    if (wanted.has("folder")) {
+      const dirs = new Set();
+      for (const abs of listed.files) {
+        const rel = path.relative(rootDir, abs).split(path.sep).join("/");
+        const parts = rel.split("/").filter(Boolean);
+        for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+      }
+      for (const localRel of dirs) {
+        const abs = path.resolve(rootDir, localRel);
+        const rel = projectRelativePath(projectRoot, abs);
+        const display = `${project}/${rel}/`;
+        const folderMention = display.replace(/\/$/, "");
+        const score = scoreSearchCandidate(q, [display, rel, localRel, path.basename(rel), project], { base: 4, emptyScore: 24 - pathDepth(rel) }) + exactSearchBonus(q, folderMention);
+        if (q && score <= 4) continue;
+        candidates.push({
+          type: "folder",
+          path: toRel(abs),
+          label: display,
+          mention: encodeMentionPath(folderMention),
+          detail: `folder · ${project}`,
+          project,
+          project_root: projectRoot,
+          score
+        });
+      }
+    }
+
+    if (wanted.has("symbol")) {
+      const symbols = await scanSymbols(rootDir, { maxFiles: 600, maxMatches: 2000, files: listed.files });
+      for (const sym of symbols) {
+        const abs = path.isAbsolute(sym.path) ? sym.path : path.resolve(PRIMARY_ROOT, sym.path);
+        const rel = projectRelativePath(projectRoot, abs);
+        const display = `${project}/${rel}`;
+        const symbolMention = `${project}:${sym.name}`;
+        const score = scoreSearchCandidate(q, [sym.name, sym.kind, display, rel, project, symbolMention], { base: 8, emptyScore: 0 }) + exactSearchBonus(q, symbolMention);
+        if (!q || score <= 8) continue;
+        candidates.push({
+          type: "symbol",
+          path: toRel(abs),
+          line: sym.line,
+          symbol: sym.name,
+          kind: sym.kind,
+          label: `${sym.name} — ${display}:${sym.line}`,
+          mention: encodeMentionPath(symbolMention),
+          detail: `${sym.kind} symbol · ${project}`,
+          project,
+          project_root: projectRoot,
+          score
+        });
+      }
     }
   }
 
@@ -1005,7 +1117,15 @@ async function workspaceSearchData(rootDir, query, { include, limit = 30 } = {})
 
   candidates.sort((a, b) => b.score - a.score || a.label.localeCompare(b.label));
   const results = candidates.slice(0, limit).map((item) => ({ ...item, score: Math.round(item.score * 100) / 100 }));
-  return { query, normalized_query: q, root: toRel(rootDir), engine: listed.engine, count: results.length, results };
+  const uniqueEngines = [...new Set(engines)];
+  return {
+    query,
+    normalized_query: q,
+    roots: searchRoots.map((root) => toRel(root)),
+    engine: uniqueEngines.length === 1 ? uniqueEngines[0] : `multi:${uniqueEngines.join("+")}`,
+    count: results.length,
+    results
+  };
 }
 
 async function slashCommandData(query, { include, limit = 30 } = {}) {
@@ -1065,7 +1185,7 @@ function workflowByName(name) {
   return WORKFLOW_COMMANDS.find((cmd) => cmd.name === key || cmd.command.slice(1) === key) || null;
 }
 
-async function composeLcaPrompt(input, rootDir, { mode, selectedContext = [], includeContextPack = true } = {}) {
+async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], includeContextPack = true } = {}) {
   const slashTokens = extractSlashTokens(input);
   const mentionTokens = extractMentionTokens(input);
   const explicitMode = slashTokens.map((token) => token.split(":")[0]).find((token) => workflowByName(token)) || mode;
@@ -1080,14 +1200,23 @@ async function composeLcaPrompt(input, rootDir, { mode, selectedContext = [], in
     try {
       const abs = resolvePath(item);
       const info = await stat(abs).catch(() => null);
-      resolved.push({ type: info?.isDirectory() ? "folder" : "file", path: toRel(abs), label: toRel(abs) });
+      const projectRoot = configuredRootForPath(abs);
+      const project = projectRootLabels().get(comparePath(projectRoot)) || path.basename(projectRoot) || projectRoot;
+      const rel = projectRelativePath(projectRoot, abs);
+      resolved.push({
+        type: info?.isDirectory() ? "folder" : "file",
+        path: toRel(abs),
+        label: `${project}/${rel}`,
+        project,
+        project_root: projectRoot
+      });
     } catch {
       unresolved.push(item);
     }
   }
 
   for (const token of mentionTokens) {
-    const search = await workspaceSearchData(rootDir, token, { include: ["file", "folder", "symbol", "skill"], limit: 1 });
+    const search = await workspaceSearchData(rootDirs, token, { include: ["file", "folder", "symbol", "skill"], limit: 1 });
     if (search.results.length) resolved.push(search.results[0]);
     else unresolved.push(`@${token}`);
   }

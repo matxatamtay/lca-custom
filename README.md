@@ -13,17 +13,18 @@ Local MCP server giúp ChatGPT Web đọc/sửa code, chạy command và xem git
 
 ## Cài Nhanh
 
-Bạn chỉ cần làm 3 bước:
+Bạn chỉ cần làm 4 bước:
 
 1. Chạy setup wizard trong repo `local-coding-agent`.
-2. Vào repo muốn làm việc và chạy `lca`.
-3. Thêm custom MCP connector trong ChatGPT Web.
+2. Cấu hình project bằng `lca reset` và `lca add`.
+3. Chạy agent nền bằng `lca start --background`.
+4. Thêm custom MCP connector trong ChatGPT Web.
 
 Yêu cầu:
 
 - Node.js >= 18
 - npm
-- Git, khuyên dùng để `lca` tự lấy git root làm workspace
+- Git, khuyên dùng để các lệnh project tự lấy Git root hiện tại
 - OpenAI Tunnel ID và Runtime API key nếu dùng ChatGPT Web tunnel
 
 Chạy setup wizard:
@@ -44,32 +45,29 @@ Nếu cần xem hướng dẫn cho hệ điều hành khác máy đang chạy, d
 
 ## Dùng Hằng Ngày
 
-Mỗi lần muốn ChatGPT làm việc trên repo nào, hãy mở terminal tại repo đó rồi chạy `lca`. LCA sẽ tự nhận git root làm workspace.
-
-Trên Windows, mở terminal mới sau setup rồi chạy:
-
-```powershell
-cd /d <path-to-your-repo>
-lca
-```
-
-macOS/Linux:
+LCA chạy như một service nền và có thể truy cập nhiều project cùng lúc:
 
 ```bash
-cd /path/to/your-repo
-lca
+lca reset /path/to/main-project  # xoá danh sách cũ, đặt project chính
+lca add /path/to/second-project  # thêm project
+lca add                          # thêm Git root của thư mục hiện tại
+lca remove /path/to/project      # gỡ project
+lca reset                        # chỉ giữ Git root của thư mục hiện tại
+lca start --background           # chạy server + tunnel dưới nền
 ```
 
-Nếu server đang chạy workspace cũ, `lca` sẽ tự restart sang workspace mới.
+Khi agent đang chạy, `add`, `remove` và `reset` tự restart service để áp dụng danh sách mới.
 
 Lệnh chính:
 
 ```bash
-lca           # set workspace = repo hiện tại, start server + tunnel
+lca start --background
+lca add [path]
+lca remove [path]
+lca reset [path]
 lca stop      # dừng server + tunnel
 lca status    # xem trạng thái
-lca workspace # mở TUI chọn workspace
-lca config    # mở TUI cấu hình mode/policy/workspace/port
+lca config    # mở TUI cấu hình mode/policy/port
 lca doctor    # kiểm tra cấu hình local
 ```
 
@@ -87,13 +85,14 @@ Chi tiết: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WEB_CONNECTOR.md).
 Tóm tắt:
 
 1. Chạy `lca setup`.
-2. Vào repo cần làm việc, chạy `lca`.
-3. Mở ChatGPT Web.
-4. Settings -> Connectors -> Developer mode -> Add custom MCP connector.
-5. Chọn tunnel đã tạo.
-6. Auth: chọn `No auth`.
-7. Lưu connector.
-8. Trong ChatGPT, gọi tool `lca` hoặc `workspace_info` để kiểm tra workspace thật.
+2. Cấu hình project bằng `lca reset` và `lca add`.
+3. Chạy `lca start --background`.
+4. Mở ChatGPT Web.
+5. Settings -> Connectors -> Developer mode -> Add custom MCP connector.
+6. Chọn tunnel đã tạo.
+7. Auth: chọn `No auth`.
+8. Lưu connector.
+9. Trong ChatGPT, gọi tool `lca` hoặc `workspace_info` để kiểm tra các root thật.
 
 Runtime API key nằm ở `.env.local` và chỉ dùng cho local tunnel-client. Không nhập Runtime API key vào phần auth của ChatGPT connector.
 
@@ -112,7 +111,7 @@ lca_input  # mở Apps SDK widget, có thể ghim PiP để nhập task trong l�
 
 `lca_input` mở widget ngay trong ChatGPT để nhập task có context rõ hơn. Widget này dùng:
 
-- `@...` để chọn file, folder, symbol hoặc skill trong workspace.
+- `@...` để chọn file, folder, symbol hoặc skill trên toàn bộ project đã đăng ký bằng `lca add`.
 - `/...` để gọi workflow hoặc skill, ví dụ `/debug`, `/review`, `/implement`, `/refactor`, `/skill:<name>`.
 - Nút **PiP** yêu cầu ChatGPT ghim composer thành cửa sổ nổi để vẫn dùng được trong lúc tiếp tục chat.
 - Nút nhanh **Plan** là quick action; không chèn chữ vào input.
@@ -128,7 +127,7 @@ ChatGPT luôn mở app ở inline trước, nên cần bấm **PiP** một lần
 
 Các tool nền phía sau:
 
-- `workspace_search`: autocomplete cho `@...`.
+- `workspace_search`: autocomplete cho `@...` trên tất cả project đã add; kết quả hiển thị dạng `project-name/path/to/file` để phân biệt file trùng tên.
 - `slash_commands`: autocomplete cho `/...`.
 - `compose_prompt`: parse input, resolve context đã chọn, và tạo prompt sẵn để gửi vào ChatGPT.
 
@@ -205,18 +204,9 @@ Config CLI nằm trong thư mục app config của hệ điều hành. Xem path:
 lca config path
 ```
 
-## Workspace Là Gì
+## Project Roots Là Gì
 
-Workspace là thư mục ChatGPT được phép đọc/sửa/chạy command thông qua connector.
-
-Khi chạy:
-
-```bash
-cd /path/to/repo
-lca
-```
-
-workspace sẽ là git root của repo đó. Nếu không nằm trong git repo, workspace là thư mục hiện tại.
+Project roots là danh sách thư mục ChatGPT được phép đọc/sửa/chạy command thông qua connector. Project đầu tiên là root chính; các project thêm bằng `lca add` được truyền an toàn qua `AGENT_EXTRA_ROOTS_JSON`.
 
 ## Bảo Mật
 

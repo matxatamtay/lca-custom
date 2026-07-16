@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Local Browser Agent",
+  "version": "0.3.0",
+  "description": "Visual review, Cheerio scraping, DevTools capture, navigation, and browser interaction for a trusted local MCP server.",
+  "minimum_chrome_version": "118",
+  "permissions": ["activeTab", "debugger", "storage", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Local Browser Agent",
+    "default_popup": "popup.html"
+  },
+  "devtools_page": "devtools.html",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

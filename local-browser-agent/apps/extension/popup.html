@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Local Browser Agent</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="popup">
+  <main>
+    <h1>Local Browser Agent</h1>
+    <p id="status" class="status">Checking local bridge…</p>
+    <label for="pairing-code">Pairing code</label>
+    <input id="pairing-code" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code">
+    <div class="actions">
+      <button id="pair">Pair</button>
+      <button id="reconnect" class="secondary">Reconnect</button>
+    </div>
+    <button id="allow-tab" class="wide">Allow full control for active tab</button>
+    <p id="tab-status" class="hint">No tab approved in this popup yet.</p>
+    <p class="hint">Pairing connects the extension. Full control is granted per tab, survives HTTP/HTTPS navigation, expires after eight hours, and ends when the tab closes.</p>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

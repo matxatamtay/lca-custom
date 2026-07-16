@@ -13,7 +13,7 @@ ChatGPT sessions; it is a normal MCP connector you authorize.
 | Group | Tools |
 |-------|-------|
 | Info | `workspace_info`, `ping` |
-| Read | `repo_overview`, `list_files`, `find_files`, `read_file`, `read_many` (concurrent + line ranges), `stat_path`, `search_text` (ripgrep/git, with context + glob) |
+| Read | `repo_overview`, `list_files`, `find_files`, `read_file`, `read_many` (concurrent + line ranges), `stat_path`, `search_text` (ripgrep/git, with context + glob), `workspace_search` (multi-project `@` autocomplete) |
 | Figma Desktop | `figma_status`, `figma_list_tools`, `figma_call_tool`, `figma_get_design_context`, `figma_get_screenshot`, `figma_get_metadata`, `figma_get_variable_defs`, `figma_get_code_connect_map`, `figma_get_figjam` |
 | Write | `write_file`, `replace_in_file`, `apply_patch`, `make_dir`, `move_path`, `delete_path` |
 | Execute | `run_command`, `run_commands` (bounded batch; cmd/powershell/bash/sh/zsh) |

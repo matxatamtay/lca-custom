@@ -458,7 +458,7 @@
     function selectItem(item) {
       if (!current) return;
       if (current.prefix === '@') {
-        const token = item.type === 'skill' ? `@skill:${item.skill || item.name}` : `@${item.path || item.label}`;
+        const token = item.type === 'skill' ? `@skill:${item.skill || item.name}` : `@${item.mention || item.path || item.label}`;
         replaceRange(current.start, current.end, `${token} `);
         if (item.path && !selected.includes(item.path)) selected.push(item.path);
       } else {

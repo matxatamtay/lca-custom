@@ -4,7 +4,7 @@
 
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Script } from "node:vm";
@@ -52,7 +52,7 @@ async function waitForHealth(port, stderrRef) {
   throw new Error(`Server did not become ready on port ${port}\n${stderrRef.value}`);
 }
 
-async function startServer(workspace) {
+async function startServer(workspace, extraRoots = []) {
   await mkdir(workspace, { recursive: true });
   const port = await getFreePort();
   const stderrRef = { value: "" };
@@ -64,7 +64,7 @@ async function startServer(workspace) {
       AGENT_WORKSPACE: workspace,
       AGENT_MODE: "safe",
       AGENT_POLICY: "full",
-      AGENT_EXTRA_ROOTS_JSON: "[]",
+      AGENT_EXTRA_ROOTS_JSON: JSON.stringify(extraRoots),
       MCP_AUTH_TOKEN: "",
       AGENT_AUDIT: "0"
     },
@@ -112,11 +112,16 @@ async function callJson(client, name, args = {}) {
   return JSON.parse(text);
 }
 
-const base = await mkdtemp(path.join(os.tmpdir(), "lca-pro-"));
+const tempRoot = await mkdtemp(path.join(os.tmpdir(), "lca-pro-"));
+const base = path.join(tempRoot, "primary-project");
+const extraRoot = path.join(tempRoot, "secondary-project");
+const secondaryFile = path.join(extraRoot, "lib", "secondary.js");
+await mkdir(path.dirname(secondaryFile), { recursive: true });
+await writeFile(secondaryFile, "export function secondaryOnly(){ return 'secondary'; }\n", "utf8");
 let server;
 let client;
 try {
-  server = await startServer(base);
+  server = await startServer(base, [extraRoot]);
   client = await connect(server.port);
 
   await callJson(client, "write_file", {
@@ -158,6 +163,15 @@ try {
   check("workspace_search finds @ file context", atSearch.results?.some((r) => r.type === "file" && r.path.endsWith("feature.js")), JSON.stringify(atSearch.results));
   check("workspace_search finds @ symbol context", atSearch.results?.some((r) => r.type === "symbol" && r.symbol === "deepFeature"), JSON.stringify(atSearch.results));
 
+  const multiProjectSearch = await callJson(client, "workspace_search", { query: "@secondary", include: ["file", "folder", "symbol"], limit: 20 });
+  check("workspace_search scans added project roots", multiProjectSearch.results?.some((r) => r.type === "file" && r.path === secondaryFile && r.project === "secondary-project"), JSON.stringify(multiProjectSearch.results));
+  check("workspace_search finds symbols in added projects", multiProjectSearch.results?.some((r) => r.type === "symbol" && r.symbol === "secondaryOnly" && r.path === secondaryFile), JSON.stringify(multiProjectSearch.results));
+  check("workspace_search labels results with project names", multiProjectSearch.results?.some((r) => r.label === "secondary-project/lib/secondary.js" && r.mention === "secondary-project/lib/secondary.js"), JSON.stringify(multiProjectSearch.results));
+  const restrictedSearch = await callJson(client, "workspace_search", { query: "@secondary", path: base, include: ["file", "symbol"], limit: 20 });
+  check("workspace_search path restricts search to one project", !restrictedSearch.results?.some((r) => r.path === secondaryFile), JSON.stringify(restrictedSearch.results));
+  const projectRoots = await callJson(client, "workspace_search", { query: "@", include: ["folder"], limit: 20 });
+  check("workspace_search exposes every project root", projectRoots.results?.some((r) => r.project === "primary-project" && r.path === ".") && projectRoots.results?.some((r) => r.project === "secondary-project" && r.path === extraRoot), JSON.stringify(projectRoots.results));
+
   const slash = await callJson(client, "slash_commands", { query: "/", limit: 20 });
   check("slash_commands omits /plan autocomplete", !slash.commands?.some((c) => c.command === "/plan"), JSON.stringify(slash.commands));
   check("slash_commands shows workflows on empty slash", slash.commands?.some((c) => c.command === "/debug" || c.command === "/implement"), JSON.stringify(slash.commands));
@@ -170,6 +184,10 @@ try {
   check("compose_prompt detects plan mode", composed.mode === "plan", JSON.stringify(composed));
   check("compose_prompt includes selected context", composed.selected_context?.some((c) => c.path === "src/index.js"), JSON.stringify(composed.selected_context));
   check("compose_prompt emits ready prompt", /Use LCA Plan mode/.test(composed.prompt) && /Selected context/.test(composed.prompt), composed.prompt);
+  const composedMultiProject = await callJson(client, "compose_prompt", { input: "review @secondaryOnly" });
+  check("compose_prompt resolves @ context across projects", composedMultiProject.selected_context?.some((c) => c.path === secondaryFile && c.project === "secondary-project"), JSON.stringify(composedMultiProject.selected_context));
+  const composedExactFile = await callJson(client, "compose_prompt", { input: "review @secondary-project/lib/secondary.js" });
+  check("compose_prompt exact project/file mention resolves the file", composedExactFile.selected_context?.some((c) => c.type === "file" && c.path === secondaryFile), JSON.stringify(composedExactFile.selected_context));
   const composedSkill = await callJson(client, "compose_prompt", { input: "check setup /skill:setup-local-coding-agent", mode: "plan" });
   check("typed slash workflow/skill is preserved in compose", composedSkill.mode === "plan" && composedSkill.skills?.includes("setup-local-coding-agent") && /read_skill/.test(composedSkill.prompt), JSON.stringify(composedSkill));
   const slashOverridesButtonMode = await callJson(client, "compose_prompt", { input: "review it /debug", mode: "plan" });
@@ -192,7 +210,7 @@ try {
   check("Apps SDK companion widget resource is listed", resources.resources?.some((r) => r.uri === "ui://widget/lca-compact-input-v2.html"), JSON.stringify(resources.resources));
   const widgetResource = await client.readResource({ uri: "ui://widget/lca-compact-input-v2.html" });
   const widgetHtml = widgetResource.contents?.[0]?.text || "";
-  check("Apps SDK companion widget resource is html", widgetResource.contents?.[0]?.mimeType === "text/html;profile=mcp-app" && widgetHtml.includes("sendFollowUpMessage") && widgetHtml.includes("slash_commands") && widgetHtml.includes("suggestions.scrollTop = 0") && !widgetHtml.includes("Prompt output"), JSON.stringify(widgetResource.contents?.[0]));
+  check("Apps SDK companion widget resource is html", widgetResource.contents?.[0]?.mimeType === "text/html;profile=mcp-app" && widgetHtml.includes("sendFollowUpMessage") && widgetHtml.includes("slash_commands") && widgetHtml.includes("item.mention") && widgetHtml.includes("suggestions.scrollTop = 0") && !widgetHtml.includes("Prompt output"), JSON.stringify(widgetResource.contents?.[0]));
   const widgetScript = widgetHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1] || "";
   let widgetScriptError = "";
   try {
@@ -203,7 +221,7 @@ try {
   check("Apps SDK companion widget script compiles", Boolean(widgetScript) && !widgetScriptError, widgetScriptError || "inline script missing");
   check("Apps SDK companion widget requests PiP from a user action", /id\s*=\s*(['\"])pip\1/.test(widgetHtml) && /pipButton\.addEventListener\(\s*(['\"])click\1\s*,\s*requestPipMode\s*\)/.test(widgetScript) && /requestDisplayMode\(\{\s*mode:\s*(['\"])pip\1\s*\}\)/.test(widgetScript), "PiP button, click handler, or requestDisplayMode({ mode: 'pip' }) missing");
   const lcaInput = await client.callTool({ name: "lca_input", arguments: { initial_input: "fix @deepFeature" } });
-  check("lca_input returns structured widget payload", lcaInput.structuredContent?.initial_input === "fix @deepFeature" && lcaInput.structuredContent?.shortcuts?.length === 1 && lcaInput.structuredContent.shortcuts[0]?.name === "plan" && /LCA input is ready/.test(lcaInput.content?.[0]?.text || ""), JSON.stringify(lcaInput));
+  check("lca_input returns structured widget payload", lcaInput.structuredContent?.initial_input === "fix @deepFeature" && lcaInput.structuredContent?.projects?.length === 2 && lcaInput.structuredContent?.shortcuts?.length === 1 && lcaInput.structuredContent.shortcuts[0]?.name === "plan" && /LCA input is ready/.test(lcaInput.content?.[0]?.text || ""), JSON.stringify(lcaInput));
 
   const doctor = await callJson(client, "workspace_doctor", {});
   check("doctor returns score", Number.isInteger(doctor.score) && doctor.score >= 0 && doctor.score <= 100);
@@ -232,7 +250,7 @@ try {
 } finally {
   if (client) await client.close().catch(() => {});
   if (server) await stopServer(server.child);
-  await rm(base, { recursive: true, force: true });
+  await rm(tempRoot, { recursive: true, force: true });
 }
 
 console.log(`\n==== PRO RESULT: ${pass} passed, ${fail} failed ====`);

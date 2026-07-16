@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Local Browser Agent</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="panel">
+  <main>
+    <h1>Local Browser Agent</h1>
+    <p id="panel-status" class="status">Connecting…</p>
+    <h2>Selected element</h2>
+    <pre id="selected">No element selected.</pre>
+    <p class="hint">When DevTools is open, captures use this companion path because Chromium detaches the extension debugger from the inspected tab.</p>
+  </main>
+  <script type="module" src="panel.js"></script>
+</body>
+</html>

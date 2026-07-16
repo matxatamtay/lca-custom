@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 
 import {
   mergeDotEnvText,
   normalize,
+  normalizeProjectRoots,
   normalizeTunnelArch,
   parseDotEnv,
   ripgrepInstallCommand,
@@ -14,6 +16,24 @@ import {
 
 test("normalizes default CLI port to 8789", () => {
   assert.equal(normalize({}).port, "8789");
+});
+
+test("normalizes and deduplicates multi-project roots", () => {
+  const first = path.resolve("project-a");
+  const second = path.resolve("project-b");
+  assert.deepEqual(normalizeProjectRoots({
+    workspace: first,
+    extraRoots: `${second};${first}`
+  }), [first, second]);
+});
+
+test("normalize keeps the primary project first and derives extra roots", () => {
+  const first = path.resolve("project-a");
+  const second = path.resolve("project-b");
+  const value = normalize({ projects: [first, second], workspace: first });
+  assert.deepEqual(value.projects, [first, second]);
+  assert.equal(value.workspace, first);
+  assert.equal(value.extraRoots, second);
 });
 
 test("maps tunnel-client release assets for supported platforms", () => {

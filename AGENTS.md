@@ -4,7 +4,7 @@ Nếu user yêu cầu cài hoặc hướng dẫn repo này, dùng flow TUI mới
 
 ## What This Is
 
-Local MCP server (`server/server.mjs`) cho ChatGPT Web connector. User chạy global command `lca` trong repo bất kỳ; workspace tự lấy theo git root hiện tại.
+Local MCP server (`server/server.mjs`) cho ChatGPT Web connector. CLI quản lý nhiều project roots và chạy như service nền.
 
 ## Prerequisites
 
@@ -33,21 +33,22 @@ Wizard sẽ cho chọn OS, kiểm tra prerequisite, mở trang Tunnel/API key, t
 
 ## Daily Use
 
-Trong repo cần làm việc:
-
 ```bash
-cd /path/to/repo
-lca
+lca reset /path/to/main-project
+lca add /path/to/another-project
+lca start --background
 ```
 
-Nếu server đang chạy workspace cũ, `lca` tự restart với workspace mới.
+`lca add`, `lca remove` và `lca reset` tự restart agent đang chạy để áp dụng danh sách project mới.
 
 Lệnh thường dùng:
 
 ```bash
 lca stop
 lca status
-lca workspace
+lca add [path]
+lca remove [path]
+lca reset [path]
 lca doctor
 ```
 
