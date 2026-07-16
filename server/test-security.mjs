@@ -10,7 +10,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const ENDPOINT = process.env.TEST_ENDPOINT || "http://127.0.0.1:8789/mcp";
+const ENDPOINT = process.env.TEST_ENDPOINT || "http://127.0.0.1:8790/mcp";
 const client = new Client({ name: "agent-security-test-client", version: "1.0.0" });
 const transport = new StreamableHTTPClientTransport(new URL(ENDPOINT));
 await client.connect(transport);
@@ -36,6 +36,17 @@ async function call(name, args) {
 
 const info = JSON.parse((await call("workspace_info", {})).text);
 const root = info.primary_root;
+const resolvedRoot = path.resolve(root);
+const resolvedTemp = path.resolve(os.tmpdir());
+const isIsolatedTestRoot = resolvedRoot.startsWith(`${resolvedTemp}${path.sep}`) &&
+  path.basename(resolvedRoot).startsWith("lca-security-");
+if (!isIsolatedTestRoot) {
+  await client.close();
+  throw new Error(
+    `Refusing destructive security test outside an isolated temporary workspace: ${resolvedRoot}. ` +
+    "Run npm run test:security, which starts a dedicated safe-mode test server."
+  );
+}
 
 // Default macOS volumes are commonly case-insensitive. A differently-cased
 // absolute path to the same root must remain inside the root after canonicalization.

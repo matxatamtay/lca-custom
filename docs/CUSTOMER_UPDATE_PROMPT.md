@@ -20,7 +20,7 @@ Quy tắc:
 - Không xoá workspace của tôi.
 - Không chạy git reset --hard, git clean hoặc xoá file nếu chưa được duyệt.
 - Nếu repo có local changes, báo git status rồi hỏi trước.
-- Flow chính sau update là cd vào repo cần làm việc rồi chạy lca.
+- Flow chính sau update là cd vào repo cần làm việc rồi chạy lca-custom.
 
 Các bước:
 1. Vào thư mục local-coding-agent.
@@ -30,16 +30,16 @@ Các bước:
 5. Chạy git log --oneline --decorate --max-count=10 HEAD..origin/main.
 6. Chạy git pull --ff-only origin main.
 7. Chạy setup wizard:
-   - macOS/Linux/WSL: bash scripts/lca setup
-   - Windows: scripts\lca.cmd setup
-8. Kiểm tra lca có trong PATH.
+   - macOS/Linux/WSL: bash scripts/lca-custom setup
+   - Windows: scripts\lca-custom.cmd setup
+8. Kiểm tra lca-custom có trong PATH.
 9. Nếu tôi đồng ý restart, chạy:
-   lca stop
+   lca-custom stop
    cd /path/to/workspace
-   lca
+   lca-custom
 10. Verify:
-   - http://127.0.0.1:8789/healthz
-   - lca status
+   - http://127.0.0.1:8790/healthz
+   - lca-custom status
 11. Báo lại commit hiện tại, health URL, workspace hiện tại, mode/policy và tunnel status.
 ```
 

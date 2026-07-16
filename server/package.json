@@ -13,12 +13,13 @@
   "scripts": {
     "start": "node server.mjs",
     "test:agent": "node test-agent.mjs",
-    "test:security": "node test-security.mjs",
+    "test:security": "node test-security-runner.mjs",
     "test:security:baseline": "node security-test.mjs",
     "test:hardening": "node test-hardening.mjs",
     "test:pro": "node test-pro.mjs",
     "eval": "node ../evals/run.mjs",
-    "test:figma": "node test-figma-desktop.mjs"
+    "test:figma": "node test-figma-desktop.mjs",
+    "test:dbeaver": "node test-dbeaver-desktop.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",

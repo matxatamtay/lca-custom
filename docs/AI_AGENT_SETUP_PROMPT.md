@@ -12,8 +12,8 @@ Mục tiêu:
 - Clone repo nếu chưa có.
 - Kiểm tra Node.js >= 18 và npm.
 - Chạy setup wizard chính.
-- Cài global command lca.
-- Kiểm tra tôi có thể cd vào repo bất kỳ và chạy lca.
+- Cài global command lca-custom.
+- Kiểm tra tôi có thể cd vào repo bất kỳ và chạy lca-custom.
 
 Quy tắc:
 - Không commit secret, API key, Tunnel ID, .env.local, tools/ hoặc generated profiles.
@@ -26,26 +26,26 @@ Các bước:
 2. Clone repo nếu cần.
 3. cd vào local-coding-agent.
 4. Chạy setup wizard:
-   - macOS/Linux/WSL: bash scripts/lca setup
-   - Windows: scripts\lca.cmd setup
+   - macOS/Linux/WSL: bash scripts/lca-custom setup
+   - Windows: scripts\lca-custom.cmd setup
 5. Khi wizard hỏi, để tôi nhập Tunnel ID và Runtime API key.
-6. Kiểm tra command lca wrapper chạy được. Trên Windows, yêu cầu mở terminal mới trước khi dùng lệnh `lca` vì User PATH mới không áp dụng cho terminal đang mở.
+6. Kiểm tra command lca-custom wrapper chạy được. Trên Windows, yêu cầu mở terminal mới trước khi dùng lệnh `lca-custom` vì User PATH mới không áp dụng cho terminal đang mở.
 7. Hướng dẫn dùng:
    cd /path/to/repo
-   lca
-8. Báo lại health URL, workspace hiện tại, kết quả `lca status` và cách stop bằng `lca stop`.
+   lca-custom
+8. Báo lại health URL, workspace hiện tại, kết quả `lca-custom status` và cách stop bằng `lca-custom stop`.
 ```
 
 ## Setup Map
 
 ```mermaid
 flowchart TD
-  A["Clone local-coding-agent"] --> B["lca setup wizard"]
+  A["Clone local-coding-agent"] --> B["lca-custom setup wizard"]
   B --> C["Chon OS"]
   C --> D["Nhap Tunnel ID + Runtime API key"]
-  D --> E["Cai deps + tunnel-client + global lca"]
+  D --> E["Cai deps + tunnel-client + global lca-custom"]
   E --> F["cd vao repo can lam viec"]
-  F --> G["lca"]
+  F --> G["lca-custom"]
   G --> H["ChatGPT Web connector No auth"]
 ```
 

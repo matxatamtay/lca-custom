@@ -29,15 +29,15 @@ version.
 6. Update safely:
    - `git pull --ff-only origin main`
 7. Run the setup wizard to refresh dependencies, config defaults, and wrappers:
-   - Windows: `scripts\lca.cmd setup`
-   - macOS/Linux/WSL: `bash scripts/lca setup`
+   - Windows: `scripts\lca-custom.cmd setup`
+   - macOS/Linux/WSL: `bash scripts/lca-custom setup`
 8. Validate:
    - `node --check scripts/local-coding-agent.mjs`
    - `node --check scripts/network-doctor.mjs`
    - `node scripts/validate-skills.mjs`
 9. Run doctor/status:
-   - Windows: `scripts\lca.cmd doctor` and `scripts\lca.cmd status`
-   - macOS/Linux: `bash scripts/lca doctor` and `bash scripts/lca status`
+   - Windows: `scripts\lca-custom.cmd doctor` and `scripts\lca-custom.cmd status`
+   - macOS/Linux: `bash scripts/lca-custom doctor` and `bash scripts/lca-custom status`
 10. Restart only if the customer wants the agent running:
    - stop, then start with the CLI wrapper for the OS.
 

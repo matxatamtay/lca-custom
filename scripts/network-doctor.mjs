@@ -34,8 +34,8 @@ Usage:
 Options:
   --out <file>                Report path (default: network-doctor-report.txt)
   --host <hostname>           Extra hostname to test; can be repeated
-  --mcp-url <url>             Local MCP URL to test (default: http://127.0.0.1:8789/mcp)
-  --health-url <url>          Local health URL (default: http://127.0.0.1:8789/healthz)
+  --mcp-url <url>             Local MCP URL to test (default: http://127.0.0.1:8790/mcp)
+  --health-url <url>          Local health URL (default: http://127.0.0.1:8790/healthz)
   --tunnel-bin <path>         Optional tunnel-client(.exe) path
   --tunnel-id <id>            Optional tunnel ID for a short tunnel smoke test
   --organization-id <id>      Optional OpenAI organization ID/header
@@ -56,8 +56,8 @@ function parseArgs(argv) {
   const opts = {
     out: DEFAULT_OUT,
     hosts: [...DEFAULT_HOSTS],
-    healthUrl: "http://127.0.0.1:8789/healthz",
-    mcpUrl: "http://127.0.0.1:8789/mcp",
+    healthUrl: "http://127.0.0.1:8790/healthz",
+    mcpUrl: "http://127.0.0.1:8790/mcp",
     tunnelBin: "",
     tunnelId: "",
     organizationId: "",

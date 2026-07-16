@@ -16,8 +16,8 @@ Local MCP server giúp ChatGPT Web đọc/sửa code, chạy command và xem git
 Bạn chỉ cần làm 4 bước:
 
 1. Chạy setup wizard trong repo `local-coding-agent`.
-2. Cấu hình project bằng `lca reset` và `lca add`.
-3. Chạy agent nền bằng `lca start --background`.
+2. Cấu hình project bằng `lca-custom reset` và `lca-custom add`.
+3. Chạy agent nền bằng `lca-custom start --background`.
 4. Thêm custom MCP connector trong ChatGPT Web.
 
 Yêu cầu:
@@ -31,15 +31,15 @@ Chạy setup wizard:
 
 ```bash
 # macOS / Linux / WSL
-bash scripts/lca setup
+bash scripts/lca-custom setup
 ```
 
 ```powershell
 # Windows
-scripts\lca.cmd setup
+scripts\lca-custom.cmd setup
 ```
 
-Wizard sẽ tự detect hệ điều hành hiện tại, kiểm tra prerequisite, mở trang tạo Tunnel/API key, tạo/cập nhật `.env.local`, cài dependency trong `server/`, tải `tools/tunnel-client`, ghi config local và cài global command `lca`. Trên Windows, wizard sẽ thêm thư mục `lca.cmd` vào User PATH; mở terminal mới trước khi gõ `lca`.
+Wizard sẽ tự detect hệ điều hành hiện tại, kiểm tra prerequisite, mở trang tạo Tunnel/API key, tạo/cập nhật `.env.local`, cài dependency trong `server/`, tải `tools/tunnel-client`, ghi config local và cài global command `lca-custom`. Trên Windows, wizard sẽ thêm thư mục `lca-custom.cmd` vào User PATH; mở terminal mới trước khi gõ `lca-custom`.
 
 Nếu cần xem hướng dẫn cho hệ điều hành khác máy đang chạy, dùng `node scripts/local-coding-agent.mjs setup --choose-os`.
 
@@ -48,12 +48,12 @@ Nếu cần xem hướng dẫn cho hệ điều hành khác máy đang chạy, d
 LCA chạy như một service nền và có thể truy cập nhiều project cùng lúc:
 
 ```bash
-lca reset /path/to/main-project  # xoá danh sách cũ, đặt project chính
-lca add /path/to/second-project  # thêm project
-lca add                          # thêm Git root của thư mục hiện tại
-lca remove /path/to/project      # gỡ project
-lca reset                        # chỉ giữ Git root của thư mục hiện tại
-lca start --background           # chạy server + tunnel dưới nền
+lca-custom reset /path/to/main-project  # xoá danh sách cũ, đặt project chính
+lca-custom add /path/to/second-project  # thêm project
+lca-custom add                          # thêm Git root của thư mục hiện tại
+lca-custom remove /path/to/project      # gỡ project
+lca-custom reset                        # chỉ giữ Git root của thư mục hiện tại
+lca-custom start --background           # chạy server + tunnel dưới nền
 ```
 
 Khi agent đang chạy, `add`, `remove` và `reset` tự restart service để áp dụng danh sách mới.
@@ -61,21 +61,21 @@ Khi agent đang chạy, `add`, `remove` và `reset` tự restart service để �
 Lệnh chính:
 
 ```bash
-lca start --background
-lca add [path]
-lca remove [path]
-lca reset [path]
-lca stop      # dừng server + tunnel
-lca status    # xem trạng thái
-lca config    # mở TUI cấu hình mode/policy/port
-lca doctor    # kiểm tra cấu hình local
+lca-custom start --background
+lca-custom add [path]
+lca-custom remove [path]
+lca-custom reset [path]
+lca-custom stop      # dừng server + tunnel
+lca-custom status    # xem trạng thái
+lca-custom config    # mở TUI cấu hình mode/policy/port
+lca-custom doctor    # kiểm tra cấu hình local
 ```
 
 Kiểm tra local:
 
 ```text
-lca status
-http://127.0.0.1:8789/healthz
+lca-custom status
+http://127.0.0.1:8790/healthz
 ```
 
 ## Tích Hợp ChatGPT Web
@@ -84,9 +84,9 @@ Chi tiết: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WEB_CONNECTOR.md).
 
 Tóm tắt:
 
-1. Chạy `lca setup`.
-2. Cấu hình project bằng `lca reset` và `lca add`.
-3. Chạy `lca start --background`.
+1. Chạy `lca-custom setup`.
+2. Cấu hình project bằng `lca-custom reset` và `lca-custom add`.
+3. Chạy `lca-custom start --background`.
 4. Mở ChatGPT Web.
 5. Settings -> Connectors -> Developer mode -> Add custom MCP connector.
 6. Chọn tunnel đã tạo.
@@ -111,7 +111,7 @@ lca_input  # mở Apps SDK widget, có thể ghim PiP để nhập task trong l�
 
 `lca_input` mở widget ngay trong ChatGPT để nhập task có context rõ hơn. Widget này dùng:
 
-- `@...` để chọn file, folder, symbol hoặc skill trên toàn bộ project đã đăng ký bằng `lca add`.
+- `@...` để chọn file, folder, symbol hoặc skill trên toàn bộ project đã đăng ký bằng `lca-custom add`.
 - `/...` để gọi workflow hoặc skill, ví dụ `/debug`, `/review`, `/implement`, `/refactor`, `/skill:<name>`.
 - Nút **PiP** yêu cầu ChatGPT ghim composer thành cửa sổ nổi để vẫn dùng được trong lúc tiếp tục chat.
 - Nút nhanh **Plan** là quick action; không chèn chữ vào input.
@@ -151,18 +151,18 @@ http://127.0.0.1:3845/mcp
 Sau đó chạy:
 
 ```bash
-lca figma
+lca-custom figma
 ```
 
-`lca figma` sẽ kiểm tra kết nối, mở Figma Desktop nếu server chưa chạy, chờ bạn bật MCP rồi thử lại. Các lệnh khác:
+`lca-custom figma` sẽ kiểm tra kết nối, mở Figma Desktop nếu server chưa chạy, chờ bạn bật MCP rồi thử lại. Các lệnh khác:
 
 ```bash
-lca figma status   # trạng thái JSON
-lca figma tools    # tool và schema thật Figma đang cung cấp
-lca figma open     # mở Figma và in hướng dẫn bật MCP
+lca-custom figma status   # trạng thái JSON
+lca-custom figma tools    # tool và schema thật Figma đang cung cấp
+lca-custom figma open     # mở Figma và in hướng dẫn bật MCP
 ```
 
-`lca setup` cũng có bước **Connect Figma Desktop MCP** sau khi cài dependency. Bước này không bắt buộc; có thể hoàn tất sau bằng `lca figma`.
+`lca-custom setup` cũng có bước **Connect Figma Desktop MCP** sau khi cài dependency. Bước này không bắt buộc; có thể hoàn tất sau bằng `lca-custom figma`.
 
 Các tool chính trong ChatGPT:
 
@@ -201,12 +201,12 @@ CONTROL_PLANE_API_KEY=sk-proj-...
 Config CLI nằm trong thư mục app config của hệ điều hành. Xem path:
 
 ```bash
-lca config path
+lca-custom config path
 ```
 
 ## Project Roots Là Gì
 
-Project roots là danh sách thư mục ChatGPT được phép đọc/sửa/chạy command thông qua connector. Project đầu tiên là root chính; các project thêm bằng `lca add` được truyền an toàn qua `AGENT_EXTRA_ROOTS_JSON`.
+Project roots là danh sách thư mục ChatGPT được phép đọc/sửa/chạy command thông qua connector. Project đầu tiên là root chính; các project thêm bằng `lca-custom add` được truyền an toàn qua `AGENT_EXTRA_ROOTS_JSON`.
 
 ## Bảo Mật
 
@@ -240,20 +240,20 @@ Policy: full
 Nếu muốn chặt hơn, có thể đổi lại `safe` hoặc `balanced` sau setup bằng TUI:
 
 ```bash
-lca config
+lca-custom config
 ```
 
-Chọn `Mode` hoặc `Policy`, lưu lại, và nếu agent đang chạy thì `lca config` sẽ tự restart để áp dụng cấu hình mới.
+Chọn `Mode` hoặc `Policy`, lưu lại, và nếu agent đang chạy thì `lca-custom config` sẽ tự restart để áp dụng cấu hình mới.
 
 ## Troubleshooting
 
 | Lỗi                                                  | Cách xử lý                                                                                                                                                           |
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lca: command not found` / `'lca' is not recognized` | Trên Windows: đóng terminal cũ, mở terminal mới rồi chạy lại `lca`. Nếu vẫn lỗi, chạy `scripts\lca.cmd cli` để cài lại wrapper hoặc gọi trực tiếp path wizard in ra. |
-| Server chạy nhầm repo                                | `cd` vào repo đúng rồi chạy lại `lca`.                                                                                                                               |
-| Port `8789` bận                                      | Chạy `lca setup` và đổi MCP port, hoặc set `PORT` trước khi chạy.                                                                                                    |
-| Server không health                                  | Kiểm tra `lca status` và `http://127.0.0.1:8789/healthz`.                                                                                                            |
-| Connector không thấy tool                            | Đảm bảo `lca` đang chạy, tunnel connected, connector dùng `No auth`.                                                                                                 |
+| `lca-custom: command not found` / `'lca-custom' is not recognized` | Trên Windows: đóng terminal cũ, mở terminal mới rồi chạy lại `lca-custom`. Nếu vẫn lỗi, chạy `scripts\lca-custom.cmd cli` để cài lại wrapper hoặc gọi trực tiếp path wizard in ra. |
+| Server chạy nhầm repo                                | `cd` vào repo đúng rồi chạy lại `lca-custom`.                                                                                                                               |
+| Port `8790` bận                                      | Chạy `lca-custom setup` và đổi MCP port, hoặc set `PORT` trước khi chạy.                                                                                                    |
+| Server không health                                  | Kiểm tra `lca-custom status` và `http://127.0.0.1:8790/healthz`.                                                                                                            |
+| Connector không thấy tool                            | Đảm bảo `lca-custom` đang chạy, tunnel connected, connector dùng `No auth`.                                                                                                 |
 | Sửa nhầm repo                                        | Trong ChatGPT gọi `lca` hoặc `workspace_info` để xem root thật.                                                                                                      |
 
 ## Low-Level CLI
@@ -269,7 +269,7 @@ node scripts/local-coding-agent.mjs logs
 Flow bình thường nên dùng global command:
 
 ```bash
-lca
+lca-custom
 ```
 
 ## License

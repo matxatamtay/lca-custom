@@ -24,8 +24,8 @@ start Local Coding Agent.
 2. Clone the repo if needed:
    - `git clone https://github.com/luongduy2798/local-coding-agent.git`
 3. Enter the repo and run setup wizard:
-   - Windows: `scripts\lca.cmd setup`
-   - macOS/Linux/WSL: `bash scripts/lca setup`
+   - Windows: `scripts\lca-custom.cmd setup`
+   - macOS/Linux/WSL: `bash scripts/lca-custom setup`
 4. Let the wizard ask the customer for:
    - workspace path
    - Tunnel ID
@@ -33,10 +33,10 @@ start Local Coding Agent.
    - tunnel-client path only if auto-download fails
 5. Start from the target repo:
    - `cd /path/to/workspace`
-   - `lca`
+   - `lca-custom`
 6. Verify:
-   - `http://127.0.0.1:8789/healthz`
-   - `scripts\lca.cmd status` or `bash scripts/lca status`
+   - `http://127.0.0.1:8790/healthz`
+   - `scripts\lca-custom.cmd status` or `bash scripts/lca-custom status`
 
 ## Report Back
 

@@ -29,10 +29,11 @@ const SERVER_DIR = join(REPO_ROOT, "server");
 const SERVER_SCRIPT = "server.mjs";
 const ENV_LOCAL_PATH = join(REPO_ROOT, ".env.local");
 const ENV_EXAMPLE_PATH = join(REPO_ROOT, ".env.example");
-const CONFIG_PATH = process.env.LCA_CONFIG_PATH || defaultConfigPath();
+export const CLI_NAME = "lca-custom";
+const CONFIG_PATH = process.env.LCA_CUSTOM_CONFIG_PATH || defaultConfigPath();
 const PID_PATH = join(dirname(CONFIG_PATH), "processes.json");
 const LOG_PATH = join(dirname(CONFIG_PATH), "launcher.log");
-const DEFAULT_PORT = "8789";
+const DEFAULT_PORT = "8790";
 const DEFAULT_TUNNEL_VERSION = process.env.TUNNEL_CLIENT_VERSION || "v0.0.10";
 const DEFAULT_FIGMA_DESKTOP_MCP_URL = "http://127.0.0.1:3845/mcp";
 const TUNNEL_RELEASE_BASE = "https://github.com/openai/tunnel-client/releases/download";
@@ -46,12 +47,12 @@ loadRepoEnvIntoProcess();
 function defaultConfigPath() {
   const home = process.env.HOME || process.env.USERPROFILE || ".";
   if (process.platform === "win32") {
-    return join(process.env.APPDATA || join(home, "AppData", "Roaming"), "LocalCodingAgent", "cli-config.json");
+    return join(process.env.APPDATA || join(home, "AppData", "Roaming"), "LocalCodingAgentCustom", "cli-config.json");
   }
   if (process.platform === "darwin") {
-    return join(home, "Library", "Application Support", "LocalCodingAgent", "cli-config.json");
+    return join(home, "Library", "Application Support", "LocalCodingAgentCustom", "cli-config.json");
   }
-  return join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "LocalCodingAgent", "cli-config.json");
+  return join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "LocalCodingAgentCustom", "cli-config.json");
 }
 
 function defaultOptions() {
@@ -68,7 +69,7 @@ function defaultOptions() {
     tunnelBin:
       process.env.TUNNEL_BIN ||
       defaultTunnelBinForPlatform(detectSetupPlatform()),
-    profile: process.env.TUNNEL_PROFILE || "local-coding-agent",
+    profile: process.env.TUNNEL_PROFILE || "local-coding-agent-custom",
     profileDir: process.env.TUNNEL_PROFILE_DIR || join(REPO_ROOT, "tools", "profiles"),
     tunnelId: process.env.CONTROL_PLANE_TUNNEL_ID || process.env.TUNNEL_ID || "",
     organizationId: process.env.OPENAI_ORGANIZATION || process.env.OPENAI_ORG_ID || "",
@@ -82,19 +83,19 @@ function usage() {
   console.log(`Local Coding Agent CLI
 
 Usage:
-  lca start [--background] [--no-tunnel]
-  lca stop
-  lca status
-  lca doctor
-  lca add [path]
-  lca remove [path]
-  lca reset [path]
-  lca profile
-  lca url
-  lca setup
-  lca config
-  lca figma [connect|status|tools|open]
-  lca update
+  lca-custom start [--background] [--no-tunnel]
+  lca-custom stop
+  lca-custom status
+  lca-custom doctor
+  lca-custom add [path]
+  lca-custom remove [path]
+  lca-custom reset [path]
+  lca-custom profile
+  lca-custom url
+  lca-custom setup
+  lca-custom config
+  lca-custom figma [connect|status|tools|open]
+  lca-custom update
 
 Options:
   --workspace <path>          Workspace root the agent may access
@@ -116,7 +117,7 @@ Tunnel options:
   --runtime-key <key>         Runtime API key for this process
 
 Project commands default to the current Git root when [path] is omitted.
-Use \`lca start --background\` to keep the agent running as a daemon.
+Use \`lca-custom start --background\` to keep the agent running as a daemon.
 `);
 }
 
@@ -124,14 +125,14 @@ function setupUsage() {
   console.log(`Local Coding Agent setup wizard
 
 Usage:
-  bash scripts/lca setup          # macOS/Linux/WSL
-  scripts\\lca.cmd setup          # Windows
+  bash scripts/lca-custom setup          # macOS/Linux/WSL
+  scripts\\lca-custom.cmd setup          # Windows
   node scripts/local-coding-agent.mjs setup
 
 The wizard uses only Node.js built-ins. It auto-detects the current OS, checks
 prerequisites, creates or updates .env.local, installs server dependencies,
 checks the local Figma Desktop MCP bridge, downloads tunnel-client when possible,
-writes local CLI config, installs the global lca command, and prints health/status checks.
+writes an isolated staging CLI config, installs the global lca-custom command, and prints health/status checks.
 
 Use --choose-os only when you want instruction mode for another OS.
 `);
@@ -489,7 +490,7 @@ function validate(opts, { requireWorkspace = false, requireTunnel = false } = {}
   const port = Number(opts.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be a TCP port.");
   if (requireWorkspace) {
-    if (!opts.projects?.length) throw new Error("No projects configured. Run `lca add [path]` or `lca reset [path]` first.");
+    if (!opts.projects?.length) throw new Error("No projects configured. Run `lca-custom add [path]` or `lca-custom reset [path]` first.");
     for (const project of opts.projects) {
       if (!isDirectory(project)) throw new Error(`Project directory does not exist: ${project}`);
     }
@@ -785,8 +786,8 @@ function printInstructionMode(selected, host) {
   console.log(`\nThis terminal is ${host.label}, but you selected ${selected.label}.`);
   console.log("Instruction mode only: no setup commands were run for the other OS.");
   console.log("\nRun this on the target OS instead:");
-  if (selected.id === "win32") console.log("  scripts\\lca.cmd setup");
-  else console.log("  bash scripts/lca setup");
+  if (selected.id === "win32") console.log("  scripts\\lca-custom.cmd setup");
+  else console.log("  bash scripts/lca-custom setup");
   console.log("\nExpected tunnel-client asset:");
   console.log(`  ${tunnelAssetName(DEFAULT_TUNNEL_VERSION, selected.tunnelOs, selected.arch)}`);
 }
@@ -882,7 +883,7 @@ async function downloadTunnelClient(selected, destination = defaultTunnelBinForP
 function defaultCliBinDir() {
   const home = process.env.HOME || process.env.USERPROFILE || ".";
   if (process.platform === "win32") {
-    return join(process.env.LOCALAPPDATA || join(home, "AppData", "Local"), "LocalCodingAgent", "bin");
+    return join(process.env.LOCALAPPDATA || join(home, "AppData", "Local"), "LocalCodingAgentCustom", "bin");
   }
   return join(home, ".local", "bin");
 }
@@ -890,7 +891,7 @@ function defaultCliBinDir() {
 function canWriteDir(dir) {
   try {
     mkdirSync(dir, { recursive: true });
-    const probe = join(dir, `.lca-write-test-${process.pid}`);
+    const probe = join(dir, `.lca-custom-write-test-${process.pid}`);
     writeFileSync(probe, "");
     rmSync(probe, { force: true });
     return true;
@@ -900,7 +901,7 @@ function canWriteDir(dir) {
 }
 
 function cliBinCandidates() {
-  if (process.env.LCA_BIN_DIR) return [process.env.LCA_BIN_DIR];
+  if (process.env.LCA_CUSTOM_BIN_DIR) return [process.env.LCA_CUSTOM_BIN_DIR];
   const home = process.env.HOME || process.env.USERPROFILE || ".";
   if (process.platform === "win32") return [defaultCliBinDir()];
   return [
@@ -1005,7 +1006,7 @@ async function configureShellPath(binDir) {
         changed,
         active: false,
         profile: "User PATH",
-        message: `${changed ? "Added" : "Already present in"} Windows User PATH: ${binDir}. Open a new terminal before running lca.`
+        message: `${changed ? "Added" : "Already present in"} Windows User PATH: ${binDir}. Open a new terminal before running lca-custom.`
       };
     }
     return {
@@ -1033,22 +1034,22 @@ async function verifyCliShim(cliPath) {
     ? await capture("cmd.exe", ["/d", "/c", `call "${cliPath}" --help`], { cwd: REPO_ROOT })
     : await capture(cliPath, ["--help"], { cwd: REPO_ROOT });
   if (result.code !== 0) {
-    throw new Error(`Installed lca wrapper failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
+    throw new Error(`Installed ${CLI_NAME} wrapper failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
   }
-  console.log(`OK lca wrapper: ${cliPath}`);
+  console.log(`OK ${CLI_NAME} wrapper: ${cliPath}`);
 }
 
 async function installCliCommand() {
-  const marker = "local-coding-agent lca wrapper";
-  const preferredBinDir = process.env.LCA_BIN_DIR || defaultCliBinDir();
+  const marker = `local-coding-agent ${CLI_NAME} wrapper`;
+  const preferredBinDir = process.env.LCA_CUSTOM_BIN_DIR || defaultCliBinDir();
   const binDir = chooseCliBinDir();
   if (binDir !== preferredBinDir) {
-    console.log(`WARN ${preferredBinDir} is not writable; installing lca into ${binDir} instead.`);
+    console.log(`WARN ${preferredBinDir} is not writable; installing ${CLI_NAME} into ${binDir} instead.`);
   }
   mkdirSync(binDir, { recursive: true });
   if (process.platform === "win32") {
-    const cmdPath = join(binDir, "lca.cmd");
-    const psPath = join(binDir, "lca.ps1");
+    const cmdPath = join(binDir, `${CLI_NAME}.cmd`);
+    const psPath = join(binDir, `${CLI_NAME}.ps1`);
     for (const target of [cmdPath, psPath]) {
       if (existsSync(target) && !readFileSync(target, "utf8").includes(marker)) {
         throw new Error(`Refusing to overwrite: ${target}`);
@@ -1062,7 +1063,7 @@ async function installCliCommand() {
     if (!pathResult.active) console.log(`Current terminal fallback: "${cmdPath}"`);
     return cmdPath;
   }
-  const target = join(binDir, "lca");
+  const target = join(binDir, CLI_NAME);
   if (existsSync(target) && !readFileSync(target, "utf8").includes(marker)) {
     throw new Error(`Refusing to overwrite: ${target}`);
   }
@@ -1077,7 +1078,7 @@ async function installCliCommand() {
 async function setup(flags) {
   if (flags.help) return setupUsage();
   if (!input.isTTY || !output.isTTY) {
-    throw new Error("Interactive terminal required. Run `lca setup` from a terminal.");
+    throw new Error("Interactive terminal required. Run `lca-custom setup` from a terminal.");
   }
   const cfg = effectiveOptions(flags);
   const rl = createPromptInterface({ input, output });
@@ -1151,7 +1152,7 @@ async function setup(flags) {
     if (useFigmaDesktop) {
       await ensureFigmaDesktopConnected(rl, { interactive: true, failOnMissing: false });
     } else {
-      console.log("Skipped. Run `lca figma` later.");
+      console.log("Skipped. Run `lca-custom figma` later.");
     }
 
     printStep(7, 9, "Install tunnel-client");
@@ -1169,13 +1170,13 @@ async function setup(flags) {
         console.log(`Using existing tunnel-client: ${cfg.tunnelBin}`);
       }
       cfg.profileDir = cfg.profileDir || join(REPO_ROOT, "tools", "profiles");
-      cfg.profile = cfg.profile || "local-coding-agent";
+      cfg.profile = cfg.profile || "local-coding-agent-custom";
       cfg.organizationId = flags.organizationId || cfg.organizationId || "";
     } else {
       console.log("Tunnel disabled.");
     }
 
-    printStep(8, 9, "Save config and install lca command");
+    printStep(8, 9, "Save config and install lca-custom command");
     cfg.runtimeKey = "";
     const normalizedCfg = normalize(cfg);
     validate(normalizedCfg);
@@ -1187,8 +1188,8 @@ async function setup(flags) {
     await status({ json: false });
     console.log("\nSetup complete.");
     console.log("Daily use:");
-    console.log("  lca add /path/to/another-project");
-    console.log("  lca start --background");
+    console.log("  lca-custom add /path/to/another-project");
+    console.log("  lca-custom start --background");
     console.log(`Health: http://127.0.0.1:${cfg.port}/healthz`);
   } finally {
     rl.close();
@@ -1459,12 +1460,12 @@ async function doctor(flags) {
   add("server directory", existsSync(SERVER_DIR), SERVER_DIR);
   add("server.mjs", existsSync(join(SERVER_DIR, SERVER_SCRIPT)), join(SERVER_DIR, SERVER_SCRIPT));
   add("server node_modules", existsSync(join(SERVER_DIR, "node_modules")), join(SERVER_DIR, "node_modules"));
-  add("projects configured", opts.projects.length > 0, opts.projects.length ? `${opts.projects.length} project(s)` : "none; run lca add [path]");
+  add("projects configured", opts.projects.length > 0, opts.projects.length ? `${opts.projects.length} project(s)` : "none; run lca-custom add [path]");
   for (const project of opts.projects) add("project", isDirectory(project), project);
   add("tunnel-client", opts.noTunnel || existsSync(opts.tunnelBin), opts.noTunnel ? "disabled" : opts.tunnelBin);
   add("runtime key", opts.noTunnel || Boolean(process.env[opts.runtimeKeyEnv] || opts.runtimeKey), opts.noTunnel ? "disabled" : opts.runtimeKeyEnv);
   const rg = await capture(process.platform === "win32" ? "rg.exe" : "rg", ["--version"]);
-  add("ripgrep", rg.code === 0, rg.code === 0 ? rg.stdout.split(/\r?\n/)[0] : "missing; run lca setup to auto-install or install ripgrep manually");
+  add("ripgrep", rg.code === 0, rg.code === 0 ? rg.stdout.split(/\r?\n/)[0] : "missing; run lca-custom setup to auto-install or install ripgrep manually");
   const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
   add("server health", Boolean(health), health ? `${health.version} pid=${health.pid || "?"}` : "offline");
   for (const check of checks) {
@@ -1483,7 +1484,7 @@ function redactConfigForDisplay(cfg) {
 
 async function promptConfigWizard() {
   if (!input.isTTY || !output.isTTY) {
-    throw new Error("Interactive terminal required. Use `lca config show` for non-interactive output.");
+    throw new Error("Interactive terminal required. Use `lca-custom config show` for non-interactive output.");
   }
   const beforeCfg = normalize(loadConfig());
   const cfg = { ...beforeCfg };
@@ -1534,7 +1535,7 @@ async function promptConfigWizard() {
         saved = true;
         console.log("Saved config.");
         const restarted = await restartIfRunning(beforeCfg, normalizedCfg);
-        if (!restarted) console.log("Agent is not running; next `lca` will use the new config.");
+        if (!restarted) console.log("Agent is not running; next `lca-custom` will use the new config.");
         break;
       } else if (action.id === "cancel") {
         console.log("Canceled.");
@@ -1613,7 +1614,7 @@ function figmaDesktopEndpoint() {
 
 async function loadFigmaDesktopBridge() {
   if (!existsSync(join(SERVER_DIR, "node_modules"))) {
-    throw new Error("Figma bridge dependencies are missing. Run `lca setup` or `lca install` first.");
+    throw new Error("Figma bridge dependencies are missing. Run `lca-custom setup` or `lca-custom install` first.");
   }
   return import(pathToFileURL(join(SERVER_DIR, "figma-desktop.mjs")).href);
 }
@@ -1672,7 +1673,7 @@ async function ensureFigmaDesktopConnected(rl, { interactive = false, failOnMiss
   }
 
   if (failOnMissing) throw new Error(statusValue.error || "Figma Desktop MCP is not available.");
-  console.log("You can finish later with: lca figma");
+  console.log("You can finish later with: lca-custom figma");
   return statusValue;
 }
 
@@ -1693,7 +1694,7 @@ async function figmaCommand(rest, flags = {}) {
     return;
   }
   if (sub !== "connect" && sub !== "check") {
-    throw new Error("Usage: lca figma [connect|status|tools|open]");
+    throw new Error("Usage: lca-custom figma [connect|status|tools|open]");
   }
 
   if (!input.isTTY || !output.isTTY) {
@@ -1774,7 +1775,7 @@ async function addProjectCommand(rest, flags) {
   console.log(`Added: ${project}`);
   printProjectList(next.projects);
   const restarted = await restartIfRunning(before, next);
-  if (!restarted) console.log("Agent is offline. Start it with: lca start --background");
+  if (!restarted) console.log("Agent is offline. Start it with: lca-custom start --background");
 }
 
 async function removeProjectCommand(rest, flags) {
@@ -1807,7 +1808,7 @@ async function resetProjectsCommand(rest, flags) {
   await saveConfig(stripRuntimeFields(next));
   console.log(`Reset projects to: ${project}`);
   const restarted = await restartIfRunning(before, next);
-  if (!restarted) console.log("Agent is offline. Start it with: lca start --background");
+  if (!restarted) console.log("Agent is offline. Start it with: lca-custom start --background");
 }
 
 function isDirectory(path) {
@@ -1900,7 +1901,7 @@ async function workspaceCommand(flags) {
   const next = normalize({ ...opts, workspace: choice });
   await saveConfig(stripRuntimeFields(next));
   console.log(`Workspace: ${choice}`);
-  console.log("Run: lca");
+  console.log("Run: lca-custom");
 }
 
 async function keysCommand() {

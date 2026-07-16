@@ -17,8 +17,8 @@ Use this when helping a customer install, update, debug, or report an issue.
 
 ## Useful Commands
 
-- `scripts\lca.cmd status` / `bash scripts/lca status`
-- `scripts\lca.cmd doctor` / `bash scripts/lca doctor`
+- `scripts\lca-custom.cmd status` / `bash scripts/lca-custom status`
+- `scripts\lca-custom.cmd doctor` / `bash scripts/lca-custom doctor`
 - `node scripts/network-doctor.mjs`
 - `node scripts/validate-skills.mjs`
 - `git status --short --branch`

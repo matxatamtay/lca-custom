@@ -15,6 +15,7 @@ ChatGPT sessions; it is a normal MCP connector you authorize.
 | Info | `workspace_info`, `ping` |
 | Read | `repo_overview`, `list_files`, `find_files`, `read_file`, `read_many` (concurrent + line ranges), `stat_path`, `search_text` (ripgrep/git, with context + glob), `workspace_search` (multi-project `@` autocomplete) |
 | Figma Desktop | `figma_status`, `figma_list_tools`, `figma_call_tool`, `figma_get_design_context`, `figma_get_screenshot`, `figma_get_metadata`, `figma_get_variable_defs`, `figma_get_code_connect_map`, `figma_get_figjam` |
+| DBeaver Desktop | `dbeaver_status`, `dbeaver_list_tools`, `dbeaver_list_connections`, `dbeaver_execute_sql` |
 | Write | `write_file`, `replace_in_file`, `apply_patch`, `make_dir`, `move_path`, `delete_path` |
 | Execute | `run_command`, `run_commands` (bounded batch; cmd/powershell/bash/sh/zsh) |
 | Processes | `proc_start`, `proc_list`, `proc_output`, `proc_stop` |
@@ -29,7 +30,7 @@ Recommended flow from any project repo:
 
 ```bash
 cd /path/to/your/repo
-lca
+lca-custom
 ```
 
 Low-level server-only run:
@@ -43,14 +44,14 @@ npm install
 npm start
 ```
 
-- MCP endpoint: `http://127.0.0.1:8789/mcp`
-- Health: `http://127.0.0.1:8789/healthz`
+- MCP endpoint: `http://127.0.0.1:8790/mcp`
+- Health: `http://127.0.0.1:8790/healthz`
 
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `PORT` | `8789` | HTTP port for the MCP endpoint. |
+| `PORT` | `8790` | HTTP port for the MCP endpoint. |
 | `AGENT_HOST` | `127.0.0.1` | Bind address. Keep loopback; the tunnel forwards to it. |
 | `AGENT_WORKSPACE` | `../agent-workspace` | Primary root the agent may touch. |
 | `AGENT_EXTRA_ROOTS` | _(empty)_ | Extra roots, `;`-separated. |
@@ -71,8 +72,12 @@ npm start
 | `FIGMA_DESKTOP_MCP_URL` | `http://127.0.0.1:3845/mcp` | Official local MCP endpoint exposed by Figma Desktop after enabling it in Dev Mode. |
 | `FIGMA_DESKTOP_TIMEOUT_MS` | `30000` | Timeout for connecting to or calling the Figma Desktop MCP server. |
 | `FIGMA_DESKTOP_ALLOW_REMOTE` | `0` | Set `1` only to allow a non-loopback override. The official desktop endpoint is loopback. |
+| `DBEAVER_DESKTOP_MCP_URL` | `http://127.0.0.1:3846/mcp` | MCP endpoint exposed by the patched DBeaver Desktop build. |
+| `DBEAVER_DESKTOP_TIMEOUT_MS` | `45000` | Timeout for connecting to or calling DBeaver Desktop MCP. |
+| `DBEAVER_DESKTOP_AUTH_TOKEN` | _(empty)_ | Bearer token matching DBeaver's `DBEAVER_MCP_AUTH_TOKEN`, when enabled. |
+| `DBEAVER_DESKTOP_ALLOW_REMOTE` | `0` | Set `1` only to allow a non-loopback DBeaver endpoint. |
 
-`ripgrep` (`rg`) is auto-installed by `lca setup` when a supported package
+`ripgrep` (`rg`) is auto-installed by `lca-custom setup` when a supported package
 manager is available. It is not required, but `search_text`, `find_files`, and
 repo mapping are much faster with it.
 
@@ -88,4 +93,5 @@ npm run test:security    # runtime security checks against a running server
 npm run test:hardening   # self-contained policy/origin/body/undo regressions
 npm run test:pro         # Pro snapshot/report/tier regression checks
 npm run test:figma       # mocked Figma Desktop MCP bridge checks
+npm run test:dbeaver     # mocked DBeaver Desktop MCP bridge and policy checks
 ```

@@ -21,35 +21,35 @@ Chạy setup wizard trong repo `local-coding-agent`:
 
 ```bash
 # macOS / Linux / WSL
-bash scripts/lca setup
+bash scripts/lca-custom setup
 ```
 
 ```powershell
 # Windows
-scripts\lca.cmd setup
+scripts\lca-custom.cmd setup
 ```
 
-Wizard sẽ cho chọn OS, kiểm tra prerequisite, mở trang Tunnel/API key, tạo/cập nhật `.env.local`, cài dependency, auto-download `tunnel-client` khi có thể, ghi config local và cài global command `lca`.
+Wizard sẽ cho chọn OS, kiểm tra prerequisite, mở trang Tunnel/API key, tạo/cập nhật `.env.local`, cài dependency, auto-download `tunnel-client` khi có thể, ghi config local và cài global command `lca-custom`.
 
 ## Daily Use
 
 ```bash
-lca reset /path/to/main-project
-lca add /path/to/another-project
-lca start --background
+lca-custom reset /path/to/main-project
+lca-custom add /path/to/another-project
+lca-custom start --background
 ```
 
-`lca add`, `lca remove` và `lca reset` tự restart agent đang chạy để áp dụng danh sách project mới.
+`lca-custom add`, `lca-custom remove` và `lca-custom reset` tự restart agent đang chạy để áp dụng danh sách project mới.
 
 Lệnh thường dùng:
 
 ```bash
-lca stop
-lca status
-lca add [path]
-lca remove [path]
-lca reset [path]
-lca doctor
+lca-custom stop
+lca-custom status
+lca-custom add [path]
+lca-custom remove [path]
+lca-custom reset [path]
+lca-custom doctor
 ```
 
 ## ChatGPT Web Connector
@@ -65,8 +65,8 @@ Chi tiết: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WEB_CONNECTOR.md).
 
 ## URLs
 
-- MCP local: `http://127.0.0.1:8789/mcp`
-- Health: `http://127.0.0.1:8789/healthz`
+- MCP local: `http://127.0.0.1:8790/mcp`
+- Health: `http://127.0.0.1:8790/healthz`
 
 ## Safety
 

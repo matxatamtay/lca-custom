@@ -33,13 +33,20 @@ import {
   listFigmaDesktopTools,
   parseFigmaNodeReference
 } from "./figma-desktop.mjs";
+import {
+  DEFAULT_DBEAVER_DESKTOP_MCP_URL,
+  callDBeaverDesktopTool,
+  callReadOnlyDBeaverDesktopTool,
+  dbeaverDesktopStatus,
+  listDBeaverDesktopTools
+} from "./dbeaver-desktop.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
 // ----------------------------------------------------------------------------
 const VERSION = "4.4.0-pro";
 const PRODUCT_TIER = "pro";
-const PORT = Number(process.env.PORT || 8789);
+const PORT = Number(process.env.PORT || 8790);
 // Bind to loopback by default. The local OpenAI tunnel-client forwards to this,
 // so we never need to listen on 0.0.0.0 (which would expose a shell to the LAN).
 const HOST = process.env.AGENT_HOST || "127.0.0.1";
@@ -94,6 +101,10 @@ const HTTP_LOG = process.env.AGENT_HTTP_LOG === "1";
 // LCA acts as an MCP client and forwards results without managing Figma tokens.
 const FIGMA_DESKTOP_MCP_URL = String(process.env.FIGMA_DESKTOP_MCP_URL || DEFAULT_FIGMA_DESKTOP_MCP_URL).trim();
 const FIGMA_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.FIGMA_DESKTOP_TIMEOUT_MS, 30_000, 1_000, 120_000);
+const DBEAVER_DESKTOP_MCP_URL = String(process.env.DBEAVER_DESKTOP_MCP_URL || DEFAULT_DBEAVER_DESKTOP_MCP_URL).trim();
+const DBEAVER_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.DBEAVER_DESKTOP_TIMEOUT_MS, 45_000, 1_000, 300_000);
+const DBEAVER_DESKTOP_AUTH_TOKEN = String(process.env.DBEAVER_DESKTOP_AUTH_TOKEN || "").trim();
+
 const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "get_code_connect_map",
   "get_code_connect_suggestions",
@@ -389,6 +400,7 @@ const SERVER_INSTRUCTIONS = [
   "WORKFLOW: (1) Start with workspace_snapshot for repo/git/policy in one call; use workspace_doctor when you need operational readiness. (2) Use read_many/search_text/repo_symbols to gather context in batches. (3) Use preview_patch/validate_patch before apply_patch for large edits. (4) Before marking 'done', call review_diff and session_report; run tests/build/lint only when the user explicitly asks. (5) For multi-step tasks, use task_plan + decision_log to maintain state across chats.",
   "POLICY: Check policy_status if you are unsure whether an action is allowed. In balanced policy, risky operations (delete, install, network, mutating git, risky processes) require one-time approval with request_approval/request_approval_batch followed by approve_request using AGENT_APPROVAL_TOKEN.",
   "FIGMA: LCA bridges the official Figma Desktop MCP server at 127.0.0.1:3845. For a Figma URL or current desktop selection, prefer figma_get_design_context; also call figma_get_screenshot when visual fidelity matters. Use figma_status when the bridge is unavailable and figma_list_tools/figma_call_tool for newer upstream tools.",
+  "DBEAVER: LCA bridges the patched DBeaver Desktop MCP server at 127.0.0.1:3846. Use dbeaver_status first, dbeaver_list_connections to select a live connection, dbeaver_call_tool for upstream read-only discovery tools, and dbeaver_execute_sql for queries. SQL writes require allow_write=true and are additionally governed by LCA policy.",
   "Use the DEDICATED tools instead of run_command for these — they are faster and cheaper:",
   "- Find files by name -> find_files (NOT dir/ls/Get-ChildItem/where).",
   "- Search file contents -> search_text with context= (NOT grep/findstr/Select-String).",
@@ -412,6 +424,7 @@ function createMcpServer() {
   registerCompanionAppResources(mcp);
   registerBasicTools(mcp);
   registerFigmaDesktopTools(mcp);
+  registerDBeaverDesktopTools(mcp);
   registerFsReadTools(mcp);
   registerFsWriteTools(mcp);
   registerExecTools(mcp);
@@ -525,6 +538,115 @@ function buildFigmaDesktopArguments({
   if (force_code !== undefined && args.forceCode === undefined) args.forceCode = force_code;
   if (enable_base64_response !== undefined && args.enableBase64Response === undefined) args.enableBase64Response = enable_base64_response;
   return args;
+}
+
+function registerDBeaverDesktopTools(mcp) {
+  const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true };
+  const bridgeOptions = {
+    endpoint: DBEAVER_DESKTOP_MCP_URL,
+    timeoutMs: DBEAVER_DESKTOP_TIMEOUT_MS,
+    authToken: DBEAVER_DESKTOP_AUTH_TOKEN
+  };
+
+  reg(
+    mcp,
+    "dbeaver_status",
+    {
+      title: "DBeaver Desktop status",
+      description: "Check whether the patched DBeaver Desktop MCP server is running and list its live tools.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => jsonResult(await dbeaverDesktopStatus(bridgeOptions))
+  );
+
+  reg(
+    mcp,
+    "dbeaver_list_tools",
+    {
+      title: "List DBeaver Desktop tools",
+      description: "List the tools and JSON schemas exposed by the patched DBeaver Desktop MCP server.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => {
+      const result = await listDBeaverDesktopTools(bridgeOptions);
+      return jsonResult({ endpoint: DBEAVER_DESKTOP_MCP_URL, count: result.tools.length, tools: result.tools });
+    }
+  );
+
+  reg(
+    mcp,
+    "dbeaver_call_tool",
+    {
+      title: "Call a read-only DBeaver tool",
+      description: "Call any upstream DBeaver Desktop tool that declares readOnlyHint=true. Use dbeaver_list_tools to inspect names and schemas. Write-capable tools are rejected.",
+      annotations: readOnly,
+      inputSchema: {
+        tool: z.string().min(1).describe("Exact upstream DBeaver tool name."),
+        arguments: z.record(z.any()).optional().describe("Arguments matching the upstream tool JSON schema.")
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callReadOnlyDBeaverDesktopTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "dbeaver_list_connections",
+    {
+      title: "List DBeaver connections",
+      description: "List live DBeaver connection IDs, names, projects, drivers, and connection state without exposing credentials.",
+      annotations: readOnly,
+      inputSchema: {
+        project: z.string().optional().describe("Optional exact DBeaver project name."),
+        connected_only: z.boolean().optional().describe("Return only currently connected data sources.")
+      }
+    },
+    async (args) => callDBeaverDesktopTool("dbeaver_list_connections", args, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "dbeaver_execute_sql",
+    {
+      title: "Execute SQL in DBeaver",
+      description: "Execute SQL through a live DBeaver connection. Reads are allowed by default. Set allow_write=true explicitly for data or schema changes.",
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+      inputSchema: {
+        connection: z.string().min(1).describe("DBeaver connection ID or exact name."),
+        project: z.string().optional().describe("Optional exact project name used to disambiguate connection names."),
+        sql: z.string().min(1).describe("SQL statement to execute."),
+        max_rows: z.number().int().min(1).max(1000).optional().describe("Maximum returned rows. Default 200."),
+        timeout_seconds: z.number().int().min(1).max(300).optional().describe("Statement timeout. Default 30 seconds."),
+        auto_connect: z.boolean().optional().describe("Connect the data source automatically when offline. Default true."),
+        allow_write: z.boolean().optional().describe("Explicitly allow statements that may modify data or schema. Default false.")
+      }
+    },
+    async (args) => callDBeaverDesktopTool("dbeaver_execute_sql", args, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "dbeaver_simulate_change",
+    {
+      title: "Simulate a DBeaver data change",
+      description: "Run one DML statement in DBeaver's isolated transaction sandbox and roll it back. Strict policy blocks this tool; balanced policy requires approval.",
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+      inputSchema: {
+        connection: z.string().min(1).describe("DBeaver connection ID or exact name."),
+        project: z.string().optional().describe("Optional project name."),
+        sql: z.string().min(1).describe("One INSERT, UPDATE, DELETE, or MERGE statement."),
+        allow_simulation: z.literal(true).describe("Explicitly acknowledge transactional DML execution."),
+        acknowledge_external_side_effects: z.literal(true).describe("Acknowledge that rollback cannot undo external side effects."),
+        observe_object_ids: z.array(z.string()).optional().describe("Optional table/view object IDs to snapshot before, during, and after rollback."),
+        observation_rows: z.number().int().min(1).max(200).optional(),
+        mask_sensitive: z.boolean().optional(),
+        timeout_seconds: z.number().int().min(1).max(300).optional(),
+        auto_connect: z.boolean().optional()
+      }
+    },
+    async (args) => callDBeaverDesktopTool("dbeaver_simulate_change", args, bridgeOptions)
+  );
 }
 
 function registerSkillTools(mcp) {
@@ -4979,13 +5101,19 @@ const POLICY_RULES = {
 };
 
 const STRICT_MUTATION_TOOLS = new Set([
-  "figma_call_tool",
+  "figma_call_tool", "dbeaver_simulate_change",
   "save_note", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
   "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
   "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log"
 ]);
 
 function approvalActionForTool(tool, args) {
+  if (tool === "dbeaver_execute_sql" && args?.allow_write === true) {
+    return `dbeaver:execute_sql:${JSON.stringify({ connection: args.connection || "", project: args.project || "", sql: args.sql || "" })}`;
+  }
+  if (tool === "dbeaver_simulate_change") {
+    return `dbeaver:simulate_change:${JSON.stringify({ connection: args.connection || "", project: args.project || "", sql: args.sql || "", observe_object_ids: args.observe_object_ids || [] })}`;
+  }
   if (tool === "figma_call_tool") {
     const upstreamTool = String(args?.tool || "");
     if (upstreamTool && !FIGMA_DESKTOP_READ_ONLY_TOOLS.has(upstreamTool)) {
@@ -5022,7 +5150,7 @@ function approvalActionForTool(tool, args) {
 async function enforceToolPolicy(tool, args) {
   if (["policy_status", "explain_risk", "request_approval", "request_approval_batch", "approve_request", "deny_request"].includes(tool)) return;
   if (AGENT_POLICY === "full") return;
-  if (AGENT_POLICY === "strict" && STRICT_MUTATION_TOOLS.has(tool)) {
+  if (AGENT_POLICY === "strict" && (STRICT_MUTATION_TOOLS.has(tool) || (tool === "dbeaver_execute_sql" && args?.allow_write === true))) {
     throw new Error(`Tool "${tool}" is blocked by policy=strict.`);
   }
   if (AGENT_POLICY !== "balanced") return;

@@ -14,8 +14,8 @@ import {
   tunnelAssetUrl
 } from "./local-coding-agent.mjs";
 
-test("normalizes default CLI port to 8789", () => {
-  assert.equal(normalize({}).port, "8789");
+test("normalizes isolated staging CLI port to 8790", () => {
+  assert.equal(normalize({}).port, "8790");
 });
 
 test("normalizes and deduplicates multi-project roots", () => {

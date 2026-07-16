@@ -4,7 +4,7 @@ Flow chính:
 
 ```bash
 cd /repo/can-lam-viec
-lca
+lca-custom
 ```
 
 Không bật OAuth/Auth trong connector. Không nhập Runtime API key vào Auth của ChatGPT connector.
@@ -15,12 +15,12 @@ Trong repo `local-coding-agent`, chạy wizard:
 
 ```bash
 # macOS / Linux / WSL
-bash scripts/lca setup
+bash scripts/lca-custom setup
 ```
 
 ```powershell
 # Windows
-scripts\lca.cmd setup
+scripts\lca-custom.cmd setup
 ```
 
 Wizard sẽ:
@@ -30,28 +30,28 @@ Wizard sẽ:
 - cài dependency
 - tải `tunnel-client` nếu có thể
 - ghi config local
-- cài global command `lca`
+- cài global command `lca-custom`
 
 Nếu cần mở trang key/tunnel sau setup:
 
 ```bash
-lca keys
+lca-custom keys
 ```
 
 ## 2. Chạy Cho Repo Cần Làm Việc
 
 ```bash
 cd /path/to/project
-lca
+lca-custom
 ```
 
-Nếu trước đó đang chạy workspace khác, `lca` sẽ tự restart sang workspace hiện tại.
+Nếu trước đó đang chạy workspace khác, `lca-custom` sẽ tự restart sang workspace hiện tại.
 
 Kiểm tra local:
 
 ```text
-http://127.0.0.1:8789/healthz
-lca status
+http://127.0.0.1:8790/healthz
+lca-custom status
 ```
 
 ## 3. Tạo Connector Trong ChatGPT Web
@@ -70,7 +70,7 @@ Nếu cần nhập URL thủ công, dùng MCP URL của tunnel trên trang OpenA
 https://tunnel-service.gateway.unified-0.internal.api.openai.org/v1/mcp/tunnel_...
 ```
 
-Không dùng URL local `http://127.0.0.1:8789/mcp` cho ChatGPT Web.
+Không dùng URL local `http://127.0.0.1:8790/mcp` cho ChatGPT Web.
 
 ## 4. Kiểm Tra
 
@@ -81,7 +81,7 @@ call workspace_info
 # or call lca
 ```
 
-Kết quả phải trả về root đúng với repo bạn vừa chạy `lca`.
+Kết quả phải trả về root đúng với repo bạn vừa chạy `lca-custom`.
 
 Để kiểm tra Apps SDK và PiP, gọi:
 
@@ -95,7 +95,7 @@ Widget sẽ xuất hiện inline trước. Bấm **PiP** và kiểm tra mode đ�
 
 ```bash
 cd /repo/khac
-lca
+lca-custom
 ```
 
 ChatGPT connector giữ nguyên. Workspace đổi theo repo mới.
@@ -103,7 +103,7 @@ ChatGPT connector giữ nguyên. Workspace đổi theo repo mới.
 ## 6. Dừng
 
 ```bash
-lca stop
+lca-custom stop
 ```
 
 ## Ghi Chú
