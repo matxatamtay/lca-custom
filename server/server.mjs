@@ -53,9 +53,30 @@ const HOST = process.env.AGENT_HOST || "127.0.0.1";
 
 const CONFIG_ID = String(process.env.AGENT_CONFIG_ID || "");
 
+function loadRequiredHtmlResource(filePath, label) {
+  try {
+    const text = readFileSync(filePath, "utf8");
+    if (!/<html(?:\s|>)/i.test(text) || !/<\/html>/i.test(text)) {
+      throw new Error("file is not a complete HTML document");
+    }
+    return Object.freeze({
+      text,
+      bytes: Buffer.byteLength(text, "utf8"),
+      sha256: createHash("sha256").update(text).digest("hex")
+    });
+  } catch (error) {
+    throw new Error(`Required ${label} app resource is unavailable at ${filePath}: ${error?.message || error}`);
+  }
+}
+
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const COMPANION_WIDGET_PATH = path.join(APP_DIR, "lca-compact-input-v2.html");
 const COMPANION_WIDGET_URI = "ui://widget/lca-compact-input-v2.html";
+const DBEAVER_SQL_ARTIFACT_PATH = path.join(APP_DIR, "dbeaver-sql-artifact.html");
+const COMPANION_WIDGET_RESOURCE = loadRequiredHtmlResource(COMPANION_WIDGET_PATH, "LCA companion widget");
+const DBEAVER_SQL_ARTIFACT_RESOURCE = loadRequiredHtmlResource(DBEAVER_SQL_ARTIFACT_PATH, "DBeaver SQL artifact");
+const DBEAVER_SQL_ARTIFACT_URI = `ui://widget/dbeaver-sql-artifact-${DBEAVER_SQL_ARTIFACT_RESOURCE.sha256.slice(0, 12)}.html`;
+const DBEAVER_SQL_ARTIFACT_LEGACY_URI = "ui://widget/dbeaver-sql-artifact.html";
 const DEFAULT_WORKSPACE = path.resolve(APP_DIR, "..", "agent-workspace");
 const PRIMARY_ROOT = path.resolve(process.env.AGENT_WORKSPACE || DEFAULT_WORKSPACE);
 const STARTUP_PROFILE = (() => {
@@ -104,6 +125,8 @@ const FIGMA_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.FIGMA_DESKTOP_TIMEOUT
 const DBEAVER_DESKTOP_MCP_URL = String(process.env.DBEAVER_DESKTOP_MCP_URL || DEFAULT_DBEAVER_DESKTOP_MCP_URL).trim();
 const DBEAVER_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.DBEAVER_DESKTOP_TIMEOUT_MS, 45_000, 1_000, 300_000);
 const DBEAVER_DESKTOP_AUTH_TOKEN = String(process.env.DBEAVER_DESKTOP_AUTH_TOKEN || "").trim();
+const DBEAVER_RUN_INTENT_TTL_MS = boundedNumber(process.env.DBEAVER_RUN_INTENT_TTL_MS, 10 * 60_000, 60_000, 30 * 60_000);
+const dbeaverRunIntents = new Map();
 
 const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "get_code_connect_map",
@@ -299,7 +322,20 @@ const httpServer = http.createServer(async (req, res) => {
         config_id: CONFIG_ID || null,
         roots: ROOTS,
         workspace: PRIMARY_ROOT,
-        mcp_endpoint: `http://${HOST}:${PORT}/mcp`
+        mcp_endpoint: `http://${HOST}:${PORT}/mcp`,
+        app_resources: {
+          companion_widget: {
+            uri: COMPANION_WIDGET_URI,
+            bytes: COMPANION_WIDGET_RESOURCE.bytes,
+            sha256: COMPANION_WIDGET_RESOURCE.sha256
+          },
+          dbeaver_sql_artifact: {
+            uri: DBEAVER_SQL_ARTIFACT_URI,
+            legacy_uri: DBEAVER_SQL_ARTIFACT_LEGACY_URI,
+            bytes: DBEAVER_SQL_ARTIFACT_RESOURCE.bytes,
+            sha256: DBEAVER_SQL_ARTIFACT_RESOURCE.sha256
+          }
+        }
       });
     }
     if (req.method === "GET" && url.pathname === "/.well-known/oauth-protected-resource") {
@@ -400,7 +436,7 @@ const SERVER_INSTRUCTIONS = [
   "WORKFLOW: (1) Start with workspace_snapshot for repo/git/policy in one call; use workspace_doctor when you need operational readiness. (2) Use read_many/search_text/repo_symbols to gather context in batches. (3) Use preview_patch/validate_patch before apply_patch for large edits. (4) Before marking 'done', call review_diff and session_report; run tests/build/lint only when the user explicitly asks. (5) For multi-step tasks, use task_plan + decision_log to maintain state across chats.",
   "POLICY: Check policy_status if you are unsure whether an action is allowed. In balanced policy, risky operations (delete, install, network, mutating git, risky processes) require one-time approval with request_approval/request_approval_batch followed by approve_request using AGENT_APPROVAL_TOKEN.",
   "FIGMA: LCA bridges the official Figma Desktop MCP server at 127.0.0.1:3845. For a Figma URL or current desktop selection, prefer figma_get_design_context; also call figma_get_screenshot when visual fidelity matters. Use figma_status when the bridge is unavailable and figma_list_tools/figma_call_tool for newer upstream tools.",
-  "DBEAVER: LCA bridges the patched DBeaver Desktop MCP server at 127.0.0.1:3846. Use dbeaver_status first, dbeaver_list_connections to select a live connection, dbeaver_call_tool for upstream read-only discovery tools, and dbeaver_execute_sql for queries. SQL writes require allow_write=true and are additionally governed by LCA policy.",
+  "DBEAVER: LCA bridges the patched DBeaver Desktop MCP server at 127.0.0.1:3846. Prefer dbeaver_propose_sql for visible editor changes. To run SQL, call dbeaver_prepare_sql_execution, let the user approve the exact SQL and connection inside DBeaver, then call dbeaver_execute_sql with the returned one-time approval_id. Use dbeaver_get_last_result/dbeaver_fetch_result for bounded result reading. Generic dbeaver_call_tool remains read-only.",
   "Use the DEDICATED tools instead of run_command for these — they are faster and cheaper:",
   "- Find files by name -> find_files (NOT dir/ls/Get-ChildItem/where).",
   "- Search file contents -> search_text with context= (NOT grep/findstr/Select-String).",
@@ -540,6 +576,58 @@ function buildFigmaDesktopArguments({
   return args;
 }
 
+function dbeaverToolPayload(result) {
+  if (result?.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
+  const text = result?.content?.find?.((item) => item?.type === "text")?.text;
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function pruneDBeaverRunIntents(now = Date.now()) {
+  for (const [token, intent] of dbeaverRunIntents) {
+    if (!intent || intent.expiresAtMs <= now || intent.status === "consumed") dbeaverRunIntents.delete(token);
+  }
+}
+
+function createDBeaverRunIntent(payload, args) {
+  pruneDBeaverRunIntents();
+  const token = randomUUID();
+  const expiresAtMs = Date.now() + DBEAVER_RUN_INTENT_TTL_MS;
+  const sql = String(payload?.sql || args?.sql || "");
+  const connection = payload?.connection && typeof payload.connection === "object" ? payload.connection : {};
+  const intent = {
+    token,
+    editorId: String(payload?.editor_id || args?.editor_id || ""),
+    proposalId: String(payload?.proposal_id || ""),
+    connectionId: String(connection.id || args?.connection || ""),
+    project: String(connection.project || args?.project || ""),
+    sql,
+    sqlSha256: createHash("sha256").update(sql).digest("hex"),
+    expiresAtMs,
+    status: "ready",
+    approvalId: ""
+  };
+  dbeaverRunIntents.set(token, intent);
+  return intent;
+}
+
+function requireDBeaverRunIntent(token, editorId = "") {
+  pruneDBeaverRunIntents();
+  const intent = dbeaverRunIntents.get(String(token || ""));
+  if (!intent) {
+    throw new Error("SQL execution must start from the SQL Artifact Run button. Create a proposal with dbeaver_propose_sql, then stop and wait for the user to click Run.");
+  }
+  if (editorId && intent.editorId && String(editorId) !== intent.editorId) {
+    throw new Error("The SQL Artifact Run capability is bound to a different DBeaver editor. Create a fresh proposal for this editor.");
+  }
+  return intent;
+}
+
 function registerDBeaverDesktopTools(mcp) {
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true };
   const bridgeOptions = {
@@ -547,6 +635,14 @@ function registerDBeaverDesktopTools(mcp) {
     timeoutMs: DBEAVER_DESKTOP_TIMEOUT_MS,
     authToken: DBEAVER_DESKTOP_AUTH_TOKEN
   };
+  const uiMutation = { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false };
+  const execution = { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false };
+  const forward = (name, title, description, annotations, inputSchema, meta) => reg(
+    mcp,
+    name,
+    { title, description, annotations, inputSchema, ...(meta ? { _meta: meta } : {}) },
+    async (args) => callDBeaverDesktopTool(name, args, bridgeOptions)
+  );
 
   reg(
     mcp,
@@ -605,47 +701,206 @@ function registerDBeaverDesktopTools(mcp) {
     async (args) => callDBeaverDesktopTool("dbeaver_list_connections", args, bridgeOptions)
   );
 
+  forward(
+    "dbeaver_open_sql_editor",
+    "Open SQL editor in DBeaver",
+    "Open a visible DBeaver SQL console and return its editor ID.",
+    uiMutation,
+    {
+      connection: z.string().min(1).describe("DBeaver connection ID or exact name."),
+      project: z.string().optional(),
+      database: z.string().optional().describe("Requested database/catalog context; DBeaver defaults remain authoritative."),
+      schema: z.string().optional().describe("Requested schema context; DBeaver defaults remain authoritative."),
+      title: z.string().optional(),
+      sql: z.string().optional()
+    }
+  );
+  forward("dbeaver_insert_sql", "Insert SQL in DBeaver", "Insert SQL at the current editor selection.", uiMutation, {
+    editor_id: z.string().min(1),
+    sql: z.string().min(1)
+  });
+  forward("dbeaver_replace_sql", "Replace SQL in DBeaver", "Replace the complete SQL editor document.", uiMutation, {
+    editor_id: z.string().min(1),
+    sql: z.string(),
+    select_all: z.boolean().optional()
+  });
+  forward("dbeaver_append_sql", "Append SQL in DBeaver", "Append SQL to the end of a visible editor.", uiMutation, {
+    editor_id: z.string().min(1),
+    sql: z.string().min(1)
+  });
+  forward("dbeaver_focus_editor", "Focus DBeaver editor", "Activate and focus a known SQL editor without executing anything.", uiMutation, {
+    editor_id: z.string().min(1)
+  });
+  forward("dbeaver_save_sql_snippet", "Save DBeaver SQL snippet", "Open DBeaver's Save As flow for a SQL editor.", uiMutation, {
+    editor_id: z.string().min(1)
+  });
+  forward("dbeaver_select_connection", "Select DBeaver connection", "Change the connection associated with a SQL editor.", uiMutation, {
+    editor_id: z.string().min(1),
+    connection: z.string().min(1),
+    project: z.string().optional()
+  });
+  reg(
+    mcp,
+    "dbeaver_propose_sql",
+    {
+      title: "Propose SQL in DBeaver",
+      description: "Create a visible SQL proposal, select it, and return a bounded diff. This never executes SQL. After this tool returns, stop and wait for the user to click Run in the SQL Artifact; never call execution preparation in the same assistant turn.",
+      annotations: uiMutation,
+      inputSchema: {
+        editor_id: z.string().optional(),
+        connection: z.string().optional().describe("Needed only when DBeaver must open a new editor."),
+        project: z.string().optional(),
+        database: z.string().optional(),
+        schema: z.string().optional(),
+        title: z.string().optional(),
+        sql: z.string().min(1)
+      },
+      _meta: {
+        ui: { resourceUri: DBEAVER_SQL_ARTIFACT_URI, visibility: ["model", "app"] },
+        "openai/outputTemplate": DBEAVER_SQL_ARTIFACT_URI,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening SQL artifact…",
+        "openai/toolInvocation/invoked": "SQL proposal ready."
+      }
+    },
+    async (args) => {
+      const result = await callDBeaverDesktopTool("dbeaver_propose_sql", args, bridgeOptions);
+      const payload = dbeaverToolPayload(result);
+      if (!payload?.editor_id) return result;
+      const intent = createDBeaverRunIntent(payload, args);
+      return {
+        ...result,
+        _meta: {
+          ...(result?._meta || {}),
+          dbeaver_run_intent: {
+            token: intent.token,
+            expires_at: new Date(intent.expiresAtMs).toISOString(),
+            editor_id: intent.editorId,
+            proposal_id: intent.proposalId
+          }
+        }
+      };
+    }
+  );
+  forward("dbeaver_get_active_editor", "Get active DBeaver editor", "Return active SQL editor identity and connection.", readOnly, {});
+  forward("dbeaver_get_current_selection", "Get DBeaver SQL selection", "Return selected SQL and the statement under the cursor.", readOnly, {
+    editor_id: z.string().optional()
+  });
+  reg(
+    mcp,
+    "dbeaver_prepare_sql_execution",
+    {
+      title: "Confirm SQL in DBeaver",
+      description: "Widget-only action invoked after the user clicks Run in the SQL Artifact. It confirms the exact immutable SQL and connection captured by dbeaver_propose_sql, never the editor cursor or current selection.",
+      annotations: uiMutation,
+      inputSchema: {
+        run_intent_token: z.string().min(1).describe("Hidden, short-lived capability supplied only to the SQL Artifact widget."),
+        max_rows: z.number().int().min(1).max(1000).optional(),
+        timeout_seconds: z.number().int().min(1).max(300).optional(),
+        auto_connect: z.boolean().optional()
+      },
+      _meta: {
+        ui: { visibility: ["app"] },
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Waiting for confirmation in DBeaver…",
+        "openai/toolInvocation/invoked": "DBeaver confirmation completed."
+      }
+    },
+    async ({ run_intent_token, max_rows, timeout_seconds, auto_connect }) => {
+      const intent = requireDBeaverRunIntent(run_intent_token);
+      if (intent.status !== "ready") throw new Error("This SQL Artifact Run capability has already been used.");
+      if (!intent.connectionId || !intent.sql) {
+        throw new Error("The SQL Artifact is missing its captured connection or SQL. Create a fresh proposal.");
+      }
+      const prepareArgs = {
+        connection: intent.connectionId,
+        ...(intent.project ? { project: intent.project } : {}),
+        sql: intent.sql,
+        ...(max_rows !== undefined ? { max_rows } : {}),
+        ...(timeout_seconds !== undefined ? { timeout_seconds } : {}),
+        ...(auto_connect !== undefined ? { auto_connect } : {})
+      };
+      const result = await callDBeaverDesktopTool("dbeaver_prepare_sql_execution", prepareArgs, bridgeOptions);
+      const payload = dbeaverToolPayload(result);
+      if (payload?.approved && payload?.approval_id) {
+        intent.status = "approved";
+        intent.approvalId = String(payload.approval_id);
+      }
+      return result;
+    }
+  );
   reg(
     mcp,
     "dbeaver_execute_sql",
     {
-      title: "Execute SQL in DBeaver",
-      description: "Execute SQL through a live DBeaver connection. Reads are allowed by default. Set allow_write=true explicitly for data or schema changes.",
-      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+      title: "Execute approved SQL in DBeaver",
+      description: "Widget-only action that executes the exact SQL approved in DBeaver. It requires both the native approval ID and the hidden SQL Artifact Run capability.",
+      annotations: execution,
       inputSchema: {
-        connection: z.string().min(1).describe("DBeaver connection ID or exact name."),
-        project: z.string().optional().describe("Optional exact project name used to disambiguate connection names."),
-        sql: z.string().min(1).describe("SQL statement to execute."),
-        max_rows: z.number().int().min(1).max(1000).optional().describe("Maximum returned rows. Default 200."),
-        timeout_seconds: z.number().int().min(1).max(300).optional().describe("Statement timeout. Default 30 seconds."),
-        auto_connect: z.boolean().optional().describe("Connect the data source automatically when offline. Default true."),
-        allow_write: z.boolean().optional().describe("Explicitly allow statements that may modify data or schema. Default false.")
+        run_intent_token: z.string().min(1).describe("Hidden SQL Artifact capability."),
+        approval_id: z.string().min(1)
+      },
+      _meta: {
+        ui: { visibility: ["app"] },
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Executing approved SQL…",
+        "openai/toolInvocation/invoked": "Approved SQL executed."
       }
     },
-    async (args) => callDBeaverDesktopTool("dbeaver_execute_sql", args, bridgeOptions)
+    async ({ run_intent_token, approval_id }) => {
+      const intent = requireDBeaverRunIntent(run_intent_token);
+      if (intent.status !== "approved" || intent.approvalId !== String(approval_id)) {
+        throw new Error("The approval ID is not bound to this SQL Artifact Run capability.");
+      }
+      intent.status = "consumed";
+      try {
+        return await callDBeaverDesktopTool("dbeaver_execute_sql", { approval_id }, bridgeOptions);
+      } finally {
+        dbeaverRunIntents.delete(intent.token);
+      }
+    }
   );
-
-  reg(
-    mcp,
+  forward("dbeaver_cancel_sql_execution", "Cancel approved SQL", "Cancel an unused DBeaver SQL approval.", uiMutation, {
+    approval_id: z.string().min(1)
+  });
+  forward("dbeaver_get_last_result", "Get last DBeaver result", "Return result metadata, columns, and a small preview.", readOnly, {});
+  forward("dbeaver_fetch_result", "Fetch DBeaver result page", "Fetch a bounded page from a stored SQL result.", readOnly, {
+    execution_id: z.string().optional(),
+    page: z.number().int().min(1).optional(),
+    page_size: z.number().int().min(1).max(200).optional()
+  });
+  forward("dbeaver_get_last_queries", "Get recent DBeaver operator queries", "Return recent SQL executed through the operator bridge.", readOnly, {
+    limit: z.number().int().min(1).max(100).optional()
+  });
+  forward("dbeaver_get_transaction_status", "Get DBeaver transaction status", "Read editor-scoped transaction state.", readOnly, {
+    editor_id: z.string().min(1)
+  });
+  forward("dbeaver_begin_transaction", "Begin DBeaver transaction", "Disable auto-commit for an editor execution context.", uiMutation, {
+    editor_id: z.string().min(1)
+  });
+  forward("dbeaver_commit", "Commit DBeaver transaction", "Show native confirmation and commit the editor's current transaction.", execution, {
+    editor_id: z.string().min(1)
+  });
+  forward("dbeaver_rollback", "Rollback DBeaver transaction", "Show native confirmation and roll back the editor's current transaction.", execution, {
+    editor_id: z.string().min(1)
+  });
+  forward(
     "dbeaver_simulate_change",
+    "Simulate a DBeaver data change",
+    "Show native DBeaver confirmation, run one DML statement in an isolated transaction, observe bounded state, and roll it back.",
+    execution,
     {
-      title: "Simulate a DBeaver data change",
-      description: "Run one DML statement in DBeaver's isolated transaction sandbox and roll it back. Strict policy blocks this tool; balanced policy requires approval.",
-      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
-      inputSchema: {
-        connection: z.string().min(1).describe("DBeaver connection ID or exact name."),
-        project: z.string().optional().describe("Optional project name."),
-        sql: z.string().min(1).describe("One INSERT, UPDATE, DELETE, or MERGE statement."),
-        allow_simulation: z.literal(true).describe("Explicitly acknowledge transactional DML execution."),
-        acknowledge_external_side_effects: z.literal(true).describe("Acknowledge that rollback cannot undo external side effects."),
-        observe_object_ids: z.array(z.string()).optional().describe("Optional table/view object IDs to snapshot before, during, and after rollback."),
-        observation_rows: z.number().int().min(1).max(200).optional(),
-        mask_sensitive: z.boolean().optional(),
-        timeout_seconds: z.number().int().min(1).max(300).optional(),
-        auto_connect: z.boolean().optional()
-      }
-    },
-    async (args) => callDBeaverDesktopTool("dbeaver_simulate_change", args, bridgeOptions)
+      connection: z.string().min(1),
+      project: z.string().optional(),
+      sql: z.string().min(1),
+      allow_simulation: z.literal(true),
+      acknowledge_external_side_effects: z.literal(true),
+      observe_object_ids: z.array(z.string()).optional(),
+      observation_rows: z.number().int().min(1).max(200).optional(),
+      mask_sensitive: z.boolean().optional(),
+      timeout_seconds: z.number().int().min(1).max(300).optional(),
+      auto_connect: z.boolean().optional()
+    }
   );
 }
 
@@ -855,25 +1110,48 @@ const WORKFLOW_COMMANDS = [
   }
 ];
 
-function registerCompanionAppResources(mcp) {
-  mcp.registerResource("lca-companion-widget", COMPANION_WIDGET_URI, {}, async () => ({
+function widgetResourcePayload(uri, resource, description) {
+  return {
     contents: [
       {
-        uri: COMPANION_WIDGET_URI,
+        uri,
         mimeType: "text/html;profile=mcp-app",
-        text: await readFile(COMPANION_WIDGET_PATH, "utf8"),
+        text: resource.text,
         _meta: {
           ui: {
             prefersBorder: true,
             csp: { connectDomains: [], resourceDomains: [] }
           },
-          "openai/widgetDescription": "Compact LCA input composer for PiP: one low-height prompt box with @ context, / workflow autocomplete, Enter-to-send, and token highlights.",
+          "openai/widgetDescription": description,
           "openai/widgetPrefersBorder": true,
           "openai/widgetCSP": { connect_domains: [], resource_domains: [] }
         }
       }
     ]
-  }));
+  };
+}
+
+function registerCompanionAppResources(mcp) {
+  const companionDescription = "Compact LCA input composer for PiP: one low-height prompt box with @ context, / workflow autocomplete, Enter-to-send, and token highlights.";
+  const sqlArtifactDescription = "Interactive SQL artifact for DBeaver with Open, native-confirmed Run, Explain, and Save Snippet actions.";
+  mcp.registerResource(
+    "lca-companion-widget",
+    COMPANION_WIDGET_URI,
+    {},
+    async () => widgetResourcePayload(COMPANION_WIDGET_URI, COMPANION_WIDGET_RESOURCE, companionDescription)
+  );
+  mcp.registerResource(
+    "dbeaver-sql-artifact-widget",
+    DBEAVER_SQL_ARTIFACT_URI,
+    {},
+    async () => widgetResourcePayload(DBEAVER_SQL_ARTIFACT_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, sqlArtifactDescription)
+  );
+  mcp.registerResource(
+    "dbeaver-sql-artifact-widget-legacy",
+    DBEAVER_SQL_ARTIFACT_LEGACY_URI,
+    {},
+    async () => widgetResourcePayload(DBEAVER_SQL_ARTIFACT_LEGACY_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, sqlArtifactDescription)
+  );
 }
 
 function registerCompanionTools(mcp) {
@@ -5101,19 +5379,14 @@ const POLICY_RULES = {
 };
 
 const STRICT_MUTATION_TOOLS = new Set([
-  "figma_call_tool", "dbeaver_simulate_change",
+  "figma_call_tool", "dbeaver_prepare_sql_execution", "dbeaver_execute_sql", "dbeaver_simulate_change",
+  "dbeaver_begin_transaction", "dbeaver_commit", "dbeaver_rollback",
   "save_note", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
   "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
   "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log"
 ]);
 
 function approvalActionForTool(tool, args) {
-  if (tool === "dbeaver_execute_sql" && args?.allow_write === true) {
-    return `dbeaver:execute_sql:${JSON.stringify({ connection: args.connection || "", project: args.project || "", sql: args.sql || "" })}`;
-  }
-  if (tool === "dbeaver_simulate_change") {
-    return `dbeaver:simulate_change:${JSON.stringify({ connection: args.connection || "", project: args.project || "", sql: args.sql || "", observe_object_ids: args.observe_object_ids || [] })}`;
-  }
   if (tool === "figma_call_tool") {
     const upstreamTool = String(args?.tool || "");
     if (upstreamTool && !FIGMA_DESKTOP_READ_ONLY_TOOLS.has(upstreamTool)) {
@@ -5150,7 +5423,7 @@ function approvalActionForTool(tool, args) {
 async function enforceToolPolicy(tool, args) {
   if (["policy_status", "explain_risk", "request_approval", "request_approval_batch", "approve_request", "deny_request"].includes(tool)) return;
   if (AGENT_POLICY === "full") return;
-  if (AGENT_POLICY === "strict" && (STRICT_MUTATION_TOOLS.has(tool) || (tool === "dbeaver_execute_sql" && args?.allow_write === true))) {
+  if (AGENT_POLICY === "strict" && STRICT_MUTATION_TOOLS.has(tool)) {
     throw new Error(`Tool "${tool}" is blocked by policy=strict.`);
   }
   if (AGENT_POLICY !== "balanced") return;

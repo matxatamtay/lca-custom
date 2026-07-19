@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 12px; background: transparent; }
+    .card { border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 14px; overflow: hidden; background: color-mix(in srgb, Canvas 96%, transparent); }
+    header { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent); }
+    h1 { font-size: 14px; margin: 0; }
+    .meta { opacity: .7; font-size: 12px; margin-top: 3px; }
+    .badge { font: 600 11px/1 ui-monospace, monospace; padding: 5px 8px; border-radius: 999px; background: color-mix(in srgb, currentColor 9%, transparent); }
+    pre { margin: 0; padding: 14px; max-height: 360px; overflow: auto; white-space: pre; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; background: color-mix(in srgb, currentColor 4%, transparent); }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 14px; border-top: 1px solid color-mix(in srgb, currentColor 14%, transparent); }
+    button { border: 1px solid color-mix(in srgb, currentColor 22%, transparent); border-radius: 9px; padding: 8px 11px; font: inherit; cursor: pointer; background: Canvas; color: CanvasText; }
+    button.primary { background: CanvasText; color: Canvas; }
+    button:disabled { opacity: .5; cursor: wait; }
+    .status { min-height: 20px; padding: 0 14px 12px; font-size: 12px; opacity: .8; }
+    details { margin: 0 14px 12px; }
+    details pre { border-radius: 9px; max-height: 240px; border: 1px solid color-mix(in srgb, currentColor 14%, transparent); }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <section class="card">
+    <header>
+      <div>
+        <h1>SQL Editor</h1>
+        <div id="meta" class="meta">DBeaver proposal</div>
+      </div>
+      <span class="badge">SQL ARTIFACT</span>
+    </header>
+    <pre id="sql">Loading SQL…</pre>
+    <div class="actions">
+      <button id="focus">Open in DBeaver</button>
+      <button id="run" class="primary">Run</button>
+      <button id="explain">Explain</button>
+      <button id="save">Save Snippet</button>
+    </div>
+    <div id="status" class="status">Ready. Running always requires confirmation inside DBeaver.</div>
+    <details id="details" hidden>
+      <summary>Result</summary>
+      <pre id="result"></pre>
+    </details>
+  </section>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const buttons = ['focus', 'run', 'explain', 'save'].map($);
+    let state = {};
+
+    function unwrap(result) {
+      if (result?.structuredContent && typeof result.structuredContent === 'object') return result.structuredContent;
+      const text = result?.content?.find?.((item) => item?.type === 'text')?.text;
+      if (text) { try { return JSON.parse(text); } catch {} }
+      return result || {};
+    }
+
+    async function callTool(name, args) {
+      if (!window.openai?.callTool) throw new Error('Tool calls are unavailable in this client.');
+      return unwrap(await window.openai.callTool(name, args || {}));
+    }
+
+    function setBusy(busy, message) {
+      buttons.forEach((button) => button.disabled = busy);
+      if (message) $('status').textContent = message;
+    }
+
+    function showResult(value) {
+      $('result').textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+      $('details').hidden = false;
+      $('details').open = true;
+      requestAnimationFrame(() => window.openai?.notifyIntrinsicHeight?.());
+    }
+
+    function hydrate() {
+      const output = window.openai?.toolOutput || {};
+      const input = window.openai?.toolInput || {};
+      const responseMeta = window.openai?.toolResponseMetadata || {};
+      state = {
+        ...output,
+        inputSql: input.sql || '',
+        runIntentToken: responseMeta?.dbeaver_run_intent?.token || ''
+      };
+      const sql = output.sql || input.sql || '';
+      $('sql').textContent = sql || 'SQL is visible in DBeaver.';
+      const connection = output.connection || {};
+      $('meta').textContent = [connection.project, connection.name || connection.id, output.title].filter(Boolean).join(' · ') || 'DBeaver proposal';
+      const ready = Boolean(output.editor_id);
+      $('focus').disabled = !ready;
+      $('run').disabled = !(ready && state.runIntentToken);
+      $('save').disabled = !ready;
+      if (ready && !state.runIntentToken) $('status').textContent = 'Run capability unavailable. Re-create the SQL proposal.';
+      $('explain').disabled = !(connection.id && (input.sql || output.sql));
+      requestAnimationFrame(() => window.openai?.notifyIntrinsicHeight?.());
+    }
+
+    $('focus').addEventListener('click', async () => {
+      setBusy(true, 'Focusing the SQL editor…');
+      try {
+        await callTool('dbeaver_focus_editor', { editor_id: state.editor_id });
+        $('status').textContent = 'Editor focused in DBeaver.';
+      } catch (error) { $('status').textContent = error.message; }
+      finally { setBusy(false); hydrate(); }
+    });
+
+    $('run').addEventListener('click', async () => {
+      setBusy(true, 'Waiting for confirmation inside DBeaver…');
+      try {
+        const prepared = await callTool('dbeaver_prepare_sql_execution', {
+          run_intent_token: state.runIntentToken
+        });
+        if (!prepared.approved || !prepared.approval_id) {
+          $('status').textContent = 'Execution cancelled in DBeaver.';
+          return;
+        }
+        $('status').textContent = 'Approved. Executing the exact SQL…';
+        const executed = await callTool('dbeaver_execute_sql', {
+          approval_id: prepared.approval_id,
+          run_intent_token: state.runIntentToken
+        });
+        $('status').textContent = executed.has_result_set ? `Executed. ${executed.row_count || 0} row(s) captured.` : `Executed. ${executed.update_count ?? 0} row(s) affected.`;
+        showResult(executed);
+      } catch (error) { $('status').textContent = error.message; }
+      finally { setBusy(false); hydrate(); }
+    });
+
+    $('explain').addEventListener('click', async () => {
+      setBusy(true, 'Requesting an execution plan…');
+      try {
+        const connection = state.connection || {};
+        const explained = await callTool('dbeaver_call_tool', {
+          tool: 'dbeaver_explain_query',
+          arguments: { connection: connection.id, project: connection.project, sql: state.inputSql || state.sql, analyze: false }
+        });
+        $('status').textContent = 'Execution plan ready.';
+        showResult(explained);
+      } catch (error) { $('status').textContent = error.message; }
+      finally { setBusy(false); hydrate(); }
+    });
+
+    $('save').addEventListener('click', async () => {
+      setBusy(true, 'Opening DBeaver Save As…');
+      try {
+        await callTool('dbeaver_save_sql_snippet', { editor_id: state.editor_id });
+        $('status').textContent = 'Save As completed or closed in DBeaver.';
+      } catch (error) { $('status').textContent = error.message; }
+      finally { setBusy(false); hydrate(); }
+    });
+
+    window.addEventListener('openai:set_globals', hydrate, { passive: true });
+    hydrate();
+  </script>
+</body>
+</html>

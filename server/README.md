@@ -15,7 +15,7 @@ ChatGPT sessions; it is a normal MCP connector you authorize.
 | Info | `workspace_info`, `ping` |
 | Read | `repo_overview`, `list_files`, `find_files`, `read_file`, `read_many` (concurrent + line ranges), `stat_path`, `search_text` (ripgrep/git, with context + glob), `workspace_search` (multi-project `@` autocomplete) |
 | Figma Desktop | `figma_status`, `figma_list_tools`, `figma_call_tool`, `figma_get_design_context`, `figma_get_screenshot`, `figma_get_metadata`, `figma_get_variable_defs`, `figma_get_code_connect_map`, `figma_get_figjam` |
-| DBeaver Desktop | `dbeaver_status`, `dbeaver_list_tools`, `dbeaver_list_connections`, `dbeaver_execute_sql` |
+| DBeaver Desktop | status/discovery, SQL editor UI tools, `dbeaver_propose_sql`, native-confirmed `dbeaver_prepare_sql_execution` + `dbeaver_execute_sql`, paged results, and editor-scoped transactions |
 | Write | `write_file`, `replace_in_file`, `apply_patch`, `make_dir`, `move_path`, `delete_path` |
 | Execute | `run_command`, `run_commands` (bounded batch; cmd/powershell/bash/sh/zsh) |
 | Processes | `proc_start`, `proc_list`, `proc_output`, `proc_stop` |
@@ -47,6 +47,19 @@ npm start
 - MCP endpoint: `http://127.0.0.1:8790/mcp`
 - Health: `http://127.0.0.1:8790/healthz`
 
+## DBeaver operator flow
+
+The DBeaver bridge is editor-first rather than a hidden SQL executor:
+
+1. Use `dbeaver_open_sql_editor` or `dbeaver_propose_sql` so the user can see the SQL in DBeaver. `dbeaver_propose_sql` renders an interactive SQL Artifact with **Open in DBeaver**, **Run**, **Explain**, and **Save Snippet** actions.
+2. After `dbeaver_propose_sql` returns, the model must stop. No native dialog is allowed yet.
+3. The user clicks **Run** in the SQL Artifact. The widget receives a short-lived capability through tool-result `_meta`; this value is not included in model-visible content.
+4. Only the widget can call `dbeaver_prepare_sql_execution` with that capability. LCA supplies the immutable SQL and connection captured at proposal time, so cursor movement, selection loss, or later editor focus cannot change what runs. DBeaver then displays the native dialog with the exact connection, SQL, source, and read/write risk.
+5. When the user approves, the widget receives a one-time `approval_id` and immediately calls `dbeaver_execute_sql` with both the native approval and its hidden capability.
+6. Read the preview with `dbeaver_get_last_result`, then use `dbeaver_fetch_result` for bounded pages.
+
+`dbeaver_prepare_sql_execution` and `dbeaver_execute_sql` are declared app-only and also enforce the hidden capability server-side. A model or non-widget client cannot trigger a native SQL dialog or execution by calling them directly. `dbeaver_call_tool` remains limited to upstream tools declaring `readOnlyHint=true`, so it cannot bypass the execution gate. Under `AGENT_POLICY=strict`, operator execution and transaction mutation tools are blocked, while read-only discovery remains available.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
@@ -75,6 +88,7 @@ npm start
 | `DBEAVER_DESKTOP_MCP_URL` | `http://127.0.0.1:3846/mcp` | MCP endpoint exposed by the patched DBeaver Desktop build. |
 | `DBEAVER_DESKTOP_TIMEOUT_MS` | `45000` | Timeout for connecting to or calling DBeaver Desktop MCP. |
 | `DBEAVER_DESKTOP_AUTH_TOKEN` | _(empty)_ | Bearer token matching DBeaver's `DBEAVER_MCP_AUTH_TOKEN`, when enabled. |
+| `DBEAVER_RUN_INTENT_TTL_MS` | `600000` | Lifetime of the widget-only SQL Run capability, clamped to 1-30 minutes. |
 | `DBEAVER_DESKTOP_ALLOW_REMOTE` | `0` | Set `1` only to allow a non-loopback DBeaver endpoint. |
 
 `ripgrep` (`rg`) is auto-installed by `lca-custom setup` when a supported package

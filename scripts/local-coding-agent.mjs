@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync
@@ -33,6 +34,8 @@ export const CLI_NAME = "lca-custom";
 const CONFIG_PATH = process.env.LCA_CUSTOM_CONFIG_PATH || defaultConfigPath();
 const PID_PATH = join(dirname(CONFIG_PATH), "processes.json");
 const LOG_PATH = join(dirname(CONFIG_PATH), "launcher.log");
+const START_LOCK_PATH = join(dirname(CONFIG_PATH), "start.lock");
+const START_LOCK_OWNER_PATH = join(START_LOCK_PATH, "owner.json");
 const DEFAULT_PORT = "8790";
 const DEFAULT_TUNNEL_VERSION = process.env.TUNNEL_CLIENT_VERSION || "v0.0.10";
 const DEFAULT_FIGMA_DESKTOP_MCP_URL = "http://127.0.0.1:3845/mcp";
@@ -577,6 +580,155 @@ function isPidAlive(pid) {
     return true;
   } catch {
     return false;
+  }
+}
+
+function samePath(left, right) {
+  if (!left || !right) return false;
+  try {
+    return realpathSync(String(left)) === realpathSync(String(right));
+  } catch {
+    return resolve(String(left)) === resolve(String(right));
+  }
+}
+
+function argvOptionValue(argv, option) {
+  const index = argv.lastIndexOf(option);
+  return index >= 0 && index + 1 < argv.length ? String(argv[index + 1]) : "";
+}
+
+export function isManagedTunnelArgv(argv, opts = {}) {
+  if (!Array.isArray(argv) || argv.length < 2 || !samePath(argv[0], opts.tunnelBin)) return false;
+  if (argv[1] !== "run") return false;
+  if (argvOptionValue(argv, "--profile") !== String(opts.profile || "")) return false;
+  if (!samePath(argvOptionValue(argv, "--profile-dir"), opts.profileDir)) return false;
+  const expectedTunnelId = String(opts.tunnelId || "");
+  return !expectedTunnelId || argvOptionValue(argv, "--control-plane.tunnel-id") === expectedTunnelId;
+}
+
+export function chooseManagedTunnelKeeper(processes, state = {}, current = {}) {
+  if (String(state.configId || "") !== String(current.configId || "")) return null;
+  if (String(state.port || "") !== String(current.port || "")) return null;
+  const rememberedPid = Number(state.tunnelPid || 0);
+  return processes.find((entry) => Number(entry.pid) === rememberedPid) || null;
+}
+
+function splitCommandLine(commandLine) {
+  const tokens = [];
+  let token = "";
+  let quote = "";
+  let escaped = false;
+  for (const char of String(commandLine || "")) {
+    if (escaped) {
+      token += char;
+      escaped = false;
+    } else if (char === "\\" && quote !== "'") {
+      escaped = true;
+    } else if (quote) {
+      if (char === quote) quote = "";
+      else token += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (/\s/.test(char)) {
+      if (token) {
+        tokens.push(token);
+        token = "";
+      }
+    } else {
+      token += char;
+    }
+  }
+  if (escaped) token += "\\";
+  if (token) tokens.push(token);
+  return tokens;
+}
+
+async function findManagedTunnelProcesses(opts) {
+  const matches = [];
+  if (process.platform === "linux" && existsSync("/proc")) {
+    for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+      const pid = Number(entry.name);
+      if (!pid || pid === process.pid) continue;
+      try {
+        const argv = readFileSync(`/proc/${pid}/cmdline`).toString("utf8").split("\0").filter(Boolean);
+        if (isManagedTunnelArgv(argv, opts)) matches.push({ pid, argv });
+      } catch {
+        // The process may exit while /proc is being inspected.
+      }
+    }
+  } else if (process.platform === "win32") {
+    const command = "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
+    const result = await capture("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command]);
+    if (result.code === 0 && result.stdout.trim()) {
+      try {
+        const parsed = JSON.parse(result.stdout);
+        for (const item of Array.isArray(parsed) ? parsed : [parsed]) {
+          const argv = splitCommandLine(item?.CommandLine || "");
+          if (isManagedTunnelArgv(argv, opts)) matches.push({ pid: Number(item.ProcessId), argv });
+        }
+      } catch {
+        // Fall back to the remembered PID when process enumeration is unavailable.
+      }
+    }
+  } else {
+    const result = await capture("ps", ["-eo", "pid=,command="]);
+    if (result.code === 0) {
+      for (const line of result.stdout.split(/\r?\n/)) {
+        const match = line.match(/^\s*(\d+)\s+(.+)$/);
+        if (!match) continue;
+        const argv = splitCommandLine(match[2]);
+        if (isManagedTunnelArgv(argv, opts)) matches.push({ pid: Number(match[1]), argv });
+      }
+    }
+  }
+  return matches.sort((left, right) => left.pid - right.pid);
+}
+
+async function stopManagedTunnel(entry, opts, timeoutMs = 2000) {
+  if (!entry?.pid || !isPidAlive(entry.pid)) return true;
+  killPid(entry.pid);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && isPidAlive(entry.pid)) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  if (isPidAlive(entry.pid) && process.platform !== "win32") {
+    const stillManaged = (await findManagedTunnelProcesses(opts)).some((candidate) => candidate.pid === entry.pid);
+    if (stillManaged) {
+      try { process.kill(entry.pid, "SIGKILL"); } catch {}
+    }
+  }
+  return !isPidAlive(entry.pid);
+}
+
+async function acquireStartLock(timeoutMs = 15000) {
+  ensureConfigDir();
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      mkdirSync(START_LOCK_PATH);
+      writeFileSync(START_LOCK_OWNER_PATH, `${JSON.stringify({ pid: process.pid, createdAtMs: Date.now() })}\n`, "utf8");
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        rmSync(START_LOCK_PATH, { recursive: true, force: true });
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let owner = {};
+      let lockAgeMs = Infinity;
+      try { owner = JSON.parse(readFileSync(START_LOCK_OWNER_PATH, "utf8")); } catch {}
+      try { lockAgeMs = Date.now() - statSync(START_LOCK_PATH).mtimeMs; } catch {}
+      if (!isPidAlive(owner.pid) || lockAgeMs > 5 * 60_000) {
+        rmSync(START_LOCK_PATH, { recursive: true, force: true });
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Another lca-custom start/stop operation is still running in PID ${owner.pid || "unknown"}.`);
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    }
   }
 }
 
@@ -1271,97 +1423,121 @@ async function updateSelf(flags) {
 }
 
 async function start(flags) {
-  const opts = effectiveOptions(flags);
-  validate(opts, { requireWorkspace: true, requireTunnel: true });
-  if (!existsSync(join(SERVER_DIR, SERVER_SCRIPT))) throw new Error(`Missing ${SERVER_SCRIPT} in ${SERVER_DIR}`);
-  if (!existsSync(join(SERVER_DIR, "node_modules"))) {
-    throw new Error("server/node_modules is missing. Run `node scripts/local-coding-agent.mjs install` first.");
-  }
-  if (flags.save) await saveConfig(stripRuntimeFields(opts));
-
-  const id = configId(opts);
-  const healthUrl = `http://127.0.0.1:${opts.port}/healthz`;
-  let health = await readJson(healthUrl);
-  if (health?.status === "ok" && health.config_id !== id) {
-    console.log(`[server] existing server config differs; stopping PID ${health.pid}`);
-    killPid(health.pid);
-    await new Promise((r) => setTimeout(r, 1200));
-    health = null;
-  }
-
-  const state = readPidState();
+  const releaseStartLock = await acquireStartLock();
   let serverChild = null;
-  if (!health) {
-    const env = {
-      ...process.env,
-      PORT: String(opts.port),
-      AGENT_HOST: "127.0.0.1",
-      AGENT_WORKSPACE: opts.workspace,
-      AGENT_MODE: opts.mode,
-      AGENT_POLICY: opts.policy,
-      AGENT_CONFIG_ID: id,
-      AGENT_EXTRA_ROOTS: opts.extraRoots || "",
-      AGENT_EXTRA_ROOTS_JSON: JSON.stringify(opts.projects.slice(1)),
-      MCP_AUTH_TOKEN: opts.authToken || ""
-    };
-    const stdio = flags.background ? ["ignore", "ignore", "ignore"] : "inherit";
-    serverChild = spawnLogged("server", opts.node, [SERVER_SCRIPT], {
-      cwd: SERVER_DIR,
-      env,
-      detached: Boolean(flags.background),
-      stdio
-    });
-    if (flags.background) serverChild.unref();
-    health = await waitForHealth(opts.port);
-    if (!health) throw new Error(`MCP server did not respond at ${healthUrl}`);
-    state.serverPid = health.pid || serverChild.pid;
-  } else {
-    state.serverPid = health.pid;
-  }
-
-  console.log(`[server] MCP OK:    http://127.0.0.1:${opts.port}/mcp`);
-  console.log(`[server] Version:   ${health.version || "unknown"} ${health.tier ? `(${health.tier})` : ""}`);
-
   let tunnelChild = null;
-  if (!opts.noTunnel) {
-    const runtimeKey = flags.runtimeKey || process.env[opts.runtimeKeyEnv] || opts.runtimeKey;
-    if (!runtimeKey) {
-      throw new Error(`Missing Runtime API key. Set ${opts.runtimeKeyEnv}, pass --runtime-key, or run key set.`);
+  try {
+    const opts = effectiveOptions(flags);
+    validate(opts, { requireWorkspace: true, requireTunnel: true });
+    if (!existsSync(join(SERVER_DIR, SERVER_SCRIPT))) throw new Error(`Missing ${SERVER_SCRIPT} in ${SERVER_DIR}`);
+    if (!existsSync(join(SERVER_DIR, "node_modules"))) {
+      throw new Error("server/node_modules is missing. Run `node scripts/local-coding-agent.mjs install` first.");
     }
-    const profilePath = writeTunnelProfile(opts);
-    console.log(`[tunnel] Profile: ${profilePath}`);
-    const env = {
-      ...process.env,
-      CONTROL_PLANE_API_KEY: runtimeKey,
-      CONTROL_PLANE_TUNNEL_ID: opts.tunnelId
-    };
-    if (opts.authToken) {
-      env.MCP_AUTH_HEADER = `Bearer ${opts.authToken}`;
-      env.MCP_EXTRA_HEADERS = "Authorization: env:MCP_AUTH_HEADER";
+    if (flags.save) await saveConfig(stripRuntimeFields(opts));
+
+    const id = configId(opts);
+    const healthUrl = `http://127.0.0.1:${opts.port}/healthz`;
+    let health = await readJson(healthUrl);
+    if (health?.status === "ok" && health.config_id !== id) {
+      console.log(`[server] existing server config differs; stopping PID ${health.pid}`);
+      killPid(health.pid);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 1200));
+      health = null;
     }
-    const args = [
-      "run",
-      "--profile", opts.profile,
-      "--profile-dir", opts.profileDir,
-      "--control-plane.tunnel-id", opts.tunnelId,
-      ...tunnelHealthArgs()
-    ];
-    const stdio = flags.background ? ["ignore", "ignore", "ignore"] : "inherit";
-    tunnelChild = spawnLogged("tunnel", opts.tunnelBin, args, {
-      cwd: dirname(opts.tunnelBin),
-      env,
-      detached: Boolean(flags.background),
-      stdio
-    });
-    if (flags.background) tunnelChild.unref();
-    state.tunnelPid = tunnelChild.pid;
-  } else {
-    delete state.tunnelPid;
+
+    const state = readPidState();
+    if (!health) {
+      const env = {
+        ...process.env,
+        PORT: String(opts.port),
+        AGENT_HOST: "127.0.0.1",
+        AGENT_WORKSPACE: opts.workspace,
+        AGENT_MODE: opts.mode,
+        AGENT_POLICY: opts.policy,
+        AGENT_CONFIG_ID: id,
+        AGENT_EXTRA_ROOTS: opts.extraRoots || "",
+        AGENT_EXTRA_ROOTS_JSON: JSON.stringify(opts.projects.slice(1)),
+        MCP_AUTH_TOKEN: opts.authToken || ""
+      };
+      const stdio = flags.background ? ["ignore", "ignore", "ignore"] : "inherit";
+      serverChild = spawnLogged("server", opts.node, [SERVER_SCRIPT], {
+        cwd: SERVER_DIR,
+        env,
+        detached: Boolean(flags.background),
+        stdio
+      });
+      if (flags.background) serverChild.unref();
+      health = await waitForHealth(opts.port);
+      if (!health) throw new Error(`MCP server did not respond at ${healthUrl}`);
+      state.serverPid = health.pid || serverChild.pid;
+    } else {
+      state.serverPid = health.pid;
+    }
+
+    console.log(`[server] MCP OK:    http://127.0.0.1:${opts.port}/mcp`);
+    console.log(`[server] Version:   ${health.version || "unknown"} ${health.tier ? `(${health.tier})` : ""}`);
+
+    if (!opts.noTunnel) {
+      const runtimeKey = flags.runtimeKey || process.env[opts.runtimeKeyEnv] || opts.runtimeKey;
+      if (!runtimeKey) {
+        throw new Error(`Missing Runtime API key. Set ${opts.runtimeKeyEnv}, pass --runtime-key, or run key set.`);
+      }
+      const profilePath = writeTunnelProfile(opts);
+      console.log(`[tunnel] Profile: ${profilePath}`);
+
+      const managed = await findManagedTunnelProcesses(opts);
+      const keeper = chooseManagedTunnelKeeper(managed, state, { configId: id, port: opts.port });
+      for (const entry of managed) {
+        if (keeper && entry.pid === keeper.pid) continue;
+        console.log(`[tunnel] removing duplicate or stale PID ${entry.pid}`);
+        const stopped = await stopManagedTunnel(entry, opts);
+        if (!stopped) throw new Error(`Unable to stop stale tunnel process PID ${entry.pid}.`);
+      }
+
+      if (keeper && isPidAlive(keeper.pid)) {
+        state.tunnelPid = keeper.pid;
+        console.log(`[tunnel] reusing singleton PID ${keeper.pid}`);
+      } else {
+        const env = {
+          ...process.env,
+          CONTROL_PLANE_API_KEY: runtimeKey,
+          CONTROL_PLANE_TUNNEL_ID: opts.tunnelId
+        };
+        if (opts.authToken) {
+          env.MCP_AUTH_HEADER = `Bearer ${opts.authToken}`;
+          env.MCP_EXTRA_HEADERS = "Authorization: env:MCP_AUTH_HEADER";
+        }
+        const args = [
+          "run",
+          "--profile", opts.profile,
+          "--profile-dir", opts.profileDir,
+          "--control-plane.tunnel-id", opts.tunnelId,
+          ...tunnelHealthArgs()
+        ];
+        const stdio = flags.background ? ["ignore", "ignore", "ignore"] : "inherit";
+        tunnelChild = spawnLogged("tunnel", opts.tunnelBin, args, {
+          cwd: dirname(opts.tunnelBin),
+          env,
+          detached: Boolean(flags.background),
+          stdio
+        });
+        if (flags.background) tunnelChild.unref();
+        state.tunnelPid = tunnelChild.pid;
+      }
+    } else {
+      for (const entry of await findManagedTunnelProcesses(opts)) {
+        console.log(`[tunnel] stopping disabled tunnel PID ${entry.pid}`);
+        await stopManagedTunnel(entry, opts);
+      }
+      delete state.tunnelPid;
+    }
+    state.updatedAt = new Date().toISOString();
+    state.configId = id;
+    state.port = opts.port;
+    await writePidState(state);
+  } finally {
+    releaseStartLock();
   }
-  state.updatedAt = new Date().toISOString();
-  state.configId = id;
-  state.port = opts.port;
-  await writePidState(state);
 
   if (flags.background) {
     console.log("Running in background.");
@@ -1389,20 +1565,26 @@ async function start(flags) {
 }
 
 async function stop(flags) {
-  const opts = effectiveOptions(flags);
-  const state = readPidState();
-  const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
-  if (state.tunnelPid && isPidAlive(state.tunnelPid)) {
-    console.log(`[tunnel] stopping PID ${state.tunnelPid}`);
-    killPid(state.tunnelPid);
+  const releaseStartLock = await acquireStartLock();
+  try {
+    const opts = effectiveOptions(flags);
+    const state = readPidState();
+    const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
+    const managed = await findManagedTunnelProcesses(opts);
+    for (const entry of managed) {
+      console.log(`[tunnel] stopping PID ${entry.pid}`);
+      await stopManagedTunnel(entry, opts);
+    }
+    const serverPid = health?.pid || state.serverPid;
+    if (serverPid && isPidAlive(serverPid)) {
+      console.log(`[server] stopping PID ${serverPid}`);
+      killPid(serverPid);
+    }
+    try { rmSync(PID_PATH, { force: true }); } catch { /* ignore */ }
+    console.log("Stopped.");
+  } finally {
+    releaseStartLock();
   }
-  const serverPid = health?.pid || state.serverPid;
-  if (serverPid && isPidAlive(serverPid)) {
-    console.log(`[server] stopping PID ${serverPid}`);
-    killPid(serverPid);
-  }
-  try { rmSync(PID_PATH, { force: true }); } catch { /* ignore */ }
-  console.log("Stopped.");
 }
 
 async function runningStatusForConfig(cfg = effectiveOptions()) {
@@ -1428,6 +1610,7 @@ async function status(flags) {
   const opts = effectiveOptions(flags);
   const state = readPidState();
   const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
+  const managedTunnels = opts.noTunnel ? [] : await findManagedTunnelProcesses(opts);
   const data = {
     config_path: CONFIG_PATH,
     pid_path: PID_PATH,
@@ -1439,7 +1622,10 @@ async function status(flags) {
       server: state.serverPid || null,
       server_alive: isPidAlive(state.serverPid),
       tunnel: state.tunnelPid || null,
-      tunnel_alive: isPidAlive(state.tunnelPid)
+      tunnel_alive: isPidAlive(state.tunnelPid),
+      managed_tunnels: managedTunnels.map((entry) => entry.pid),
+      tunnel_count: managedTunnels.length,
+      tunnel_duplicates: Math.max(0, managedTunnels.length - 1)
     }
   };
   if (flags.json) console.log(JSON.stringify(data, null, 2));
@@ -1449,7 +1635,7 @@ async function status(flags) {
     console.log(`Projects:  ${data.projects.length}`);
     for (const project of data.projects) console.log(`  - ${project}`);
     console.log(`Server:    ${health ? `ONLINE ${health.version || ""} (${health.mode || "mode?"}/${health.policy || "policy?"}) pid=${health.pid || "?"}` : "offline"}`);
-    console.log(`Tunnel:    ${data.pids.tunnel_alive ? `running pid=${data.pids.tunnel}` : "unknown/offline"}`);
+    console.log(`Tunnel:    ${data.pids.tunnel_alive ? `running pid=${data.pids.tunnel}` : "unknown/offline"} managed=${data.pids.tunnel_count} duplicates=${data.pids.tunnel_duplicates}`);
   }
 }
 
@@ -1468,6 +1654,12 @@ async function doctor(flags) {
   add("ripgrep", rg.code === 0, rg.code === 0 ? rg.stdout.split(/\r?\n/)[0] : "missing; run lca-custom setup to auto-install or install ripgrep manually");
   const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
   add("server health", Boolean(health), health ? `${health.version} pid=${health.pid || "?"}` : "offline");
+  const managedTunnels = opts.noTunnel ? [] : await findManagedTunnelProcesses(opts);
+  add(
+    "tunnel singleton",
+    opts.noTunnel || managedTunnels.length === 1,
+    opts.noTunnel ? "disabled" : `${managedTunnels.length} managed process(es): ${managedTunnels.map((entry) => entry.pid).join(", ") || "none"}`
+  );
   for (const check of checks) {
     console.log(`${check.ok ? "OK " : "ERR"} ${check.name}: ${check.detail}`);
   }

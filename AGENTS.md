@@ -74,6 +74,7 @@ Chi tiết: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WEB_CONNECTOR.md).
 - Đây không phải OS sandbox.
 - Chỉ connect workspace tin tưởng.
 - Không expose server public nếu chưa hiểu rủi ro.
+- DBeaver SQL là editor-first: sau `dbeaver_propose_sql` phải dừng và chờ user bấm **Run** trong SQL Artifact. Không được tự gọi `dbeaver_prepare_sql_execution` trong cùng lượt. Backend dùng capability ẩn để cưỡng chế invariant này.
 
 ## Low-Level CLI
 

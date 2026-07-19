@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import path from "node:path";
 
 import {
+  chooseManagedTunnelKeeper,
+  isManagedTunnelArgv,
   mergeDotEnvText,
   normalize,
   normalizeProjectRoots,
@@ -34,6 +36,41 @@ test("normalize keeps the primary project first and derives extra roots", () => 
   assert.deepEqual(value.projects, [first, second]);
   assert.equal(value.workspace, first);
   assert.equal(value.extraRoots, second);
+});
+
+test("matches only the exact managed tunnel command", () => {
+  const opts = {
+    tunnelBin: path.resolve("tools/tunnel-client"),
+    profile: "local-coding-agent",
+    profileDir: path.resolve("tools/profiles"),
+    tunnelId: "tunnel_demo"
+  };
+  const argv = [
+    opts.tunnelBin,
+    "run",
+    "--profile", opts.profile,
+    "--profile-dir", opts.profileDir,
+    "--control-plane.tunnel-id", opts.tunnelId
+  ];
+  assert.equal(isManagedTunnelArgv(argv, opts), true);
+  assert.equal(isManagedTunnelArgv([...argv.slice(0, -1), "tunnel_other"], opts), false);
+  assert.equal(isManagedTunnelArgv(["/tmp/other-tunnel", ...argv.slice(1)], opts), false);
+});
+
+test("reuses only the remembered tunnel for the current config", () => {
+  const processes = [{ pid: 101 }, { pid: 202 }];
+  assert.deepEqual(
+    chooseManagedTunnelKeeper(processes, { tunnelPid: 202, configId: "same", port: "8789" }, { configId: "same", port: "8789" }),
+    { pid: 202 }
+  );
+  assert.equal(
+    chooseManagedTunnelKeeper(processes, { tunnelPid: 202, configId: "old", port: "8789" }, { configId: "same", port: "8789" }),
+    null
+  );
+  assert.equal(
+    chooseManagedTunnelKeeper(processes, { tunnelPid: 202, configId: "same", port: "8790" }, { configId: "same", port: "8789" }),
+    null
+  );
 });
 
 test("maps tunnel-client release assets for supported platforms", () => {
