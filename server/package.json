@@ -19,7 +19,8 @@
     "test:pro": "node test-pro.mjs",
     "eval": "node ../evals/run.mjs",
     "test:figma": "node test-figma-desktop.mjs",
-    "test:dbeaver": "node test-dbeaver-desktop.mjs"
+    "test:dbeaver": "node test-dbeaver-desktop.mjs",
+    "test:bruno": "node test-bruno-desktop.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",

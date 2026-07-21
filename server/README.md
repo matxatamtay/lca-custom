@@ -109,3 +109,28 @@ npm run test:pro         # Pro snapshot/report/tier regression checks
 npm run test:figma       # mocked Figma Desktop MCP bridge checks
 npm run test:dbeaver     # mocked DBeaver Desktop MCP bridge and policy checks
 ```
+# Bruno Desktop bridge
+
+Local Coding Agent can connect to the Bruno Automation Platform MCP server running inside Bruno Desktop.
+
+```env
+BRUNO_DESKTOP_MCP_URL=http://127.0.0.1:3847/mcp
+BRUNO_DESKTOP_AUTH_TOKEN=<token copied from Bruno Preferences>
+BRUNO_DESKTOP_TIMEOUT_MS=120000
+BRUNO_DESKTOP_ALLOW_REMOTE=0
+```
+
+Enable MCP in Bruno Preferences, allowlist the required workspace and network hosts, then choose the smallest permission profile that fits the task. The bridge rejects non-loopback endpoints unless `BRUNO_DESKTOP_ALLOW_REMOTE=1` is explicitly set.
+
+Dedicated tools cover request and flow reads, preparation, execution, cancellation, and revision-safe flow patches. `bruno_call_tool` forwards only upstream tools annotated with `readOnlyHint=true` and `destructiveHint=false`, so it cannot be used to bypass execution or mutation policy.
+
+Flow edits require two steps:
+
+1. Call `bruno_preview_flow_patch` with `expected_revision` and operations.
+2. Review the preview, then call `bruno_apply_flow_patch` with explicit approval and the short-lived patch intent returned in `_meta`.
+
+Run the bridge integration gate with:
+
+```bash
+npm run test:bruno
+```
