@@ -50,9 +50,6 @@ export function friendlyBrunoDesktopError(error, endpoint = normalizeBrunoDeskto
   if (/401|Unauthorized|authentication failed/i.test(message)) {
     return new Error("Bruno Desktop MCP rejected authentication. Rotate or copy the token in Bruno Preferences and update BRUNO_DESKTOP_AUTH_TOKEN.");
   }
-  if (/403|permission profile|PERMISSION_DENIED/i.test(message)) {
-    return new Error(`Bruno Desktop MCP denied this operation under its current permission profile: ${message}`);
-  }
   return new Error(`Bruno Desktop MCP error: ${message}`);
 }
 
@@ -60,7 +57,7 @@ export async function withBrunoDesktopClient(callback, options = {}) {
   const endpoint = normalizeBrunoDesktopEndpoint(options.endpoint);
   const ms = timeoutMs(options.timeoutMs);
   const authToken = String(options.authToken ?? process.env.BRUNO_DESKTOP_AUTH_TOKEN ?? "").trim();
-  const client = new Client({ name: options.clientName || "local-coding-agent-bruno-bridge", version: "1.0.0" });
+  const client = new Client({ name: options.clientName || "local-coding-agent-bruno-bridge", version: "2.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
     requestInit: authToken ? { headers: { Authorization: `Bearer ${authToken}` } } : undefined
   });
@@ -91,22 +88,6 @@ export async function callBrunoDesktopTool(name, args = {}, options = {}) {
   }, options);
 }
 
-export async function callReadOnlyBrunoDesktopTool(name, args = {}, options = {}) {
-  const toolName = String(name || "").trim();
-  if (!toolName) throw new Error("Bruno tool name is required.");
-  return withBrunoDesktopClient(async (client) => {
-    const listed = await client.listTools();
-    const tool = listed.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new Error(`Bruno Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
-    }
-    if (tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true) {
-      throw new Error(`Bruno tool "${toolName}" is not declared read-only and cannot be called through bruno_call_tool.`);
-    }
-    return client.callTool({ name: toolName, arguments: args || {} });
-  }, options);
-}
-
 export async function brunoDesktopStatus(options = {}) {
   let endpoint = String(options.endpoint || process.env.BRUNO_DESKTOP_MCP_URL || DEFAULT_BRUNO_DESKTOP_MCP_URL);
   try {
@@ -116,7 +97,8 @@ export async function brunoDesktopStatus(options = {}) {
       connected: true,
       endpoint,
       tool_count: listed.tools.length,
-      tools: listed.tools.map((tool) => tool.name)
+      tools: listed.tools.map((tool) => tool.name),
+      surface: "collections"
     };
   } catch (error) {
     return {
@@ -124,28 +106,15 @@ export async function brunoDesktopStatus(options = {}) {
       endpoint,
       tool_count: 0,
       tools: [],
+      surface: "collections",
       error: error?.message || String(error),
       enable_steps: [
         "Open Bruno Desktop.",
-        "Enable Bruno MCP in Preferences and keep the endpoint loopback-only.",
-        "Copy or rotate the token and set BRUNO_DESKTOP_AUTH_TOKEN for Local Coding Agent."
+        "Enable Bruno MCP in Preferences.",
+        "Copy or rotate the local token and set BRUNO_DESKTOP_AUTH_TOKEN for Local Coding Agent."
       ]
     };
   }
-}
-
-export async function previewBrunoFlowPatch(args, options = {}) {
-  return callBrunoDesktopTool("bruno_preview_flow_patch", args, options);
-}
-
-export async function applyApprovedBrunoFlowPatch(args, options = {}) {
-  if (args?.approved !== true) {
-    throw new Error("Bruno flow patch apply requires approved=true after the preview has been reviewed.");
-  }
-  if (!args?.preview_id || !args?.expected_revision || !Array.isArray(args?.operations)) {
-    throw new Error("Bruno flow patch apply requires preview_id, expected_revision, and the exact previewed operations.");
-  }
-  return callBrunoDesktopTool("bruno_apply_flow_patch", args, options);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

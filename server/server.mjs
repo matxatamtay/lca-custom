@@ -42,12 +42,9 @@ import {
 } from "./dbeaver-desktop.mjs";
 import {
   DEFAULT_BRUNO_DESKTOP_MCP_URL,
-  applyApprovedBrunoFlowPatch,
   brunoDesktopStatus,
   callBrunoDesktopTool,
-  callReadOnlyBrunoDesktopTool,
-  listBrunoDesktopTools,
-  previewBrunoFlowPatch
+  listBrunoDesktopTools
 } from "./bruno-desktop.mjs";
 
 // ----------------------------------------------------------------------------
@@ -139,8 +136,6 @@ const dbeaverRunIntents = new Map();
 const BRUNO_DESKTOP_MCP_URL = String(process.env.BRUNO_DESKTOP_MCP_URL || DEFAULT_BRUNO_DESKTOP_MCP_URL).trim();
 const BRUNO_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.BRUNO_DESKTOP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const BRUNO_DESKTOP_AUTH_TOKEN = String(process.env.BRUNO_DESKTOP_AUTH_TOKEN || "").trim();
-const BRUNO_PATCH_INTENT_TTL_MS = boundedNumber(process.env.BRUNO_PATCH_INTENT_TTL_MS, 10 * 60_000, 60_000, 30 * 60_000);
-const brunoPatchIntents = new Map();
 
 const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "get_code_connect_map",
@@ -451,7 +446,7 @@ const SERVER_INSTRUCTIONS = [
   "POLICY: Check policy_status if you are unsure whether an action is allowed. In balanced policy, risky operations (delete, install, network, mutating git, risky processes) require one-time approval with request_approval/request_approval_batch followed by approve_request using AGENT_APPROVAL_TOKEN.",
   "FIGMA: LCA bridges the official Figma Desktop MCP server at 127.0.0.1:3845. For a Figma URL or current desktop selection, prefer figma_get_design_context; also call figma_get_screenshot when visual fidelity matters. Use figma_status when the bridge is unavailable and figma_list_tools/figma_call_tool for newer upstream tools.",
   "DBEAVER: LCA bridges the patched DBeaver Desktop MCP server at 127.0.0.1:3846. Prefer dbeaver_propose_sql for visible editor changes. To run SQL, call dbeaver_prepare_sql_execution, let the user approve the exact SQL and connection inside DBeaver, then call dbeaver_execute_sql with the returned one-time approval_id. Use dbeaver_get_last_result/dbeaver_fetch_result for bounded result reading. Generic dbeaver_call_tool remains read-only.",
-  "BRUNO: LCA bridges Bruno Desktop MCP at 127.0.0.1:3847. For API work, use bruno_search_requests -> bruno_prepare_request -> bruno_run_request, pass environment_name/environment_uid plus runtime_variables when needed, then consume response.body, tests, assertions, and variableChanges from the structured result. GET/HEAD/OPTIONS run autonomously in balanced policy; side-effect methods require allow_side_effects=true plus approval. Flow edits must preview before apply. Generic bruno_call_tool remains read-only.",
+  "BRUNO: LCA mirrors Bruno Desktop's collection-native MCP at 127.0.0.1:3847. Use bruno_list_collections/bruno_search_requests to discover data, bruno_get_request to read the complete editable definition, bruno_update_request or bruno_update_request_tab for every request field/tab, and bruno_run_request plus bruno_get_request_run for execution. Collection, folder, environment, dotenv, request CRUD, and request execution are forwarded directly without an extra LCA policy gate. Flow Studio and Intelligence Suite are not exposed.",
   "Use the DEDICATED tools instead of run_command for these — they are faster and cheaper:",
   "- Find files by name -> find_files (NOT dir/ls/Get-ChildItem/where).",
   "- Search file contents -> search_text with context= (NOT grep/findstr/Select-String).",
@@ -644,65 +639,10 @@ function requireDBeaverRunIntent(token, editorId = "") {
   return intent;
 }
 
-function pruneBrunoPatchIntents() {
-  const now = Date.now();
-  for (const [token, intent] of brunoPatchIntents) {
-    if (intent.expiresAtMs <= now || intent.status === "consumed") brunoPatchIntents.delete(token);
-  }
-}
-
-function hashBrunoPatchIntent(value) {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-function createBrunoPatchIntent(payload, args) {
-  pruneBrunoPatchIntents();
-  const token = randomUUID();
-  const binding = {
-    workspace_uid: args.workspace_uid || null,
-    workspace_path: args.workspace_path || null,
-    flow_uid: args.flow_uid || null,
-    relative_path: args.relative_path || null,
-    expected_revision: args.expected_revision,
-    operations: args.operations
-  };
-  const intent = {
-    token,
-    previewId: String(payload.preview_id),
-    proposedRevision: payload.proposed_revision || null,
-    binding,
-    bindingHash: hashBrunoPatchIntent(binding),
-    status: "ready",
-    expiresAtMs: Date.now() + BRUNO_PATCH_INTENT_TTL_MS
-  };
-  brunoPatchIntents.set(token, intent);
-  return intent;
-}
-
-function requireBrunoPatchIntent(token, args) {
-  pruneBrunoPatchIntents();
-  const intent = brunoPatchIntents.get(String(token || ""));
-  if (!intent) throw new Error("Bruno flow patch apply requires a fresh preview intent from bruno_preview_flow_patch.");
-  if (intent.status !== "ready") throw new Error("This Bruno flow patch intent has already been used.");
-  const binding = {
-    workspace_uid: args.workspace_uid || null,
-    workspace_path: args.workspace_path || null,
-    flow_uid: args.flow_uid || null,
-    relative_path: args.relative_path || null,
-    expected_revision: args.expected_revision,
-    operations: args.operations
-  };
-  if (hashBrunoPatchIntent(binding) !== intent.bindingHash) {
-    throw new Error("Bruno flow patch apply does not match the exact workspace, flow, revision, and operations captured by the preview.");
-  }
-  return intent;
-}
-
 function registerBrunoDesktopTools(mcp) {
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true };
-  const execution = { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false };
-  const cancellation = { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: true };
-  const mutation = { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false };
+  const mutation = { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false };
+  const destructive = { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false };
   const bridgeOptions = {
     endpoint: BRUNO_DESKTOP_MCP_URL,
     timeoutMs: BRUNO_DESKTOP_TIMEOUT_MS,
@@ -712,23 +652,34 @@ function registerBrunoDesktopTools(mcp) {
     workspace_uid: z.string().min(1).optional(),
     workspace_path: z.string().min(1).optional()
   };
-  const flowSchema = {
+  const collectionSchema = {
     ...workspaceSchema,
-    flow_uid: z.string().min(1).optional(),
-    relative_path: z.string().min(1).optional()
+    collection_path: z.string().min(1)
   };
-  const requestSchema = {
+  const requestReferenceSchema = {
     ...workspaceSchema,
     request_uid: z.string().min(1).optional(),
     collection_path: z.string().min(1).optional(),
     item_pathname: z.string().min(1).optional()
   };
-  const requestExecutionSchema = {
-    ...requestSchema,
+  const mutationSchema = {
+    definition: z.record(z.string(), z.any()).optional(),
+    changes: z.record(z.string(), z.any()).optional(),
+    set: z.record(z.string(), z.any()).optional(),
+    unset: z.array(z.string().min(1)).optional()
+  };
+  const executionSchema = {
+    ...requestReferenceSchema,
     environment_uid: z.string().min(1).optional(),
     environment_name: z.string().min(1).optional(),
-    runtime_variables: z.record(z.any()).optional(),
-    prompt_variables: z.record(z.any()).optional()
+    runtime_variables: z.record(z.string(), z.any()).optional(),
+    prompt_variables: z.record(z.string(), z.any()).optional()
+  };
+  const environmentReferenceSchema = {
+    ...collectionSchema,
+    environment_uid: z.string().optional(),
+    environment_name: z.string().optional(),
+    environment_filename: z.string().optional()
   };
   const forward = (name, title, description, annotations, inputSchema) => reg(
     mcp,
@@ -742,7 +693,7 @@ function registerBrunoDesktopTools(mcp) {
     "bruno_status",
     {
       title: "Bruno Desktop status",
-      description: "Check whether Bruno Desktop MCP is running and list its live tools.",
+      description: "Check whether Bruno Desktop's collection-native MCP is running and list its live tools.",
       annotations: readOnly,
       inputSchema: {}
     },
@@ -754,7 +705,7 @@ function registerBrunoDesktopTools(mcp) {
     "bruno_list_tools",
     {
       title: "List Bruno Desktop tools",
-      description: "List Bruno MCP tools, annotations, and JSON schemas exposed by the running desktop application.",
+      description: "List every live Bruno MCP tool with its annotations and JSON schema.",
       annotations: readOnly,
       inputSchema: {}
     },
@@ -768,126 +719,162 @@ function registerBrunoDesktopTools(mcp) {
     mcp,
     "bruno_call_tool",
     {
-      title: "Call a read-only Bruno tool",
-      description: "Forward only an upstream Bruno tool that declares readOnlyHint=true and destructiveHint=false. Execution and mutation tools are always rejected.",
-      annotations: readOnly,
+      title: "Call any Bruno Desktop tool",
+      description: "Forward any currently exposed Bruno Desktop MCP tool without an additional LCA permission, trusted-domain, side-effect, or flow policy layer. Use bruno_list_tools first for the exact upstream schema.",
+      annotations: mutation,
       inputSchema: {
         tool: z.string().min(1),
         arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments }) => callReadOnlyBrunoDesktopTool(tool, upstreamArguments || {}, bridgeOptions)
+    async ({ tool, arguments: upstreamArguments }) => callBrunoDesktopTool(tool, upstreamArguments || {}, bridgeOptions)
   );
 
-  forward("bruno_list_workspaces", "List Bruno workspaces", "List workspaces explicitly allowlisted by Bruno MCP preferences.", readOnly, {});
-  forward("bruno_list_flows", "List Bruno flows", "List Flow Studio flows in an allowed workspace.", readOnly, workspaceSchema);
-  forward("bruno_get_flow", "Read Bruno flow", "Read one canonical redacted Flow Studio definition.", readOnly, flowSchema);
-  forward("bruno_search_requests", "Search Bruno requests", "Search requests by name, method, URL, or pathname.", readOnly, {
+  forward("bruno_list_workspaces", "List Bruno workspaces", "List workspace roots configured for Bruno collection discovery.", readOnly, {});
+  forward("bruno_list_collections", "List Bruno collections", "Find Bruno collections under a workspace.", readOnly, { ...workspaceSchema, query: z.string().optional() });
+  forward("bruno_get_collection", "Get Bruno collection", "Read a complete collection definition, settings, nested items, and environments.", readOnly, collectionSchema);
+  forward("bruno_create_collection", "Create Bruno collection", "Create a .bru or OpenCollection YAML collection.", mutation, {
     ...workspaceSchema,
+    location: z.string().optional(),
+    name: z.string().min(1),
+    folder_name: z.string().optional(),
+    format: z.enum(["bru", "yml"]).optional(),
+    bruno_config: z.record(z.string(), z.any()).optional(),
+    root: z.record(z.string(), z.any()).optional()
+  });
+  forward("bruno_update_collection", "Update Bruno collection", "Replace, merge, set, or unset any collection root/config field.", mutation, {
+    ...collectionSchema,
+    name: z.string().optional(),
+    ...mutationSchema
+  });
+  forward("bruno_update_collection_tab", "Update Bruno collection tab", "Edit overview, headers, vars, auth, script, tests, docs, presets, proxy, client-certificates, or protobuf.", mutation, {
+    ...collectionSchema,
+    tab: z.string().min(1),
+    value: z.any()
+  });
+  forward("bruno_clone_collection", "Clone Bruno collection", "Clone a complete collection including requests, environments, dotenv, and settings.", mutation, {
+    ...collectionSchema,
+    target_location: z.string().optional(),
+    folder_name: z.string().optional(),
+    name: z.string().optional()
+  });
+  forward("bruno_move_collection", "Move Bruno collection", "Move or rename a collection directory and optionally change its display name.", mutation, {
+    ...collectionSchema,
+    target_location: z.string().optional(),
+    folder_name: z.string().optional(),
+    name: z.string().optional()
+  });
+  forward("bruno_delete_collection", "Delete Bruno collection", "Delete a collection directory and all contents.", destructive, collectionSchema);
+  forward("bruno_resequence_items", "Resequence Bruno items", "Set request and folder seq values used by the collection sidebar.", mutation, {
+    ...collectionSchema,
+    items: z.array(z.object({ path: z.string().min(1), seq: z.number() }))
+  });
+  forward("bruno_list_collection_items", "List Bruno collection items", "Read the complete nested folder/request tree.", readOnly, collectionSchema);
+
+  forward("bruno_get_folder", "Get Bruno folder", "Read a complete folder definition and every Folder Settings tab.", readOnly, { ...collectionSchema, folder_path: z.string() });
+  forward("bruno_create_folder", "Create Bruno folder", "Create a folder with an optional complete definition.", mutation, {
+    ...collectionSchema,
+    parent_path: z.string().optional(),
+    folder_name: z.string().min(1),
+    name: z.string().optional(),
+    seq: z.number().optional(),
+    definition: z.record(z.string(), z.any()).optional()
+  });
+  forward("bruno_update_folder", "Update Bruno folder", "Replace, merge, set, or unset any folder field.", mutation, {
+    ...collectionSchema,
+    folder_path: z.string(),
+    ...mutationSchema
+  });
+  forward("bruno_update_folder_tab", "Update Bruno folder tab", "Edit headers, vars, auth, script, tests, docs, or settings.", mutation, {
+    ...collectionSchema,
+    folder_path: z.string(),
+    tab: z.string().min(1),
+    value: z.any()
+  });
+  forward("bruno_delete_folder", "Delete Bruno folder", "Delete a folder and all nested requests.", destructive, { ...collectionSchema, folder_path: z.string().min(1) });
+  forward("bruno_move_item", "Move Bruno item", "Move or rename a request or folder inside a collection.", mutation, {
+    ...collectionSchema,
+    source_path: z.string().min(1),
+    target_folder: z.string().optional(),
+    new_filename: z.string().optional()
+  });
+
+  forward("bruno_list_requests", "List Bruno requests", "List requests across a workspace or within one collection.", readOnly, {
+    ...workspaceSchema,
+    collection_path: z.string().optional(),
+    limit: z.number().int().min(1).max(10000).optional()
+  });
+  forward("bruno_search_requests", "Search Bruno requests", "Search by name, type, method, URL, collection, or pathname.", readOnly, {
+    ...workspaceSchema,
+    collection_path: z.string().optional(),
     query: z.string().min(1),
-    limit: z.number().int().min(1).max(1000).optional()
+    limit: z.number().int().min(1).max(10000).optional()
   });
-  forward("bruno_get_request", "Read Bruno request", "Read one redacted Bruno request definition.", readOnly, requestSchema);
-  forward("bruno_get_run", "Read Bruno run", "Read the safe status and result summary for a Bruno flow run.", readOnly, { run_id: z.string().min(1) });
-  forward("bruno_get_run_events", "Read Bruno run events", "Read redacted events for a Bruno flow run.", readOnly, {
-    run_id: z.string().min(1),
-    after_sequence: z.number().int().min(0).optional(),
-    limit: z.number().int().min(1).max(5000).optional()
+  forward("bruno_get_request", "Get Bruno request", "Read the complete editable request definition including every persisted tab and field.", readOnly, requestReferenceSchema);
+  forward("bruno_create_request", "Create Bruno request", "Create HTTP, GraphQL, gRPC, WebSocket, or SSE request with an optional full definition.", mutation, {
+    ...collectionSchema,
+    folder_path: z.string().optional(),
+    name: z.string().min(1),
+    filename: z.string().optional(),
+    type: z.string().optional(),
+    method: z.string().optional(),
+    url: z.string().optional(),
+    seq: z.number().optional(),
+    definition: z.record(z.string(), z.any()).optional()
   });
-  forward("bruno_prepare_request", "Prepare Bruno request", "Resolve a request with its real Bruno collection, folder, environment, dotenv, and runtime-variable context without network execution.", readOnly, requestExecutionSchema);
-  forward("bruno_prepare_flow_run", "Prepare Bruno flow run", "Validate flow inputs, hosts, and side effects without network execution.", readOnly, flowSchema);
-  forward("bruno_preview_resolved_request", "Preview resolved Bruno request", "Resolve one Flow Studio request node without calling the network.", readOnly, {
-    ...flowSchema,
-    node_id: z.string().min(1),
-    inputs: z.record(z.any()).optional()
+  forward("bruno_update_request", "Update Bruno request", "Universal request editor: replace, deep-merge, set, unset, rename, or move any current or future field.", mutation, {
+    ...requestReferenceSchema,
+    name: z.string().optional(),
+    new_item_pathname: z.string().optional(),
+    ...mutationSchema
   });
+  forward("bruno_update_request_tab", "Update Bruno request tab", "Edit params, body, headers/metadata, auth, vars, script, assert, tests, docs, query, message, examples, app, or settings.", mutation, {
+    ...requestReferenceSchema,
+    tab: z.string().min(1),
+    value: z.any()
+  });
+  forward("bruno_duplicate_request", "Duplicate Bruno request", "Duplicate a request with every tab and example preserved.", mutation, {
+    ...requestReferenceSchema,
+    name: z.string().optional(),
+    filename: z.string().optional(),
+    folder_path: z.string().optional()
+  });
+  forward("bruno_delete_request", "Delete Bruno request", "Delete a request file.", destructive, requestReferenceSchema);
 
-  forward("bruno_run_request", "Run Bruno request", "Execute one allowlisted Bruno request through the normal desktop execution service and return the structured response body, tests, assertions, and variable changes. Read-only methods run autonomously; side-effect methods require allow_side_effects=true and policy approval.", execution, {
-    ...requestExecutionSchema,
-    correlation_id: z.string().optional(),
-    allow_side_effects: z.boolean().optional()
+  forward("bruno_list_environments", "List Bruno environments", "List complete collection environments and variable definitions.", readOnly, collectionSchema);
+  forward("bruno_get_environment", "Get Bruno environment", "Read one complete environment definition.", readOnly, environmentReferenceSchema);
+  forward("bruno_create_environment", "Create Bruno environment", "Create an environment including typed, described, annotated, colored, and secret variables.", mutation, {
+    ...collectionSchema,
+    name: z.string().min(1),
+    filename: z.string().optional(),
+    definition: z.record(z.string(), z.any()).optional()
   });
-  forward("bruno_run_flow", "Run Bruno flow", "Run an allowlisted Flow Studio flow and return a structured run resource.", execution, {
-    ...flowSchema,
+  forward("bruno_update_environment", "Update Bruno environment", "Replace, merge, set, unset, rename, or move any environment field or variable.", mutation, {
+    ...environmentReferenceSchema,
+    name: z.string().optional(),
+    new_filename: z.string().optional(),
+    ...mutationSchema
+  });
+  forward("bruno_delete_environment", "Delete Bruno environment", "Delete a collection environment.", destructive, environmentReferenceSchema);
+
+  forward("bruno_get_dotenv", "Get Bruno dotenv", "Read a collection .env file as raw content and parsed variables.", readOnly, { ...collectionSchema, filename: z.string().optional() });
+  forward("bruno_set_dotenv", "Set Bruno dotenv", "Create or replace a collection .env file from raw content or variables.", mutation, {
+    ...collectionSchema,
+    filename: z.string().optional(),
+    content: z.string().optional(),
+    variables: z.record(z.string(), z.any()).optional()
+  });
+  forward("bruno_delete_dotenv", "Delete Bruno dotenv", "Delete a collection .env file.", destructive, { ...collectionSchema, filename: z.string().optional() });
+
+  forward("bruno_prepare_request", "Prepare Bruno request", "Resolve normal Bruno collection, folder, environment, dotenv, runtime, and prompt-variable precedence without sending.", readOnly, executionSchema);
+  forward("bruno_run_request", "Run Bruno request", "Run any Bruno request through the normal desktop engine and return the complete stored result. No separate LCA side-effect approval is added.", mutation, {
+    ...executionSchema,
     run_id: z.string().optional(),
-    inputs: z.record(z.any()).optional(),
-    dataset: z.any().optional(),
-    wait_mode: z.enum(["start", "complete"]).optional(),
-    idempotency_key: z.string().optional()
+    correlation_id: z.string().optional(),
+    wait_mode: z.enum(["start", "complete"]).optional()
   });
-  forward("bruno_cancel_run", "Cancel Bruno flow run", "Cancel an active Flow Studio run and wait for Bruno cleanup semantics.", cancellation, {
-    run_id: z.string().min(1)
-  });
-  reg(
-    mcp,
-    "bruno_preview_flow_patch",
-    {
-      title: "Preview Bruno flow patch",
-      description: "Preview a revision-safe Flow Studio patch. This never writes and returns a short-lived intent bound to the exact revision and operations.",
-      annotations: readOnly,
-      inputSchema: {
-        ...flowSchema,
-        expected_revision: z.string().min(1),
-        operations: z.array(z.object({
-          op: z.enum(["add", "replace", "remove"]),
-          path: z.string().min(1),
-          value: z.any().optional()
-        })).min(1).max(100)
-      }
-    },
-    async (args) => {
-      const result = await previewBrunoFlowPatch(args, bridgeOptions);
-      const payload = dbeaverToolPayload(result);
-      if (result?.isError || payload?.valid !== true || !payload?.preview_id) return result;
-      const intent = createBrunoPatchIntent(payload, args);
-      return {
-        ...result,
-        _meta: {
-          ...(result?._meta || {}),
-          bruno_patch_intent: {
-            token: intent.token,
-            preview_id: intent.previewId,
-            proposed_revision: intent.proposedRevision,
-            expires_at: new Date(intent.expiresAtMs).toISOString()
-          }
-        }
-      };
-    }
-  );
-
-  reg(
-    mcp,
-    "bruno_apply_flow_patch",
-    {
-      title: "Apply approved Bruno flow patch",
-      description: "Apply the exact previewed Flow Studio patch. Requires explicit approval and a short-lived intent bound to workspace, flow, revision, and operations.",
-      annotations: mutation,
-      inputSchema: {
-        patch_intent_token: z.string().min(1),
-        approved: z.literal(true),
-        ...flowSchema,
-        expected_revision: z.string().min(1),
-        operations: z.array(z.object({
-          op: z.enum(["add", "replace", "remove"]),
-          path: z.string().min(1),
-          value: z.any().optional()
-        })).min(1).max(100)
-      }
-    },
-    async ({ patch_intent_token, approved, ...args }) => {
-      const intent = requireBrunoPatchIntent(patch_intent_token, args);
-      intent.status = "consumed";
-      try {
-        return await applyApprovedBrunoFlowPatch({
-          ...args,
-          preview_id: intent.previewId,
-          approved
-        }, bridgeOptions);
-      } finally {
-        brunoPatchIntents.delete(intent.token);
-      }
-    }
-  );
+  forward("bruno_get_request_run", "Get Bruno request run", "Read a previously started request run and its complete result.", readOnly, { run_id: z.string().min(1) });
+  forward("bruno_list_request_runs", "List Bruno request runs", "List request runs retained by the current Bruno Desktop process.", readOnly, { limit: z.number().int().min(1).max(1000).optional() });
 }
 
 function registerDBeaverDesktopTools(mcp) {
@@ -5643,21 +5630,12 @@ const POLICY_RULES = {
 const STRICT_MUTATION_TOOLS = new Set([
   "figma_call_tool", "dbeaver_prepare_sql_execution", "dbeaver_execute_sql", "dbeaver_simulate_change",
   "dbeaver_begin_transaction", "dbeaver_commit", "dbeaver_rollback",
-  "bruno_run_request", "bruno_run_flow", "bruno_cancel_run", "bruno_apply_flow_patch",
   "save_note", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
   "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
   "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log"
 ]);
 
 function approvalActionForTool(tool, args) {
-  if (tool === "bruno_run_request") {
-    return args?.allow_side_effects === true
-      ? `bruno:${tool}:${JSON.stringify(args || {})}`
-      : null;
-  }
-  if (["bruno_run_flow", "bruno_cancel_run", "bruno_apply_flow_patch"].includes(tool)) {
-    return `bruno:${tool}:${JSON.stringify(args || {})}`;
-  }
   if (tool === "figma_call_tool") {
     const upstreamTool = String(args?.tool || "");
     if (upstreamTool && !FIGMA_DESKTOP_READ_ONLY_TOOLS.has(upstreamTool)) {

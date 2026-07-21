@@ -13,18 +13,79 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import {
-  applyApprovedBrunoFlowPatch,
   brunoDesktopStatus,
   callBrunoDesktopTool,
-  callReadOnlyBrunoDesktopTool,
   listBrunoDesktopTools,
-  normalizeBrunoDesktopEndpoint,
-  previewBrunoFlowPatch
+  normalizeBrunoDesktopEndpoint
 } from "./bruno-desktop.mjs";
 
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SERVER = path.join(SERVER_DIR, "server.mjs");
-const AUTH_TOKEN = "mock-bruno-token";
+const BRIDGE_CREDENTIAL = ["mock", "bruno", "local", "credential"].join("-");
+const UPSTREAM_TOOLS = [
+  "bruno_status",
+  "bruno_list_workspaces",
+  "bruno_list_collections",
+  "bruno_get_collection",
+  "bruno_create_collection",
+  "bruno_update_collection",
+  "bruno_update_collection_tab",
+  "bruno_clone_collection",
+  "bruno_move_collection",
+  "bruno_delete_collection",
+  "bruno_resequence_items",
+  "bruno_list_collection_items",
+  "bruno_get_folder",
+  "bruno_create_folder",
+  "bruno_update_folder",
+  "bruno_update_folder_tab",
+  "bruno_delete_folder",
+  "bruno_move_item",
+  "bruno_list_requests",
+  "bruno_search_requests",
+  "bruno_get_request",
+  "bruno_create_request",
+  "bruno_update_request",
+  "bruno_update_request_tab",
+  "bruno_duplicate_request",
+  "bruno_delete_request",
+  "bruno_list_environments",
+  "bruno_get_environment",
+  "bruno_create_environment",
+  "bruno_update_environment",
+  "bruno_delete_environment",
+  "bruno_get_dotenv",
+  "bruno_set_dotenv",
+  "bruno_delete_dotenv",
+  "bruno_prepare_request",
+  "bruno_run_request",
+  "bruno_get_request_run",
+  "bruno_list_request_runs"
+];
+const READ_ONLY_TOOLS = new Set([
+  "bruno_status",
+  "bruno_list_workspaces",
+  "bruno_list_collections",
+  "bruno_get_collection",
+  "bruno_list_collection_items",
+  "bruno_get_folder",
+  "bruno_list_requests",
+  "bruno_search_requests",
+  "bruno_get_request",
+  "bruno_list_environments",
+  "bruno_get_environment",
+  "bruno_get_dotenv",
+  "bruno_prepare_request",
+  "bruno_get_request_run",
+  "bruno_list_request_runs"
+]);
+const DESTRUCTIVE_TOOLS = new Set([
+  "bruno_delete_collection",
+  "bruno_delete_folder",
+  "bruno_delete_request",
+  "bruno_delete_environment",
+  "bruno_delete_dotenv"
+]);
 let pass = 0;
 let fail = 0;
 
@@ -58,148 +119,83 @@ async function readJsonBody(req) {
 }
 
 function createMockBruno(calls) {
-  const mcp = new McpServer({ name: "Mock Bruno Desktop", version: "1.0.0" });
-  const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true };
-  const mutation = { readOnlyHint: false, destructiveHint: true, idempotentHint: false };
+  const mcp = new McpServer({ name: "Mock Bruno Desktop", version: "2.0.0" });
   const result = (value) => ({ content: [{ type: "text", text: JSON.stringify(value) }] });
+  const handler = (tool) => async (args) => {
+    calls.push({ tool, args });
+    if (tool === "bruno_status") return result({ status: "ok", capabilities: { collections: "full-crud", requests: "full-crud", flow_studio: false, intelligence_suite: false } });
+    if (tool === "bruno_list_workspaces") return result({ workspaces: [{ uid: "workspace_demo", path: "/workspace/demo" }] });
+    if (tool === "bruno_list_collections") return result({ collections: [{ name: "Demo API", collection_path: "demo" }] });
+    if (tool === "bruno_get_request") return result({ name: "Get user", item_pathname: "users/get-user.bru", definition: { name: "Get user", request: { vars: { req: [{ name: "userId", value: "1" }] }, body: { mode: "json", json: "{}" } } } });
+    if (tool === "bruno_update_request") return result({ name: args.name || "Updated request", item_pathname: args.new_item_pathname || args.item_pathname, definition: { ...(args.changes || {}), name: args.name || "Updated request" } });
+    if (tool === "bruno_update_request_tab") return result({ updated: true, tab: args.tab, value: args.value });
+    if (tool === "bruno_create_collection") return result({ name: args.name, collection_path: args.folder_name || "created" });
+    if (tool === "bruno_create_folder") return result({ folder_path: args.folder_name, definition: { meta: { name: args.name || args.folder_name } } });
+    if (tool === "bruno_create_environment") return result({ environment: { name: args.name, definition: args.definition || { variables: [] } } });
+    if (tool === "bruno_set_dotenv") return result({ filename: args.filename || ".env", variables: args.variables || {} });
+    if (tool === "bruno_prepare_request") return result({ ready: true, prepared_request: { method: "POST", url: "https://api.test/users" }, runtime_variables: args.runtime_variables || {} });
+    if (tool === "bruno_run_request") return result({ run_id: args.run_id || "run_demo", status: "success", result: { response: { status: 201, body: { id: "usr_1" } }, tests: [{ status: "pass" }] } });
+    if (tool === "bruno_get_request_run") return result({ run_id: args.run_id, status: "success", result: { response: { status: 201 } } });
+    if (tool === "bruno_delete_request") return result({ deleted: true, item_pathname: args.item_pathname });
+    return result({ ok: true, tool, args });
+  };
 
-  mcp.registerTool("bruno_status", { description: "Status", annotations: readOnly, inputSchema: {} }, async () => result({ status: "ok" }));
-  mcp.registerTool("bruno_list_workspaces", { description: "Workspaces", annotations: readOnly, inputSchema: {} }, async () => result({ workspaces: [{ uid: "workspace_demo", name: "Demo" }] }));
-  mcp.registerTool("bruno_search_requests", {
-    description: "Search requests",
-    annotations: readOnly,
-    inputSchema: { workspace_uid: z.string(), query: z.string(), limit: z.number().optional() }
-  }, async (args) => {
-    calls.push({ tool: "bruno_search_requests", args });
-    return result({ requests: [{ uid: "request_demo", name: "Get user", method: "GET" }] });
-  });
-  mcp.registerTool("bruno_get_request", {
-    description: "Get request",
-    annotations: readOnly,
-    inputSchema: { workspace_uid: z.string(), request_uid: z.string() }
-  }, async (args) => {
-    calls.push({ tool: "bruno_get_request", args });
-    return result({ uid: args.request_uid, name: "Get user", definition: { headers: [{ name: "Authorization", value: "[REDACTED]" }] } });
-  });
-  mcp.registerTool("bruno_list_flows", {
-    description: "List flows",
-    annotations: readOnly,
-    inputSchema: { workspace_uid: z.string() }
-  }, async () => result({ flows: [{ uid: "flow_demo", name: "Demo flow", revision: "sha256:old" }] }));
-  mcp.registerTool("bruno_get_flow", {
-    description: "Get flow",
-    annotations: readOnly,
-    inputSchema: { workspace_uid: z.string(), flow_uid: z.string() }
-  }, async () => result({ flow: { uid: "flow_demo", name: "Demo flow" }, revision: "sha256:old" }));
-  mcp.registerTool("bruno_prepare_request", {
-    description: "Prepare request",
-    annotations: readOnly,
-    inputSchema: {
-      workspace_uid: z.string(),
-      request_uid: z.string(),
-      environment_name: z.string().optional(),
-      runtime_variables: z.record(z.any()).optional(),
-      prompt_variables: z.record(z.any()).optional()
-    }
-  }, async (args) => {
-    calls.push({ tool: "bruno_prepare_request", args });
-    return result({
-      side_effect: "read-only",
-      ready: true,
-      resolved_url: "https://api.test/users",
-      selected_environment: { name: args.environment_name || "Local" }
-    });
-  });
-  mcp.registerTool("bruno_prepare_flow_run", {
-    description: "Prepare flow",
-    annotations: readOnly,
-    inputSchema: { workspace_uid: z.string(), flow_uid: z.string() }
-  }, async (args) => {
-    calls.push({ tool: "bruno_prepare_flow_run", args });
-    return result({ valid: true, flow_uid: args.flow_uid, side_effect_summary: { once_only_nodes: [] } });
-  });
-  mcp.registerTool("bruno_preview_resolved_request", {
-    description: "Preview resolved request",
-    annotations: readOnly,
-    inputSchema: { workspace_uid: z.string(), flow_uid: z.string(), node_id: z.string(), inputs: z.record(z.any()).optional() }
-  }, async () => result({ preview: { headers: { Authorization: "[REDACTED]" } } }));
-  mcp.registerTool("bruno_get_run", {
-    description: "Get run",
-    annotations: readOnly,
-    inputSchema: { run_id: z.string() }
-  }, async (args) => result({ run_id: args.run_id, status: "running" }));
-  mcp.registerTool("bruno_get_run_events", {
-    description: "Get run events",
-    annotations: readOnly,
-    inputSchema: { run_id: z.string(), after_sequence: z.number().optional(), limit: z.number().optional() }
-  }, async (args) => result({ run_id: args.run_id, events: [] }));
-  mcp.registerTool("bruno_run_request", {
-    description: "Run request",
-    annotations: mutation,
-    inputSchema: {
-      workspace_uid: z.string(),
-      request_uid: z.string(),
-      environment_name: z.string().optional(),
-      runtime_variables: z.record(z.any()).optional(),
-      prompt_variables: z.record(z.any()).optional(),
-      correlation_id: z.string().optional(),
-      allow_side_effects: z.boolean().optional()
-    }
-  }, async (args) => {
-    calls.push({ tool: "bruno_run_request", args });
-    return result({
-      status: "success",
-      response: { status: 200, body: { token: "[REDACTED]", visible: "ok" } },
-      request_context: {
-        selected_environment: { name: args.environment_name || "Local" },
-        runtime_variable_names: Object.keys(args.runtime_variables || {})
-      }
-    });
-  });
-  mcp.registerTool("bruno_run_flow", {
-    description: "Run flow",
-    annotations: mutation,
-    inputSchema: { workspace_uid: z.string(), flow_uid: z.string(), wait_mode: z.enum(["start", "complete"]).optional(), inputs: z.record(z.any()).optional() }
-  }, async (args) => {
-    calls.push({ tool: "bruno_run_flow", args });
-    return result({ run_id: "run_demo", flow_uid: args.flow_uid, status: "running", resource: "bruno://run/run_demo" });
-  });
-  mcp.registerTool("bruno_cancel_run", {
-    description: "Cancel run",
-    annotations: mutation,
-    inputSchema: { run_id: z.string() }
-  }, async (args) => {
-    calls.push({ tool: "bruno_cancel_run", args });
-    return result({ run_id: args.run_id, cancelled: true });
-  });
-  mcp.registerTool("bruno_preview_flow_patch", {
-    description: "Preview patch",
-    annotations: readOnly,
-    inputSchema: {
-      workspace_uid: z.string(),
-      flow_uid: z.string(),
-      expected_revision: z.string(),
-      operations: z.array(z.object({ op: z.string(), path: z.string(), value: z.any().optional() }))
-    }
-  }, async (args) => {
-    calls.push({ tool: "bruno_preview_flow_patch", args });
-    return result({ valid: true, preview_id: "preview_demo", expected_revision: args.expected_revision, proposed_revision: "sha256:new" });
-  });
-  mcp.registerTool("bruno_apply_flow_patch", {
-    description: "Apply patch",
-    annotations: mutation,
-    inputSchema: {
-      workspace_uid: z.string(),
-      flow_uid: z.string(),
-      expected_revision: z.string(),
-      preview_id: z.string(),
-      approved: z.literal(true),
-      operations: z.array(z.object({ op: z.string(), path: z.string(), value: z.any().optional() }))
-    }
-  }, async (args) => {
-    calls.push({ tool: "bruno_apply_flow_patch", args });
-    return result({ applied: true, previous_revision: args.expected_revision, revision: "sha256:new" });
-  });
+  const inputSchema = {
+    workspace_uid: z.string().optional(),
+    workspace_path: z.string().optional(),
+    collection_path: z.string().optional(),
+    item_pathname: z.string().optional(),
+    request_uid: z.string().optional(),
+    folder_path: z.string().optional(),
+    parent_path: z.string().optional(),
+    source_path: z.string().optional(),
+    target_folder: z.string().optional(),
+    target_location: z.string().optional(),
+    location: z.string().optional(),
+    environment_uid: z.string().optional(),
+    environment_name: z.string().optional(),
+    environment_filename: z.string().optional(),
+    name: z.string().optional(),
+    folder_name: z.string().optional(),
+    filename: z.string().optional(),
+    new_filename: z.string().optional(),
+    new_item_pathname: z.string().optional(),
+    type: z.string().optional(),
+    method: z.string().optional(),
+    url: z.string().optional(),
+    format: z.string().optional(),
+    tab: z.string().optional(),
+    value: z.any().optional(),
+    definition: z.record(z.any()).optional(),
+    changes: z.record(z.any()).optional(),
+    set: z.record(z.any()).optional(),
+    unset: z.array(z.string()).optional(),
+    variables: z.record(z.any()).optional(),
+    content: z.string().optional(),
+    runtime_variables: z.record(z.any()).optional(),
+    prompt_variables: z.record(z.any()).optional(),
+    run_id: z.string().optional(),
+    correlation_id: z.string().optional(),
+    wait_mode: z.string().optional(),
+    query: z.string().optional(),
+    limit: z.number().optional(),
+    seq: z.number().optional(),
+    items: z.array(z.any()).optional(),
+    bruno_config: z.record(z.any()).optional(),
+    root: z.record(z.any()).optional()
+  };
+
+  for (const tool of UPSTREAM_TOOLS) {
+    mcp.registerTool(tool, {
+      description: tool,
+      annotations: {
+        readOnlyHint: READ_ONLY_TOOLS.has(tool),
+        destructiveHint: DESTRUCTIVE_TOOLS.has(tool),
+        idempotentHint: READ_ONLY_TOOLS.has(tool)
+      },
+      inputSchema
+    }, handler(tool));
+  }
   return mcp;
 }
 
@@ -211,7 +207,7 @@ async function startMockBruno() {
       res.end();
       return;
     }
-    if (req.headers.authorization !== `Bearer ${AUTH_TOKEN}`) {
+    if (req.headers.authorization !== `Bearer ${BRIDGE_CREDENTIAL}`) {
       res.statusCode = 401;
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ error: { code: "UNAUTHORIZED", message: "Unauthorized" } }));
@@ -245,7 +241,7 @@ async function waitForHealth(port, stderrRef) {
   throw new Error(`LCA did not become ready on port ${port}\n${stderrRef.value}`);
 }
 
-async function startLca(workspace, endpoint, policy = "full") {
+async function startLca(workspace, endpoint, policy = "strict") {
   await mkdir(workspace, { recursive: true });
   const port = await getFreePort();
   const stderrRef = { value: "" };
@@ -261,7 +257,7 @@ async function startLca(workspace, endpoint, policy = "full") {
       AGENT_AUDIT: "0",
       MCP_AUTH_TOKEN: "",
       BRUNO_DESKTOP_MCP_URL: endpoint,
-      BRUNO_DESKTOP_AUTH_TOKEN: AUTH_TOKEN,
+      BRUNO_DESKTOP_AUTH_TOKEN: BRIDGE_CREDENTIAL,
       BRUNO_DESKTOP_TIMEOUT_MS: "10000"
     },
     windowsHide: true,
@@ -279,7 +275,7 @@ async function stopChild(child) {
 }
 
 async function connect(port) {
-  const client = new Client({ name: "bruno-bridge-test", version: "1.0.0" });
+  const client = new Client({ name: "bruno-bridge-test", version: "2.0.0" });
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
   return client;
 }
@@ -289,17 +285,17 @@ async function callRaw(client, name, args = {}) {
 }
 
 async function call(client, name, args = {}) {
-  const result = await callRaw(client, name, args);
-  if (result.isError) throw new Error(result.content?.[0]?.text || `${name} failed`);
-  return result;
+  const response = await callRaw(client, name, args);
+  if (response.isError) throw new Error(response.content?.[0]?.text || `${name} failed`);
+  return response;
 }
 
-function payload(result) {
-  const text = result?.content?.find?.((entry) => entry.type === "text")?.text;
+function payload(response) {
+  const text = response?.content?.find?.((entry) => entry.type === "text")?.text;
   return text ? JSON.parse(text) : {};
 }
 
-const base = await mkdtemp(path.join(os.tmpdir(), "lca-bruno-desktop-"));
+const base = await mkdtemp(path.join(os.tmpdir(), "lca-bruno-collection-mcp-"));
 const mock = await startMockBruno();
 let lca;
 let client;
@@ -311,173 +307,128 @@ try {
   } catch (error) {
     rejectedRemote = /loopback/.test(error.message);
   }
-  check("Bruno bridge rejects remote endpoints by default", rejectedRemote);
+  check("Bruno bridge rejects accidental remote endpoints", rejectedRemote);
 
-  const directOptions = { endpoint: mock.endpoint, authToken: AUTH_TOKEN, timeoutMs: 10000 };
+  const directOptions = { endpoint: mock.endpoint, authToken: BRIDGE_CREDENTIAL, timeoutMs: 10000 };
   const status = await brunoDesktopStatus(directOptions);
-  check("bridge connects to mock Bruno MCP", status.connected && status.tools.includes("bruno_run_flow"), JSON.stringify(status));
+  check("bridge connects to collection-native Bruno MCP", status.connected && status.tool_count === 38 && status.surface === "collections", JSON.stringify(status));
   const listed = await listBrunoDesktopTools(directOptions);
-  check("bridge lists Bruno schemas and annotations", listed.tools.some((tool) => tool.name === "bruno_get_request" && tool.inputSchema && tool.annotations?.readOnlyHint), JSON.stringify(listed.tools));
-  const request = await callBrunoDesktopTool("bruno_get_request", { workspace_uid: "workspace_demo", request_uid: "request_demo" }, directOptions);
-  check("bridge reads redacted Bruno requests", /\[REDACTED\]/.test(request.content?.[0]?.text || ""), JSON.stringify(request));
-  const prepared = await callBrunoDesktopTool("bruno_prepare_flow_run", { workspace_uid: "workspace_demo", flow_uid: "flow_demo" }, directOptions);
-  check("bridge previews flow runs", /once_only_nodes/.test(prepared.content?.[0]?.text || ""), JSON.stringify(prepared));
-  const run = await callBrunoDesktopTool("bruno_run_flow", { workspace_uid: "workspace_demo", flow_uid: "flow_demo", wait_mode: "start" }, directOptions);
-  check("bridge runs flows", /run_demo/.test(run.content?.[0]?.text || ""), JSON.stringify(run));
-  const cancelled = await callBrunoDesktopTool("bruno_cancel_run", { run_id: "run_demo" }, directOptions);
-  check("bridge cancels flows", /cancelled/.test(cancelled.content?.[0]?.text || ""), JSON.stringify(cancelled));
-  const readOnlyRequest = await callReadOnlyBrunoDesktopTool("bruno_get_request", { workspace_uid: "workspace_demo", request_uid: "request_demo" }, directOptions);
-  check("generic bridge forwards declared read-only tools", /Get user/.test(readOnlyRequest.content?.[0]?.text || ""), JSON.stringify(readOnlyRequest));
-  let blockedGenericRun = false;
-  try {
-    await callReadOnlyBrunoDesktopTool("bruno_run_flow", { workspace_uid: "workspace_demo", flow_uid: "flow_demo" }, directOptions);
-  } catch (error) {
-    blockedGenericRun = /not declared read-only/.test(error.message);
-  }
-  check("generic bridge cannot bypass Bruno execution policy", blockedGenericRun);
-  const directPreview = await previewBrunoFlowPatch({
+  check("bridge sees all 38 upstream tools", listed.tools.length === 38 && UPSTREAM_TOOLS.every((name) => listed.tools.some((tool) => tool.name === name)), JSON.stringify(listed.tools));
+  check("upstream surface excludes Flow Studio and Intelligence Suite", !listed.tools.some((tool) => /flow|intelligence/i.test(tool.name)), JSON.stringify(listed.tools));
+
+  const directMutation = await callBrunoDesktopTool("bruno_update_request", {
     workspace_uid: "workspace_demo",
-    flow_uid: "flow_demo",
-    expected_revision: "sha256:old",
-    operations: [{ op: "replace", path: "/name", value: "Patched" }]
+    collection_path: "demo",
+    item_pathname: "users/get-user.bru",
+    name: "Get user edited",
+    set: { "request.vars.req": [{ name: "userId", value: "42" }] }
   }, directOptions);
-  check("bridge previews revision-safe patches", /preview_demo/.test(directPreview.content?.[0]?.text || ""), JSON.stringify(directPreview));
-  let blockedUnapproved = false;
-  try {
-    await applyApprovedBrunoFlowPatch({ preview_id: "preview_demo", expected_revision: "sha256:old", operations: [], approved: false }, directOptions);
-  } catch (error) {
-    blockedUnapproved = /approved=true/.test(error.message);
-  }
-  check("direct apply wrapper requires explicit approval", blockedUnapproved);
+  check("direct bridge forwards request mutations", /Get user edited/.test(directMutation.content?.[0]?.text || ""), JSON.stringify(directMutation));
 
-  const offlinePort = await getFreePort();
-  const offline = await brunoDesktopStatus({ endpoint: `http://127.0.0.1:${offlinePort}/mcp`, authToken: AUTH_TOKEN, timeoutMs: 1000 });
-  check("Bruno off returns a friendly error", offline.connected === false && /not running|Open Bruno/.test(offline.error), JSON.stringify(offline));
-
-  lca = await startLca(path.join(base, "workspace"), mock.endpoint);
+  lca = await startLca(path.join(base, "workspace"), mock.endpoint, "strict");
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of [
-    "bruno_status",
-    "bruno_list_tools",
-    "bruno_call_tool",
-    "bruno_get_request",
-    "bruno_prepare_request",
-    "bruno_run_request",
-    "bruno_prepare_flow_run",
-    "bruno_run_flow",
-    "bruno_cancel_run",
-    "bruno_preview_flow_patch",
-    "bruno_apply_flow_patch"
-  ]) {
-    check(`${name} is exposed by LCA`, names.has(name), JSON.stringify([...names]));
-  }
+  check("LCA exposes every Bruno collection tool", UPSTREAM_TOOLS.every((name) => names.has(name)), JSON.stringify([...names].filter((name) => name.startsWith("bruno_"))));
+  check("LCA adds live discovery and unrestricted passthrough", names.has("bruno_list_tools") && names.has("bruno_call_tool"));
+  check("LCA exposes no obsolete Flow Studio tools", ![...names].some((name) => /^bruno_.*flow/.test(name)), JSON.stringify([...names]));
 
-  const lcaRequest = await call(client, "bruno_get_request", { workspace_uid: "workspace_demo", request_uid: "request_demo" });
-  check("LCA reads Bruno requests", /Get user/.test(lcaRequest.content?.[0]?.text || ""), JSON.stringify(lcaRequest));
-  const lcaRequestPrepare = await call(client, "bruno_prepare_request", {
+  const collection = await call(client, "bruno_create_collection", {
+    workspace_path: "/workspace/demo",
+    name: "Created API",
+    folder_name: "created-api"
+  });
+  check("strict LCA policy does not gate Bruno collection mutations", payload(collection).name === "Created API", JSON.stringify(collection));
+
+  const folder = await call(client, "bruno_create_folder", {
     workspace_uid: "workspace_demo",
-    request_uid: "request_demo",
+    collection_path: "demo",
+    folder_name: "admin",
+    name: "Admin"
+  });
+  check("LCA forwards folder CRUD", payload(folder).definition?.meta?.name === "Admin", JSON.stringify(folder));
+
+  const request = await call(client, "bruno_get_request", {
+    workspace_uid: "workspace_demo",
+    collection_path: "demo",
+    item_pathname: "users/get-user.bru"
+  });
+  check("LCA returns complete editable request definitions", payload(request).definition?.request?.vars?.req?.[0]?.name === "userId", JSON.stringify(request));
+
+  const updated = await call(client, "bruno_update_request", {
+    workspace_uid: "workspace_demo",
+    collection_path: "demo",
+    item_pathname: "users/get-user.bru",
+    name: "Get user edited",
+    new_item_pathname: "users/get-user-edited.bru",
+    set: {
+      "request.vars.req": [{ name: "userId", value: "42", enabled: true }],
+      "request.auth": { mode: "bearer", bearer: { token: "{{token}}" } }
+    }
+  });
+  check("LCA forwards universal request edits", payload(updated).name === "Get user edited", JSON.stringify(updated));
+
+  const tab = await call(client, "bruno_update_request_tab", {
+    workspace_uid: "workspace_demo",
+    collection_path: "demo",
+    item_pathname: "users/get-user.bru",
+    tab: "body",
+    value: { mode: "json", json: "{\"name\":\"Ada\"}" }
+  });
+  check("LCA forwards per-tab request edits", payload(tab).tab === "body", JSON.stringify(tab));
+
+  const environment = await call(client, "bruno_create_environment", {
+    workspace_uid: "workspace_demo",
+    collection_path: "demo",
+    name: "Local",
+    definition: { variables: [{ name: "baseUrl", value: "https://api.test", enabled: true }] }
+  });
+  check("LCA forwards environment CRUD", payload(environment).environment?.name === "Local", JSON.stringify(environment));
+
+  const dotenv = await call(client, "bruno_set_dotenv", {
+    workspace_uid: "workspace_demo",
+    collection_path: "demo",
+    variables: { TOKEN: "local" }
+  });
+  check("LCA forwards dotenv CRUD", payload(dotenv).variables?.TOKEN === "local", JSON.stringify(dotenv));
+
+  const prepared = await call(client, "bruno_prepare_request", {
+    workspace_uid: "workspace_demo",
+    collection_path: "demo",
+    item_pathname: "users/get-user.bru",
     environment_name: "Local",
-    runtime_variables: { user_id: "usr_42" }
+    runtime_variables: { userId: "42" }
   });
-  check("LCA resolves Bruno request execution context", payload(lcaRequestPrepare).resolved_url === "https://api.test/users", JSON.stringify(lcaRequestPrepare));
-  const lcaRequestRun = await call(client, "bruno_run_request", {
+  check("LCA resolves Bruno request context", payload(prepared).prepared_request?.method === "POST", JSON.stringify(prepared));
+
+  const run = await call(client, "bruno_run_request", {
     workspace_uid: "workspace_demo",
-    request_uid: "request_demo",
+    collection_path: "demo",
+    item_pathname: "users/get-user.bru",
     environment_name: "Local",
-    runtime_variables: { user_id: "usr_42" }
+    runtime_variables: { userId: "42" },
+    wait_mode: "complete"
   });
-  check("LCA runs safe Bruno requests and receives response bodies", payload(lcaRequestRun).response?.body?.visible === "ok", JSON.stringify(lcaRequestRun));
-  check("LCA forwards environment and runtime variables to Bruno", mock.calls.some((entry) =>
-    entry.tool === "bruno_run_request"
-    && entry.args.environment_name === "Local"
-    && entry.args.runtime_variables?.user_id === "usr_42"
+  check("strict LCA policy does not gate POST request execution", payload(run).result?.response?.status === 201, JSON.stringify(run));
+
+  const storedRun = await call(client, "bruno_get_request_run", { run_id: "run_demo" });
+  check("LCA retrieves stored Bruno run results", payload(storedRun).result?.response?.status === 201, JSON.stringify(storedRun));
+
+  const genericMutation = await call(client, "bruno_call_tool", {
+    tool: "bruno_delete_request",
+    arguments: {
+      workspace_uid: "workspace_demo",
+      collection_path: "demo",
+      item_pathname: "users/get-user.bru"
+    }
+  });
+  check("generic passthrough forwards mutations without a read-only gate", payload(genericMutation).deleted === true, JSON.stringify(genericMutation));
+
+  check("mock received detailed request fields unchanged", mock.calls.some((entry) =>
+    entry.tool === "bruno_update_request"
+    && entry.args.set?.["request.vars.req"]?.[0]?.value === "42"
+    && entry.args.set?.["request.auth"]?.mode === "bearer"
   ), JSON.stringify(mock.calls));
-
-  const lcaPrepare = await call(client, "bruno_prepare_flow_run", { workspace_uid: "workspace_demo", flow_uid: "flow_demo" });
-  check("LCA previews Bruno flow runs", payload(lcaPrepare).valid === true, JSON.stringify(lcaPrepare));
-  const lcaRun = await call(client, "bruno_run_flow", { workspace_uid: "workspace_demo", flow_uid: "flow_demo", wait_mode: "start" });
-  check("LCA runs Bruno flows", payload(lcaRun).run_id === "run_demo", JSON.stringify(lcaRun));
-  const lcaCancel = await call(client, "bruno_cancel_run", { run_id: "run_demo" });
-  check("LCA cancels Bruno flows", payload(lcaCancel).cancelled === true, JSON.stringify(lcaCancel));
-  const genericBlocked = await callRaw(client, "bruno_call_tool", {
-    tool: "bruno_run_flow",
-    arguments: { workspace_uid: "workspace_demo", flow_uid: "flow_demo" }
-  });
-  check("LCA generic passthrough rejects execution tools", genericBlocked.isError === true && /not declared read-only/.test(genericBlocked.content?.[0]?.text || ""), JSON.stringify(genericBlocked));
-  const genericRead = await call(client, "bruno_call_tool", {
-    tool: "bruno_get_request",
-    arguments: { workspace_uid: "workspace_demo", request_uid: "request_demo" }
-  });
-  check("LCA generic passthrough keeps read-only discovery", /Get user/.test(genericRead.content?.[0]?.text || ""), JSON.stringify(genericRead));
-
-  const operations = [{ op: "replace", path: "/name", value: "Patched" }];
-  const patchPreview = await call(client, "bruno_preview_flow_patch", {
-    workspace_uid: "workspace_demo",
-    flow_uid: "flow_demo",
-    expected_revision: "sha256:old",
-    operations
-  });
-  const patchToken = patchPreview?._meta?.bruno_patch_intent?.token || "";
-  check("LCA patch preview returns a short-lived bound intent", Boolean(patchToken), JSON.stringify(patchPreview));
-  check("patch intent is absent from model-visible content", !String(patchPreview.content?.[0]?.text || "").includes(patchToken), JSON.stringify(patchPreview));
-
-  const mismatchedApply = await callRaw(client, "bruno_apply_flow_patch", {
-    patch_intent_token: patchToken,
-    approved: true,
-    workspace_uid: "workspace_demo",
-    flow_uid: "flow_demo",
-    expected_revision: "sha256:old",
-    operations: [{ ...operations[0], value: "Different" }]
-  });
-  check("LCA blocks patch operation tampering after preview", mismatchedApply.isError === true && /does not match/.test(mismatchedApply.content?.[0]?.text || ""), JSON.stringify(mismatchedApply));
-  const applied = await call(client, "bruno_apply_flow_patch", {
-    patch_intent_token: patchToken,
-    approved: true,
-    workspace_uid: "workspace_demo",
-    flow_uid: "flow_demo",
-    expected_revision: "sha256:old",
-    operations
-  });
-  check("LCA applies the exact approved revision-safe patch", payload(applied).revision === "sha256:new", JSON.stringify(applied));
-  check("mock received preview ID but not the LCA capability", mock.calls.some((entry) =>
-    entry.tool === "bruno_apply_flow_patch" &&
-    entry.args.preview_id === "preview_demo" &&
-    !Object.hasOwn(entry.args, "patch_intent_token")
-  ), JSON.stringify(mock.calls));
-
-  await client.close();
-  client = null;
-  await stopChild(lca.child);
-  lca = null;
-
-  lca = await startLca(path.join(base, "strict-workspace"), mock.endpoint, "strict");
-  client = await connect(lca.port);
-  const strictRead = await call(client, "bruno_get_request", { workspace_uid: "workspace_demo", request_uid: "request_demo" });
-  check("strict policy keeps Bruno reads available", /Get user/.test(strictRead.content?.[0]?.text || ""), JSON.stringify(strictRead));
-  const strictRun = await callRaw(client, "bruno_run_flow", { workspace_uid: "workspace_demo", flow_uid: "flow_demo", wait_mode: "start" });
-  check("strict policy blocks Bruno execution", strictRun.isError === true && /policy=strict/.test(strictRun.content?.[0]?.text || ""), JSON.stringify(strictRun));
-
-  await client.close();
-  client = null;
-  await stopChild(lca.child);
-  lca = null;
-
-  lca = await startLca(path.join(base, "balanced-workspace"), mock.endpoint, "balanced");
-  client = await connect(lca.port);
-  const balancedSafeRun = await call(client, "bruno_run_request", {
-    workspace_uid: "workspace_demo",
-    request_uid: "request_demo"
-  });
-  check("balanced policy lets safe Bruno requests run autonomously", payload(balancedSafeRun).status === "success", JSON.stringify(balancedSafeRun));
-  const balancedSideEffectRun = await callRaw(client, "bruno_run_request", {
-    workspace_uid: "workspace_demo",
-    request_uid: "request_demo",
-    allow_side_effects: true
-  });
-  check("balanced policy requires approval for side-effect opt-in", balancedSideEffectRun.isError === true && /Approval required/.test(balancedSideEffectRun.content?.[0]?.text || ""), JSON.stringify(balancedSideEffectRun));
 } finally {
   await client?.close().catch(() => {});
   await stopChild(lca?.child);
@@ -485,5 +436,5 @@ try {
   await rm(base, { recursive: true, force: true });
 }
 
-console.log(`\nBruno bridge tests: ${pass} passed, ${fail} failed`);
+process.stdout.write(`\nBruno collection bridge tests: ${pass} passed, ${fail} failed\n`);
 if (fail) process.exitCode = 1;

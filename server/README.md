@@ -16,6 +16,7 @@ ChatGPT sessions; it is a normal MCP connector you authorize.
 | Read | `repo_overview`, `list_files`, `find_files`, `read_file`, `read_many` (concurrent + line ranges), `stat_path`, `search_text` (ripgrep/git, with context + glob), `workspace_search` (multi-project `@` autocomplete) |
 | Figma Desktop | `figma_status`, `figma_list_tools`, `figma_call_tool`, `figma_get_design_context`, `figma_get_screenshot`, `figma_get_metadata`, `figma_get_variable_defs`, `figma_get_code_connect_map`, `figma_get_figjam` |
 | DBeaver Desktop | status/discovery, SQL editor UI tools, `dbeaver_propose_sql`, native-confirmed `dbeaver_prepare_sql_execution` + `dbeaver_execute_sql`, paged results, and editor-scoped transactions |
+| Bruno Desktop | complete collection, folder, request, environment, dotenv CRUD; full request-tab editing; request preparation, execution, and retained results |
 | Write | `write_file`, `replace_in_file`, `apply_patch`, `make_dir`, `move_path`, `delete_path` |
 | Execute | `run_command`, `run_commands` (bounded batch; cmd/powershell/bash/sh/zsh) |
 | Processes | `proc_start`, `proc_list`, `proc_output`, `proc_stop` |
@@ -111,7 +112,7 @@ npm run test:dbeaver     # mocked DBeaver Desktop MCP bridge and policy checks
 ```
 # Bruno Desktop bridge
 
-Local Coding Agent can connect to the Bruno Automation Platform MCP server running inside Bruno Desktop.
+Local Coding Agent mirrors the collection-native MCP server running inside Bruno Desktop.
 
 ```env
 BRUNO_DESKTOP_MCP_URL=http://127.0.0.1:3847/mcp
@@ -120,14 +121,17 @@ BRUNO_DESKTOP_TIMEOUT_MS=120000
 BRUNO_DESKTOP_ALLOW_REMOTE=0
 ```
 
-Enable MCP in Bruno Preferences, allowlist the required workspace and network hosts, then choose the smallest permission profile that fits the task. The bridge rejects non-loopback endpoints unless `BRUNO_DESKTOP_ALLOW_REMOTE=1` is explicitly set.
+Enable MCP in Bruno Preferences, copy or rotate its local token, and set `BRUNO_DESKTOP_AUTH_TOKEN`. Configured workspace paths are discovery shortcuts rather than authorization allowlists. The bridge still defaults to a loopback endpoint so the local token is not sent over an accidental network path.
 
-Dedicated tools cover request and flow reads, preparation, execution, cancellation, and revision-safe flow patches. `bruno_call_tool` forwards only upstream tools annotated with `readOnlyHint=true` and `destructiveHint=false`, so it cannot be used to bypass execution or mutation policy.
+LCA exposes the complete Bruno surface directly:
 
-Flow edits require two steps:
+- collection discovery, read, create, update, tab editing, clone, move, delete, and resequencing;
+- folder read/create/update/tab editing/move/delete;
+- request list/search/get/create/update/tab editing/duplicate/move/delete;
+- environment and dotenv CRUD;
+- request preparation, execution, asynchronous run IDs, retained results, and run listing.
 
-1. Call `bruno_preview_flow_patch` with `expected_revision` and operations.
-2. Review the preview, then call `bruno_apply_flow_patch` with explicit approval and the short-lived patch intent returned in `_meta`.
+`bruno_get_request` returns the complete persisted definition. `bruno_update_request` supports `definition`, recursive `changes`, path-based `set`, and `unset`; `bruno_update_request_tab` addresses every current Bruno request tab. `bruno_call_tool` forwards any live upstream Bruno tool for forward compatibility. LCA does not add permission profiles, trusted-domain checks, side-effect approval, or Flow Studio patch policy to Bruno calls. Flow Studio and Intelligence Suite are intentionally absent.
 
 Run the bridge integration gate with:
 
