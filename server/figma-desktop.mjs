@@ -2,9 +2,13 @@
 // Copyright (c) 2026 Lương Duy
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { pathToFileURL } from "node:url";
+import {
+  PersistentHttpMcpClient,
+  PersistentHttpMcpClientRegistry,
+  normalizeTimeout,
+  persistentHttpClientKey
+} from "./persistent-http-mcp-client.mjs";
 
 export const DEFAULT_FIGMA_DESKTOP_MCP_URL = "http://127.0.0.1:3845/mcp";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -54,19 +58,7 @@ export function parseFigmaNodeReference(value) {
   return { nodeId, fileKey, url: url.toString() };
 }
 
-function timeoutMs(value) {
-  const parsed = Number(value ?? process.env.FIGMA_DESKTOP_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
-  if (!Number.isFinite(parsed)) return DEFAULT_TIMEOUT_MS;
-  return Math.min(120_000, Math.max(1_000, Math.trunc(parsed)));
-}
-
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms.`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
+const figmaClients = new PersistentHttpMcpClientRegistry();
 
 export function friendlyFigmaDesktopError(error, endpoint = normalizeFigmaDesktopEndpoint()) {
   const message = String(error?.cause?.message || error?.message || error || "Unknown error");
@@ -78,36 +70,41 @@ export function friendlyFigmaDesktopError(error, endpoint = normalizeFigmaDeskto
   return new Error(`Figma Desktop MCP error: ${message}`);
 }
 
-export async function withFigmaDesktopClient(callback, options = {}) {
+function getFigmaDesktopClient(options = {}) {
   const endpoint = normalizeFigmaDesktopEndpoint(options.endpoint);
-  const ms = timeoutMs(options.timeoutMs);
-  const client = new Client({ name: options.clientName || "local-coding-agent-figma-bridge", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint));
-  try {
-    await withTimeout(client.connect(transport), ms, "Connecting to Figma Desktop MCP");
-    return await withTimeout(Promise.resolve(callback(client)), ms, "Figma Desktop MCP request");
-  } catch (error) {
-    throw friendlyFigmaDesktopError(error, endpoint);
-  } finally {
-    await client.close().catch(() => {});
-  }
+  const ms = normalizeTimeout(options.timeoutMs ?? process.env.FIGMA_DESKTOP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  const clientName = options.clientName || "local-coding-agent-figma-bridge";
+  const key = `${persistentHttpClientKey({ endpoint, clientName })}|timeout=${ms}`;
+  return figmaClients.get(key, () => new PersistentHttpMcpClient({
+    endpoint,
+    clientName,
+    clientVersion: "1.0.0",
+    timeoutMs: ms,
+    mapError: (error) => friendlyFigmaDesktopError(error, endpoint)
+  }));
+}
+
+export async function withFigmaDesktopClient(callback, options = {}) {
+  return callback(getFigmaDesktopClient(options));
+}
+
+export async function closeFigmaDesktopClients() {
+  await figmaClients.closeAll();
 }
 
 export async function listFigmaDesktopTools(options = {}) {
-  return withFigmaDesktopClient((client) => client.listTools(), options);
+  return getFigmaDesktopClient(options).listTools({ refresh: options.refresh === true });
 }
 
 export async function callFigmaDesktopTool(name, args = {}, options = {}) {
   const toolName = String(name || "").trim();
   if (!toolName) throw new Error("Figma tool name is required.");
-  return withFigmaDesktopClient(async (client) => {
-    const listed = await client.listTools();
-    const tool = listed.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new Error(`Figma Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
-    }
-    return client.callTool({ name: toolName, arguments: args || {} });
-  }, options);
+  const client = getFigmaDesktopClient(options);
+  const { listed, tool } = await client.findTool(toolName);
+  if (!tool) {
+    throw new Error(`Figma Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
+  }
+  return client.callTool({ name: toolName, arguments: args || {} });
 }
 
 export async function figmaDesktopStatus(options = {}) {

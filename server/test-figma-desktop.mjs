@@ -12,8 +12,10 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { callCompactTool } from "./compact-test-client.mjs";
 import {
   callFigmaDesktopTool,
+  closeFigmaDesktopClients,
   figmaDesktopStatus,
   listFigmaDesktopTools,
   parseFigmaNodeReference
@@ -107,12 +109,15 @@ function createMockFigmaMcp(calls) {
 
 async function startMockFigma() {
   const calls = [];
+  let initializeCount = 0;
   const server = http.createServer(async (req, res) => {
     if (req.url !== "/mcp" || req.method !== "POST") {
       res.statusCode = 405;
       res.end();
       return;
     }
+    const body = await readJsonBody(req);
+    if (body?.method === "initialize") initializeCount += 1;
     const mcp = createMockFigmaMcp(calls);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
@@ -120,14 +125,19 @@ async function startMockFigma() {
       mcp.close().catch(() => {});
     });
     await mcp.connect(transport);
-    await transport.handleRequest(req, res, await readJsonBody(req));
+    await transport.handleRequest(req, res, body);
   });
   const port = await getFreePort();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
   });
-  return { server, calls, endpoint: `http://127.0.0.1:${port}/mcp` };
+  return {
+    server,
+    calls,
+    endpoint: `http://127.0.0.1:${port}/mcp`,
+    get initializeCount() { return initializeCount; }
+  };
 }
 
 async function waitForHealth(port, stderrRef) {
@@ -141,7 +151,7 @@ async function waitForHealth(port, stderrRef) {
   throw new Error(`LCA did not become ready on port ${port}\n${stderrRef.value}`);
 }
 
-async function startLca(workspace, figmaEndpoint, policy = "full") {
+async function startLca(workspace, figmaEndpoint) {
   await mkdir(workspace, { recursive: true });
   const port = await getFreePort();
   const stderrRef = { value: "" };
@@ -151,8 +161,7 @@ async function startLca(workspace, figmaEndpoint, policy = "full") {
       ...process.env,
       PORT: String(port),
       AGENT_WORKSPACE: workspace,
-      AGENT_MODE: "safe",
-      AGENT_POLICY: policy,
+      AGENTMEMORY_RECORD_SESSIONS: "0",
       AGENT_EXTRA_ROOTS_JSON: "[]",
       AGENT_AUDIT: "0",
       MCP_AUTH_TOKEN: "",
@@ -180,7 +189,7 @@ async function connect(port) {
 }
 
 async function callRaw(client, name, args = {}) {
-  return client.callTool({ name, arguments: args });
+  return callCompactTool(client, name, args);
 }
 
 async function call(client, name, args = {}) {
@@ -217,14 +226,13 @@ try {
 
   const direct = await callFigmaDesktopTool("get_metadata", { nodeId: "1:2" }, { endpoint: mock.endpoint });
   check("module forwards direct upstream tool calls", direct.content?.[0]?.text === '<node id="1:2" />', JSON.stringify(direct));
+  check("module reuses one persistent upstream connection", mock.initializeCount === 1, `initialize_count=${mock.initializeCount}`);
 
   lca = await startLca(path.join(base, "workspace"), mock.endpoint);
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of ["figma_status", "figma_list_tools", "figma_call_tool", "figma_get_design_context", "figma_get_screenshot", "figma_get_metadata", "figma_get_variable_defs"]) {
-    check(`${name} is exposed by LCA`, names.has(name), JSON.stringify([...names]));
-  }
+  check("Figma is exposed through one compact facade", names.has("figma") && !names.has("figma_call_tool") && tools.tools.length === 14, JSON.stringify([...names]));
 
   const bridgeStatus = await call(client, "figma_status");
   const bridgeStatusJson = JSON.parse(bridgeStatus.content?.[0]?.text || "{}");
@@ -247,32 +255,10 @@ try {
 
   check("mock received normalized node id", mock.calls.some((entry) => entry.tool === "get_design_context" && entry.args.nodeId === "12305:144779"), JSON.stringify(mock.calls));
 
-  await client.close();
-  client = null;
-  await stopChild(lca.child);
-  lca = null;
-
-  lca = await startLca(path.join(base, "strict-workspace"), mock.endpoint, "strict");
-  client = await connect(lca.port);
-  const strictRead = await call(client, "figma_get_metadata", { node_id: "11:12" });
-  check("strict policy allows dedicated read-only Figma wrappers", /11:12/.test(strictRead.content?.[0]?.text || ""), JSON.stringify(strictRead));
-  const strictGeneric = await callRaw(client, "figma_call_tool", { tool: "get_metadata", arguments: { nodeId: "11:12" } });
-  check("strict policy blocks generic Figma passthrough", strictGeneric.isError === true && /policy=strict/.test(strictGeneric.content?.[0]?.text || ""), JSON.stringify(strictGeneric));
-
-  await client.close();
-  client = null;
-  await stopChild(lca.child);
-  lca = null;
-
-  lca = await startLca(path.join(base, "balanced-workspace"), mock.endpoint, "balanced");
-  client = await connect(lca.port);
-  const balancedRead = await call(client, "figma_call_tool", { tool: "get_variable_defs", arguments: { nodeId: "13:14" } });
-  check("balanced policy allows known read-only generic Figma tools", /#FFFFFF/.test(balancedRead.content?.[0]?.text || ""), JSON.stringify(balancedRead));
-  const balancedUnknown = await callRaw(client, "figma_call_tool", { tool: "future_write_tool", arguments: { nodeId: "13:14" } });
-  check("balanced policy requires approval for unknown or mutating upstream tools", balancedUnknown.isError === true && /Approval required/.test(balancedUnknown.content?.[0]?.text || ""), JSON.stringify(balancedUnknown));
 } finally {
   if (client) await client.close().catch(() => {});
   await stopChild(lca?.child);
+  await closeFigmaDesktopClients();
   await new Promise((resolve) => mock.server.close(resolve));
   await rm(base, { recursive: true, force: true });
 }

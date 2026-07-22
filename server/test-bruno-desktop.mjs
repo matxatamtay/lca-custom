@@ -12,9 +12,11 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { callCompactTool } from "./compact-test-client.mjs";
 import {
   brunoDesktopStatus,
   callBrunoDesktopTool,
+  closeBrunoDesktopClients,
   listBrunoDesktopTools,
   normalizeBrunoDesktopEndpoint
 } from "./bruno-desktop.mjs";
@@ -201,6 +203,7 @@ function createMockBruno(calls) {
 
 async function startMockBruno() {
   const calls = [];
+  let initializeCount = 0;
   const server = http.createServer(async (req, res) => {
     if (req.url !== "/mcp" || req.method !== "POST") {
       res.statusCode = 405;
@@ -213,6 +216,8 @@ async function startMockBruno() {
       res.end(JSON.stringify({ error: { code: "UNAUTHORIZED", message: "Unauthorized" } }));
       return;
     }
+    const body = await readJsonBody(req);
+    if (body?.method === "initialize") initializeCount += 1;
     const mcp = createMockBruno(calls);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
@@ -220,14 +225,19 @@ async function startMockBruno() {
       mcp.close().catch(() => {});
     });
     await mcp.connect(transport);
-    await transport.handleRequest(req, res, await readJsonBody(req));
+    await transport.handleRequest(req, res, body);
   });
   const port = await getFreePort();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
   });
-  return { server, calls, endpoint: `http://127.0.0.1:${port}/mcp` };
+  return {
+    server,
+    calls,
+    endpoint: `http://127.0.0.1:${port}/mcp`,
+    get initializeCount() { return initializeCount; }
+  };
 }
 
 async function waitForHealth(port, stderrRef) {
@@ -241,7 +251,7 @@ async function waitForHealth(port, stderrRef) {
   throw new Error(`LCA did not become ready on port ${port}\n${stderrRef.value}`);
 }
 
-async function startLca(workspace, endpoint, policy = "strict") {
+async function startLca(workspace, endpoint) {
   await mkdir(workspace, { recursive: true });
   const port = await getFreePort();
   const stderrRef = { value: "" };
@@ -251,8 +261,7 @@ async function startLca(workspace, endpoint, policy = "strict") {
       ...process.env,
       PORT: String(port),
       AGENT_WORKSPACE: workspace,
-      AGENT_MODE: "safe",
-      AGENT_POLICY: policy,
+      AGENTMEMORY_RECORD_SESSIONS: "0",
       AGENT_EXTRA_ROOTS_JSON: "[]",
       AGENT_AUDIT: "0",
       MCP_AUTH_TOKEN: "",
@@ -281,7 +290,7 @@ async function connect(port) {
 }
 
 async function callRaw(client, name, args = {}) {
-  return client.callTool({ name, arguments: args });
+  return callCompactTool(client, name, args);
 }
 
 async function call(client, name, args = {}) {
@@ -324,21 +333,20 @@ try {
     set: { "request.vars.req": [{ name: "userId", value: "42" }] }
   }, directOptions);
   check("direct bridge forwards request mutations", /Get user edited/.test(directMutation.content?.[0]?.text || ""), JSON.stringify(directMutation));
+  check("module reuses one persistent upstream connection", mock.initializeCount === 1, `initialize_count=${mock.initializeCount}`);
 
-  lca = await startLca(path.join(base, "workspace"), mock.endpoint, "strict");
+  lca = await startLca(path.join(base, "workspace"), mock.endpoint);
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  check("LCA exposes every Bruno collection tool", UPSTREAM_TOOLS.every((name) => names.has(name)), JSON.stringify([...names].filter((name) => name.startsWith("bruno_"))));
-  check("LCA adds live discovery and unrestricted passthrough", names.has("bruno_list_tools") && names.has("bruno_call_tool"));
-  check("LCA exposes no obsolete Flow Studio tools", ![...names].some((name) => /^bruno_.*flow/.test(name)), JSON.stringify([...names]));
+  check("Bruno is exposed through one compact facade", names.has("bruno") && !names.has("bruno_call_tool") && tools.tools.length === 14, JSON.stringify([...names]));
 
   const collection = await call(client, "bruno_create_collection", {
     workspace_path: "/workspace/demo",
     name: "Created API",
     folder_name: "created-api"
   });
-  check("strict LCA policy does not gate Bruno collection mutations", payload(collection).name === "Created API", JSON.stringify(collection));
+  check("trusted runtime executes Bruno collection mutations directly", payload(collection).name === "Created API", JSON.stringify(collection));
 
   const folder = await call(client, "bruno_create_folder", {
     workspace_uid: "workspace_demo",
@@ -409,7 +417,7 @@ try {
     runtime_variables: { userId: "42" },
     wait_mode: "complete"
   });
-  check("strict LCA policy does not gate POST request execution", payload(run).result?.response?.status === 201, JSON.stringify(run));
+  check("trusted runtime executes Bruno requests directly", payload(run).result?.response?.status === 201, JSON.stringify(run));
 
   const storedRun = await call(client, "bruno_get_request_run", { run_id: "run_demo" });
   check("LCA retrieves stored Bruno run results", payload(storedRun).result?.response?.status === 201, JSON.stringify(storedRun));
@@ -422,7 +430,7 @@ try {
       item_pathname: "users/get-user.bru"
     }
   });
-  check("generic passthrough forwards mutations without a read-only gate", payload(genericMutation).deleted === true, JSON.stringify(genericMutation));
+  check("generic passthrough forwards mutations directly", payload(genericMutation).deleted === true, JSON.stringify(genericMutation));
 
   check("mock received detailed request fields unchanged", mock.calls.some((entry) =>
     entry.tool === "bruno_update_request"
@@ -432,6 +440,7 @@ try {
 } finally {
   await client?.close().catch(() => {});
   await stopChild(lca?.child);
+  await closeBrunoDesktopClients();
   await new Promise((resolve) => mock.server.close(resolve));
   await rm(base, { recursive: true, force: true });
 }

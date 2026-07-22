@@ -17,11 +17,13 @@ import {
   copyFile,
   cp
 } from "node:fs/promises";
-import { createWriteStream, readFileSync, existsSync, realpathSync } from "node:fs";
+import { createWriteStream, readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
@@ -29,6 +31,7 @@ import { summarizeArgs } from "./core/redaction.mjs";
 import {
   DEFAULT_FIGMA_DESKTOP_MCP_URL,
   callFigmaDesktopTool,
+  closeFigmaDesktopClients,
   figmaDesktopStatus,
   listFigmaDesktopTools,
   parseFigmaNodeReference
@@ -37,6 +40,7 @@ import {
   DEFAULT_DBEAVER_DESKTOP_MCP_URL,
   callDBeaverDesktopTool,
   callReadOnlyDBeaverDesktopTool,
+  closeDBeaverDesktopClients,
   dbeaverDesktopStatus,
   listDBeaverDesktopTools
 } from "./dbeaver-desktop.mjs";
@@ -44,6 +48,7 @@ import {
   DEFAULT_BRUNO_DESKTOP_MCP_URL,
   brunoDesktopStatus,
   callBrunoDesktopTool,
+  closeBrunoDesktopClients,
   listBrunoDesktopTools
 } from "./bruno-desktop.mjs";
 
@@ -76,6 +81,35 @@ function loadRequiredHtmlResource(filePath, label) {
 }
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
+let nextApplicationRuntimePromise;
+
+async function getNextApplicationRuntime() {
+  if (!nextApplicationRuntimePromise) {
+    nextApplicationRuntimePromise = import("./dist/bootstrap/default-container.js")
+      .then(({ createDefaultApplicationContainer }) => createDefaultApplicationContainer({
+        agentMemoryUrl: process.env.AGENTMEMORY_URL || "http://127.0.0.1:3111",
+        agentMemorySecret: process.env.AGENTMEMORY_SECRET || undefined
+      }))
+      .catch((error) => {
+        nextApplicationRuntimePromise = undefined;
+        throw error;
+      });
+  }
+  return nextApplicationRuntimePromise;
+}
+
+async function closeNextApplicationRuntime() {
+  const pending = nextApplicationRuntimePromise;
+  nextApplicationRuntimePromise = undefined;
+  if (!pending) {
+    await lifecycleLog("next runtime close skipped: runtime was never created");
+    return;
+  }
+  await lifecycleLog("next runtime close started");
+  const runtime = await pending;
+  await runtime.close();
+  await lifecycleLog("next runtime close completed");
+}
 const COMPANION_WIDGET_PATH = path.join(APP_DIR, "lca-compact-input-v2.html");
 const COMPANION_WIDGET_URI = "ui://widget/lca-compact-input-v2.html";
 const DBEAVER_SQL_ARTIFACT_PATH = path.join(APP_DIR, "dbeaver-sql-artifact.html");
@@ -95,18 +129,15 @@ const STARTUP_PROFILE = (() => {
 const EXTRA_ROOTS = parseExtraRoots();
 const ROOTS = dedupe([PRIMARY_ROOT, ...EXTRA_ROOTS]);
 
-// "safe" (default): file/command tools are confined to roots, destructive
-// commands and absolute Windows paths inside commands are blocked.
-// "full": full power inside roots, only catastrophic system commands stay
-// blocked (unless AGENT_ALLOW_DANGEROUS=1).
-const MODE = String(process.env.AGENT_MODE || STARTUP_PROFILE?.mode || "safe").toLowerCase() === "full" ? "full" : "safe";
-const ALLOW_DANGEROUS = process.env.AGENT_ALLOW_DANGEROUS === "1";
+// LCA is a trusted local execution engine. Project roots drive discovery and
+// relative-path routing; they are not authorization boundaries.
+const TOOL_SURFACE = "compact";
+const RECORD_AGENTMEMORY_SESSIONS = process.env.AGENTMEMORY_RECORD_SESSIONS !== "0";
 
 // Optional defense-in-depth bearer token. If set, every /mcp request must send
 // Authorization: Bearer <token>. Leave empty when relying on the
 // OpenAI Secure MCP Tunnel, whose channel is already private to your account.
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
-const APPROVAL_TOKEN = process.env.AGENT_APPROVAL_TOKEN || "";
 const ALLOWED_ORIGINS = new Set(
   String(process.env.MCP_ALLOWED_ORIGINS || "")
     .split(",")
@@ -115,6 +146,7 @@ const ALLOWED_ORIGINS = new Set(
 );
 
 const DATA_DIR = path.resolve(APP_DIR, "data");
+const LIFECYCLE_LOG_PATH = path.join(DATA_DIR, "lifecycle.log");
 const WORKSPACE_ID = createHash("sha256").update(comparePath(PRIMARY_ROOT)).digest("hex").slice(0, 16);
 const WORKSPACE_DATA_DIR = path.join(DATA_DIR, "workspaces", WORKSPACE_ID);
 const NOTES_PATH = path.resolve(WORKSPACE_DATA_DIR, "notes.json");
@@ -163,18 +195,6 @@ const AGENT_STATE_DIR = path.join(PRIMARY_ROOT, ".agent", "state");
 const TASK_PLAN_PATH = path.join(AGENT_STATE_DIR, "current-task.json");
 const DECISIONS_PATH = path.join(AGENT_STATE_DIR, "decisions.md");
 
-// v2.6 Approvals
-const APPROVALS_DIR = path.resolve(WORKSPACE_DATA_DIR, "approvals");
-const APPROVAL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const APPROVAL_TTL_MINUTES = boundedNumber(process.env.AGENT_APPROVAL_TTL_MINUTES, 10, 1, 30);
-
-// v2.6 Policy
-const AGENT_POLICY = (() => {
-  const p = String(process.env.AGENT_POLICY || STARTUP_PROFILE?.policy || "balanced").toLowerCase();
-  if (p === "strict" || p === "full") return p;
-  return "balanced";
-})();
-
 // v2.8 Profile
 let WORKSPACE_PROFILE = STARTUP_PROFILE;
 
@@ -213,50 +233,10 @@ const SKIP_DIRS = new Set([
   ...((Array.isArray(STARTUP_PROFILE?.ignoredDirs) ? STARTUP_PROFILE.ignoredDirs : []).map(String))
 ]);
 
-// Always blocked, even in full mode, unless AGENT_ALLOW_DANGEROUS=1.
-// These can brick the OS or wipe disks regardless of working directory.
-const CATASTROPHIC = [
-  // Disk format command only (e.g. "format C:", "format /fs:ntfs D:").
-  // Must NOT match PowerShell's Format-Table / Format-List / -f format operator.
-  /(^|[;&|]\s*)format(\.com)?\s+(\/|[a-z]:)/i,
-  /\bdiskpart\b/i,
-  /\bmkfs\b/i,
-  /\bfdisk\b/i,
-  /\bshutdown\b/i,
-  /\brestart-computer\b/i,
-  /\bstop-computer\b/i,
-  /\bremove-item\b[^\n]*\b(c:\\\\|c:\/|\$env:systemroot|system32|windows\\\\)/i,
-  /\b(rd|rmdir)\b\s+\/s[^\n]*\bc:\\\\/i,
-  /\bdel\b[^\n]*\/s[^\n]*\bc:\\\\/i,
-  /\bcipher\b\s+\/w/i,
-  /\b(reg)\b\s+delete\s+hk(lm|ey_local_machine)/i,
-  /:\(\)\s*\{\s*:\|:&\s*\}\s*;:/, // fork bomb
-  // --- Unix / macOS / Linux ---
-  /\brm\s+-[rRfile]*\s+(--no-preserve-root\s+)?\/(\s|$|\*)/i, // rm -rf /
-  /\bdd\b[^\n]*\bof=\/dev\/(sd|nvme|disk|hd)/i, // overwrite a disk
-  /\bmkfs\.[a-z0-9]+\b/i,
-  /\b(reboot|halt|poweroff|init\s+0)\b/i,
-  /\bchmod\s+-R\s*0*\s+\//i,
-  />\s*\/dev\/(sd|nvme|disk|hd)[a-z0-9]/i // write to raw disk
-];
-
-// Extra blocks that only apply in "safe" mode.
-const SAFE_MODE_BLOCKS = [
-  /\b(del|erase|rmdir|rd|remove-item|rm|format|shutdown|restart-computer|stop-computer|diskpart)\b/i,
-  /\bgit\s+clean\b/i,
-  /\bgit\s+reset\s+--hard\b/i,
-  /\breg\s+delete\b/i,
-  /\btakeown\b/i,
-  /\bicacls\b/i,
-  /[a-z]:\\/i,
-  /(^|\s)~[\\/]/i
-];
-
 // ----------------------------------------------------------------------------
 // State
 // ----------------------------------------------------------------------------
 const processes = new Map(); // id -> { id, name, command, child, status, exitCode, startedAt, stdout, stderr }
-let approvalLock = Promise.resolve();
 let auditStream = null;
 
 // ----------------------------------------------------------------------------
@@ -266,7 +246,6 @@ await mkdir(DATA_DIR, { recursive: true });
 await mkdir(WORKSPACE_DATA_DIR, { recursive: true });
 await mkdir(PRIMARY_ROOT, { recursive: true });
 await mkdir(BACKUPS_DIR, { recursive: true });
-await mkdir(APPROVALS_DIR, { recursive: true });
 await mkdir(AGENT_STATE_DIR, { recursive: true });
 if (AUDIT_ENABLED) {
   auditStream = createWriteStream(AUDIT_PATH, { flags: "a" });
@@ -312,8 +291,8 @@ const httpServer = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         status: "ok",
         version: VERSION,
-        mode: MODE,
-        policy: AGENT_POLICY,
+        runtime: "trusted-local",
+        tool_surface: TOOL_SURFACE,
         roots: ROOTS,
         mcp_endpoint: `http://${HOST}:${PORT}/mcp`
       });
@@ -324,9 +303,9 @@ const httpServer = http.createServer(async (req, res) => {
         version: VERSION,
         tier: PRODUCT_TIER,
         pid: process.pid,
-        mode: MODE,
-        policy: AGENT_POLICY,
-        allow_dangerous: ALLOW_DANGEROUS,
+        runtime: "trusted-local",
+        tool_surface: TOOL_SURFACE,
+        agentmemory_session_recording: RECORD_AGENTMEMORY_SESSIONS,
         auth: AUTH_TOKEN ? "bearer" : "none",
         config_id: CONFIG_ID || null,
         roots: ROOTS,
@@ -378,7 +357,7 @@ httpServer.on("error", (err) => {
 
 httpServer.listen(PORT, HOST, () => {
   console.log(`Local Coding Agent v${VERSION} listening on http://${HOST}:${PORT}`);
-  console.log(`Mode: ${MODE}${ALLOW_DANGEROUS ? " (+dangerous)" : ""}  Auth: ${AUTH_TOKEN ? "bearer" : "none (tunnel-only)"}`);
+  console.log(`Runtime: trusted-local  Surface: ${TOOL_SURFACE}  Auth: ${AUTH_TOKEN ? "bearer" : "none (tunnel-only)"}`);
   console.log(`Roots:\n${ROOTS.map((r) => `  - ${r}`).join("\n")}`);
   console.log(`MCP endpoint: http://${HOST}:${PORT}/mcp`);
 });
@@ -386,14 +365,36 @@ httpServer.listen(PORT, HOST, () => {
 // Never let a single bad request take the whole server down.
 process.on("uncaughtException", (err) => log(`uncaughtException: ${err?.stack || err}`));
 process.on("unhandledRejection", (err) => log(`unhandledRejection: ${err?.stack || err}`));
+let gracefulExitPromise;
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
-    log(`${sig} received, shutting down`);
+    if (gracefulExitPromise) return;
+    gracefulExitPromise = gracefulExit(sig);
+  });
+}
+
+async function gracefulExit(signal) {
+  const forceExit = setTimeout(() => process.exit(1), 15_000);
+  forceExit.unref();
+  await lifecycleLog(`${signal} received`);
+  try {
     for (const proc of processes.values()) killProcessTree(proc);
     try { auditStream?.end(); } catch {}
+    await closeNextApplicationRuntime();
+    await closeLegacyBackendRuntime();
+    await Promise.all([
+      closeFigmaDesktopClients(),
+      closeDBeaverDesktopClients(),
+      closeBrunoDesktopClients()
+    ]);
+    await lifecycleLog(`${signal} cleanup completed`);
+  } catch (error) {
+    await lifecycleLog(`${signal} cleanup failed: ${error?.stack || error}`);
+  } finally {
+    clearTimeout(forceExit);
     httpServer.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();
-  });
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -440,34 +441,24 @@ async function handleMcp(req, res) {
   await transport.handleRequest(req, res, body);
 }
 
-const SERVER_INSTRUCTIONS = [
-  "Local Coding Agent Pro MCP: tool calls cross a tunnel, so start with workspace_snapshot or workspace_doctor, then use read_many/search_text/run_commands to batch work; prefer dedicated tools over run_command. Policy may require token approval via AGENT_APPROVAL_TOKEN for risky delete/install/network/mutating-git actions; exact action batches can use request_approval_batch. File tools are root-confined, but commands are not an OS sandbox.",
-  "WORKFLOW: (1) Start with workspace_snapshot for repo/git/policy in one call; use workspace_doctor when you need operational readiness. (2) Use read_many/search_text/repo_symbols to gather context in batches. (3) Use preview_patch/validate_patch before apply_patch for large edits. (4) Before marking 'done', call review_diff and session_report; run tests/build/lint only when the user explicitly asks. (5) For multi-step tasks, use task_plan + decision_log to maintain state across chats.",
-  "POLICY: Check policy_status if you are unsure whether an action is allowed. In balanced policy, risky operations (delete, install, network, mutating git, risky processes) require one-time approval with request_approval/request_approval_batch followed by approve_request using AGENT_APPROVAL_TOKEN.",
-  "FIGMA: LCA bridges the official Figma Desktop MCP server at 127.0.0.1:3845. For a Figma URL or current desktop selection, prefer figma_get_design_context; also call figma_get_screenshot when visual fidelity matters. Use figma_status when the bridge is unavailable and figma_list_tools/figma_call_tool for newer upstream tools.",
-  "DBEAVER: LCA bridges the patched DBeaver Desktop MCP server at 127.0.0.1:3846. Prefer dbeaver_propose_sql for visible editor changes. To run SQL, call dbeaver_prepare_sql_execution, let the user approve the exact SQL and connection inside DBeaver, then call dbeaver_execute_sql with the returned one-time approval_id. Use dbeaver_get_last_result/dbeaver_fetch_result for bounded result reading. Generic dbeaver_call_tool remains read-only.",
-  "BRUNO: LCA mirrors Bruno Desktop's collection-native MCP at 127.0.0.1:3847. Use bruno_list_collections/bruno_search_requests to discover data, bruno_get_request to read the complete editable definition, bruno_update_request or bruno_update_request_tab for every request field/tab, and bruno_run_request plus bruno_get_request_run for execution. Collection, folder, environment, dotenv, request CRUD, and request execution are forwarded directly without an extra LCA policy gate. Flow Studio and Intelligence Suite are not exposed.",
-  "Use the DEDICATED tools instead of run_command for these — they are faster and cheaper:",
-  "- Find files by name -> find_files (NOT dir/ls/Get-ChildItem/where).",
-  "- Search file contents -> search_text with context= (NOT grep/findstr/Select-String).",
-  "- Read files -> read_many for several or targeted ranges, read_file for one (NOT type/cat/Get-Content).",
-  "- Map a repo -> workspace_snapshot first, repo_map for deeper tree detail; use workspace_doctor for readiness checks.",
-  "- Create/edit files -> write_file / apply_patch (with a unified `diff` for many edits) (NOT echo>/Set-Content).",
-  "- Symbol search -> repo_symbols for function/class definitions.",
-  "Reserve run_command for explicit user-requested builds, tests, installs, running programs, and git. When you do use it:",
-  "- Pass the `cwd` argument instead of cd/pushd.",
-  "- Combine multiple steps into ONE command (&& on cmd/bash, ; on PowerShell).",
-  "- Keep output small with tail_lines/head_lines/max_output_chars.",
-  "Keep the conversation light: do NOT re-read a file you already read; read only the line range you need; never dump a whole large file or large command output unless asked.",
-  "When the conversation grows long or feels slow, call checkpoint() with a compact summary + next steps, then tell the user to open a NEW chat; in that fresh chat call resume() first. This resets the heavy context (faster) while keeping your progress.",
-  "If a task matches an available skill, call list_skills first, then read_skill(name) to load its instructions before doing the work.",
-  "For ChatGPT UI companion flows, call lca_input to render the Apps SDK widget in ChatGPT; the widget uses workspace_search for @ file/folder/symbol search, slash_commands for / workflow/mode/skill suggestions, and compose_prompt to turn sidebar input into a ready prompt. If the user only says 'lca' in a fresh chat, call the lca tool for workspace_info-style status.",
-  "Prefer a few large, well-targeted calls over many tiny ones."
-].join("\n");
+const compactMcpInterface = await import("./dist/interfaces/mcp/compact-mcp-interface.js").catch((error) => {
+  throw new Error(`Compiled compact MCP interface is unavailable. Run npm run build:next. ${error?.message || error}`);
+});
+
+const INTERNAL_MCP_SERVERS = new WeakSet();
+let legacyBackendRuntimePromise = null;
 
 function createMcpServer() {
-  const mcp = new McpServer({ name: "Local Coding Agent", version: VERSION }, { instructions: SERVER_INSTRUCTIONS });
+  const mcp = new McpServer(
+    { name: "Local Coding Agent", version: VERSION },
+    { instructions: compactMcpInterface.COMPACT_SERVER_INSTRUCTIONS }
+  );
   registerCompanionAppResources(mcp);
+  registerCompactTools(mcp);
+  return mcp;
+}
+
+function registerBackendTools(mcp) {
   registerBasicTools(mcp);
   registerFigmaDesktopTools(mcp);
   registerDBeaverDesktopTools(mcp);
@@ -484,11 +475,56 @@ function createMcpServer() {
   registerTestRunnerTools(mcp);   // v2.3
   registerReviewTools(mcp);       // v2.4
   registerPlannerTools(mcp);      // v2.5
-  registerPolicyTools(mcp);       // v2.6
   registerProfileTools(mcp);      // v2.8
-  return mcp;
 }
 
+function registerCompactTools(mcp) {
+  compactMcpInterface.registerCompactMcpTools(mcp, {
+    registerTool: reg,
+    callBackendTool: callLegacyTool,
+    listBackendTools: async () => (await getLegacyBackendRuntime()).tools,
+    registerLcaInputTool,
+    structuredJsonResult
+  });
+}
+
+async function getLegacyBackendRuntime() {
+  if (!legacyBackendRuntimePromise) {
+    legacyBackendRuntimePromise = createLegacyBackendRuntime().catch((error) => {
+      legacyBackendRuntimePromise = null;
+      throw error;
+    });
+  }
+  return legacyBackendRuntimePromise;
+}
+
+async function createLegacyBackendRuntime() {
+  const backend = new McpServer({ name: "Local Coding Agent Backend", version: VERSION }, { instructions: "Internal compatibility backend." });
+  INTERNAL_MCP_SERVERS.add(backend);
+  registerBackendTools(backend);
+  const client = new Client({ name: "lca-compact-facade", version: VERSION });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await backend.connect(serverTransport);
+  await client.connect(clientTransport);
+  const listed = await client.listTools();
+  return { backend, client, tools: listed.tools || [] };
+}
+
+async function closeLegacyBackendRuntime() {
+  if (!legacyBackendRuntimePromise) return;
+  try {
+    const runtime = await legacyBackendRuntimePromise;
+    try { await runtime.client.close(); } catch {}
+    try { await runtime.backend.close(); } catch {}
+  } finally {
+    legacyBackendRuntimePromise = null;
+  }
+}
+
+async function callLegacyTool(name, args = {}) {
+  const runtime = await getLegacyBackendRuntime();
+  return runtime.client.callTool({ name, arguments: args });
+}
 
 function registerFigmaDesktopTools(mcp) {
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true };
@@ -1204,7 +1240,7 @@ function registerSkillTools(mcp) {
         name: z.string().min(1).describe("Skill name (folder + frontmatter name), e.g. \"deploy-web\"."),
         description: z.string().min(1).describe("One-line description shown by list_skills."),
         body: z.string().describe("Markdown body of the skill (instructions). Written below the frontmatter."),
-        dir: z.string().optional().describe("Skills directory to write into (must be inside a root). Default <PRIMARY_ROOT>/.claude/skills.")
+        dir: z.string().optional().describe("Skills directory to write into. Relative paths resolve from the primary project; absolute paths are accepted. Default <PRIMARY_ROOT>/.claude/skills.")
       }
     },
     async ({ name, description, body, dir }) => {
@@ -1234,7 +1270,7 @@ function registerSkillTools(mcp) {
       description: "Delete a skill folder (the directory holding its SKILL.md). Only removes folders located inside a skills directory.",
       inputSchema: {
         name: z.string().min(1).describe("Skill name from list_skills."),
-        dir: z.string().optional().describe("Skills directory to look in (must be inside a root). Default <PRIMARY_ROOT>/.claude/skills.")
+        dir: z.string().optional().describe("Skills directory to inspect. Relative paths resolve from the primary project; absolute paths are accepted. Default <PRIMARY_ROOT>/.claude/skills.")
       }
     },
     async ({ name, dir }) => {
@@ -1355,7 +1391,7 @@ const WORKFLOW_COMMANDS = [
     command: "/context",
     label: "Context pack",
     description: "Gather a compact workspace context pack before deciding what to do.",
-    prompt: "Gather workspace context first using workspace_snapshot/workspace_search, then ask only for genuinely missing information."
+    prompt: "Call workspace_context with the concrete task first so filesystem, CodeGraph, and AgentMemory are all searched, then ask only for genuinely missing information."
   }
 ];
 
@@ -1888,7 +1924,7 @@ async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], i
     lines.push("Use LCA workspace tools when useful.");
   }
   if (includeContextPack) {
-    lines.push("Start by calling workspace_snapshot or workspace_search if more context is needed; do not ask me to copy file paths unless the @ context is ambiguous.");
+    lines.push("Start by calling workspace_context with this task so filesystem, CodeGraph, and AgentMemory are all searched; do not ask me to copy file paths unless the @ context is ambiguous.");
   }
   if (skillTokens.length) {
     lines.push("", "Requested skills:");
@@ -1909,10 +1945,10 @@ async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], i
   lines.push("", "Task:", task);
 
   const suggested = workflow?.name === "plan"
-    ? ["workspace_snapshot", "workspace_search", "read_many", "task_plan"]
+    ? ["workspace_context", "read_many", "task_plan"]
     : workflow?.name === "review"
-      ? ["workspace_snapshot", "review_diff", "read_many"]
-      : ["workspace_snapshot", "workspace_search", "read_many", "apply_patch"];
+      ? ["workspace_context", "review_diff", "read_many"]
+      : ["workspace_context", "read_many", "apply_patch"];
 
   return {
     mode: workflow?.name || null,
@@ -1931,6 +1967,7 @@ async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], i
 // Tool registration helper: audit + uniform error handling
 // ----------------------------------------------------------------------------
 function reg(mcp, name, def, handler) {
+  const modelFacing = !INTERNAL_MCP_SERVERS.has(mcp);
   mcp.registerTool(name, def, async (args, extra) => {
     const startedAt = isoNow();
     const startedMs = performance.now();
@@ -1939,7 +1976,6 @@ function reg(mcp, name, def, handler) {
     let result;
     let ok = true;
     try {
-      await enforceToolPolicy(name, args ?? {});
       result = await handler(args ?? {}, extra);
     } catch (err) {
       ok = false;
@@ -1950,8 +1986,106 @@ function reg(mcp, name, def, handler) {
     const durationMs = Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10);
     const errText = success ? null : firstText(result).slice(0, 200);
     audit({ ts: startedAt, tool: name, ok: success, durationMs, inChars, outChars, error: errText || undefined, args: argSummary || undefined });
+    if (modelFacing && RECORD_AGENTMEMORY_SESSIONS) {
+      scheduleAgentMemoryObservation(name, args ?? {}, result, success, durationMs, outChars, errText);
+    }
     return result;
   });
+}
+
+function scheduleAgentMemoryObservation(name, args, result, success, durationMs, outChars, errText) {
+  const structured = result?.structuredContent && typeof result.structuredContent === "object"
+    ? result.structuredContent
+    : null;
+  const task = name === "workspace_context" && typeof args?.task === "string" ? args.task.trim() : undefined;
+  const evidence = Array.isArray(structured?.evidence) ? structured.evidence : [];
+  const coverage = structured?.coverage && typeof structured.coverage === "object" ? structured.coverage : undefined;
+  const observation = {
+    tool: name,
+    root: inferObservationRoot(args),
+    argsSummary: memorySafeArgsSummary(args),
+    outputSummary: name === "workspace_context"
+      ? firstText(result).slice(0, 500)
+      : `${success ? "success" : "failed"}; output_chars=${outChars}${errText ? `; error=${errText}` : ""}`,
+    success,
+    durationMs,
+    ...(task ? { task } : {}),
+    ...(coverage ? { coverage } : {}),
+    ...(evidence.length ? { evidenceCount: evidence.length } : {}),
+    files: collectObservationFiles(args)
+  };
+  const decision = extractAgentMemoryDecision(name, args, success, observation.root);
+  void getNextApplicationRuntime()
+    .then(async (runtime) => {
+      const operations = [
+        runtime.memorySessions.recordToolCall(observation)
+      ];
+      if (decision) operations.push(runtime.memorySessions.recordDecision(decision));
+      const results = await Promise.allSettled(operations);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          log(`AgentMemory persistence failed for ${name}: ${result.reason?.message || result.reason}`);
+        }
+      }
+    })
+    .catch((error) => log(`AgentMemory persistence failed for ${name}: ${error?.message || error}`));
+}
+
+function extractAgentMemoryDecision(name, args, success, root) {
+  if (!success || name !== "workspace_edit" || args?.action !== "decision") return null;
+  const forwarded = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
+  const decision = typeof forwarded.decision === "string" ? forwarded.decision.trim() : "";
+  const why = typeof forwarded.why === "string" ? forwarded.why.trim() : "";
+  if (!decision || !why) return null;
+  return { root, decision, why };
+}
+
+function inferObservationRoot(args) {
+  const nested = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
+  const candidates = [args?.root, args?.path, args?.cwd, nested.root, nested.path, nested.cwd];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    try {
+      const resolved = resolvePath(candidate);
+      return ROOTS.find((root) => isWithinRoots(resolved, [root])) || PRIMARY_ROOT;
+    } catch {
+      // Ignore optional path-like arguments that are not workspace paths.
+    }
+  }
+  return PRIMARY_ROOT;
+}
+
+function memorySafeArgsSummary(args) {
+  const nested = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
+  const summary = {};
+  for (const [key, value] of Object.entries({
+    action: args?.action,
+    task: args?.task,
+    intent: args?.intent,
+    path: args?.path,
+    cwd: args?.cwd,
+    nested_action: nested.action,
+    nested_path: nested.path,
+    nested_cwd: nested.cwd
+  })) {
+    if (typeof value === "string" && value.trim()) summary[key] = value.slice(0, 500);
+  }
+  if (Array.isArray(args?.changed_files)) summary.changed_files = args.changed_files.filter((value) => typeof value === "string").slice(0, 50);
+  return JSON.stringify(summary);
+}
+
+function collectObservationFiles(args) {
+  const files = new Set();
+  const nested = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
+  const add = (value) => {
+    if (typeof value === "string" && value.trim()) files.add(value.trim());
+  };
+  add(args?.path);
+  add(args?.cwd);
+  add(nested.path);
+  add(nested.cwd);
+  for (const value of args?.changed_files || []) add(value);
+  return [...files].slice(0, 50);
 }
 
 // ----------------------------------------------------------------------------
@@ -1962,9 +2096,9 @@ function workspaceInfoPayload() {
     status: "ok",
     version: VERSION,
     tier: PRODUCT_TIER,
-    mode: MODE,
-    policy: AGENT_POLICY,
-    allow_dangerous: ALLOW_DANGEROUS,
+    runtime: "trusted-local",
+    tool_surface: TOOL_SURFACE,
+    agentmemory_session_recording: RECORD_AGENTMEMORY_SESSIONS,
     auth: AUTH_TOKEN ? "bearer" : "none",
     roots: ROOTS,
     primary_root: PRIMARY_ROOT,
@@ -1976,10 +2110,12 @@ function workspaceInfoPayload() {
       max_procs: MAX_PROCS
     },
     running_processes: [...processes.values()].filter((p) => p.status === "running").length,
-    safety:
-      MODE === "full"
-        ? ["File tools are root-confined; command cwd is root-confined but command execution is not an OS sandbox.", "Catastrophic system commands stay blocked unless AGENT_ALLOW_DANGEROUS=1.", "Paths outside the roots are rejected by file tools."]
-        : ["File tools are root-confined; command cwd is root-confined but command execution is not an OS sandbox.", "Destructive commands and absolute Windows paths in commands are blocked.", "Switch to AGENT_MODE=full only for trusted automation."]
+    execution_model: [
+      "Trusted local engine: tool actions execute directly without policy or approval round-trips.",
+      "Configured project roots are discovery and relative-path defaults, not authorization boundaries.",
+      "Commands are not executed inside an OS sandbox; connect only trusted projects and users.",
+      "Transport integrity remains enforced through loopback binding, optional bearer auth, origin checks, timeouts, output caps, and process-tree cleanup."
+    ]
   };
 }
 
@@ -1992,7 +2128,7 @@ function registerBasicTools(mcp) {
       description: "Check whether the local coding agent is reachable.",
       inputSchema: { message: z.string().optional().describe("Optional message to echo back.") }
     },
-    async ({ message }) => textResult(`Local coding agent online (mode=${MODE}).${message ? ` Echo: ${message}` : ""}`)
+    async ({ message }) => textResult(`Local coding agent online (trusted-local).${message ? ` Echo: ${message}` : ""}`)
   );
 
   reg(
@@ -2000,7 +2136,7 @@ function registerBasicTools(mcp) {
     "workspace_info",
     {
       title: "Workspace info",
-      description: "Return roots, mode, limits, host info, and safety rules.",
+      description: "Return project roots, runtime limits, host information, and transport posture.",
       inputSchema: {}
     },
     async () => jsonResult(workspaceInfoPayload())
@@ -2106,7 +2242,7 @@ function registerFsReadTools(mcp) {
     "list_files",
     {
       title: "List files",
-      description: "List files and folders under a root (or absolute path inside a root).",
+      description: "List files and folders from a project-relative or absolute path.",
       inputSchema: {
         path: z.string().optional().describe("Directory path. Relative paths resolve against the primary root."),
         recursive: z.boolean().optional(),
@@ -2600,7 +2736,6 @@ function registerFsWriteTools(mcp) {
     },
     async ({ path: rel, recursive = false }) => {
       const target = resolvePath(rel);
-      if (target === PRIMARY_ROOT || ROOTS.includes(target)) throw new Error("Refusing to delete a configured root.");
       const info = await stat(target);
       if (info.isDirectory() && !recursive) throw new Error("Path is a directory; pass recursive=true to delete it.");
       if (info.isFile()) await createBackupBatch("delete_path", [target]);
@@ -2722,7 +2857,6 @@ async function applyOne(op) {
     return { op: "update", path: toRel(target), ok: true, replacements: count };
   }
   if (op.op === "delete") {
-    if (target === PRIMARY_ROOT || ROOTS.includes(target)) throw new Error("Refusing to delete a configured root.");
     await rm(target, { recursive: Boolean(op.recursive), force: false });
     return { op: "delete", path: toRel(target), ok: true };
   }
@@ -2748,7 +2882,7 @@ function registerExecTools(mcp) {
       description: "Run a command and wait for it to finish. Use proc_start for long-running servers. Output is trimmed to keep payloads small — use tail_lines/head_lines or max_output_chars to control it.",
       inputSchema: {
         command: z.string().min(1),
-        cwd: z.string().optional().describe("Working directory inside a root."),
+        cwd: z.string().optional().describe("Project-relative or absolute working directory."),
         shell: z.enum(["cmd", "powershell", "bash", "sh", "zsh"]).optional().describe("Shell to use (default cmd on Windows, bash/sh on macOS/Linux)."),
         timeout_ms: z.number().int().min(1000).max(600000).optional(),
         tail_lines: z.number().int().min(1).max(5000).optional().describe("Return only the last N lines of output."),
@@ -2757,7 +2891,6 @@ function registerExecTools(mcp) {
       }
     },
     async ({ command, cwd = ".", shell, timeout_ms = DEFAULT_CMD_TIMEOUT, tail_lines, head_lines, max_output_chars = CMD_OUTPUT_DEFAULT }) => {
-      assertCommandAllowed(command);
       const workdir = resolvePath(cwd);
       const result = await runShellCommand(command, workdir, shell, timeout_ms);
       const trim = (s) => trimOutput(s, { tail_lines, head_lines, max_chars: max_output_chars });
@@ -2799,7 +2932,6 @@ function registerExecTools(mcp) {
     async ({ commands, parallel = false, max_concurrency = 4, stop_on_failure = true }) => {
       const results = new Array(commands.length);
       const runOne = async (item, index) => {
-        assertCommandAllowed(item.command);
         const workdir = resolvePath(item.cwd || ".");
         const result = await runShellCommand(item.command, workdir, item.shell, item.timeout_ms || DEFAULT_CMD_TIMEOUT);
         const maxChars = item.max_output_chars || 10_000;
@@ -2864,7 +2996,6 @@ function registerProcessTools(mcp) {
       }
     },
     async ({ command, cwd = ".", shell, name }) => {
-      assertCommandAllowed(command);
       const running = [...processes.values()].filter((p) => p.status === "running").length;
       if (running >= MAX_PROCS) throw new Error(`Too many running processes (max ${MAX_PROCS}). Stop some first.`);
       const workdir = resolvePath(cwd);
@@ -2934,22 +3065,6 @@ function registerProcessTools(mcp) {
   );
 }
 
-// Git flags blocked on the raw `git` tool (any mode): they can write arbitrary
-// files, run external programs, or operate outside the resolved repo.
-const BAD_GIT_FLAGS = [
-  /^-c$/, /^-C$/,
-  /^--git-dir(=|$)/i, /^--work-tree(=|$)/i,
-  /^--output(=|$)/i, /^--no-index$/i, /^--ext-diff$/i,
-  /^--exec-path(=|$)/i, /^--upload-pack(=|$)/i, /^--receive-pack(=|$)/i
-];
-
-// Read-only git subcommands allowed in safe mode (mutating ones need full mode).
-const GIT_READONLY = new Set([
-  "status", "diff", "log", "show", "ls-files", "ls-tree", "rev-parse", "blame",
-  "grep", "cat-file", "describe", "shortlog", "reflog", "whatchanged", "name-rev",
-  "merge-base", "symbolic-ref", "for-each-ref", "count-objects", "version", "help"
-]);
-
 function registerGitTool(mcp) {
   reg(
     mcp,
@@ -2959,28 +3074,10 @@ function registerGitTool(mcp) {
       description: "Run a git command. Pass args as an array, e.g. [\"status\",\"--short\"].",
       inputSchema: {
         args: z.array(z.string()).min(1).describe('Git arguments, e.g. ["log","--oneline","-n","10"].'),
-        cwd: z.string().optional().describe("Repository directory inside a root.")
+        cwd: z.string().optional().describe("Project-relative or absolute repository directory.")
       }
     },
     async ({ args, cwd = "." }) => {
-      // Always block flags that can write files, run external programs, or escape
-      // the repo — even on "read" subcommands (e.g. `git diff --output=../x`,
-      // `-c core.pager=...`, `--ext-diff`, `--git-dir`/`--work-tree`).
-      if (args.some((a) => BAD_GIT_FLAGS.some((re) => re.test(a)))) {
-        throw new Error("That git flag is blocked (can write files, run external programs, or escape the repo).");
-      }
-      if (MODE !== "full") {
-        // safe mode: only allow read-only git subcommands. Mutations
-        // (restore, checkout --, rm, branch -D, push --force, reset, clean, …)
-        // require AGENT_MODE=full.
-        const sub = (args.find((a) => !a.startsWith("-")) || "").toLowerCase();
-        const infoFlag = args.some((a) => /^(--version|--help)$/i.test(a) || /^-[vh]$/.test(a));
-        if (!infoFlag && !GIT_READONLY.has(sub)) {
-          throw new Error(
-            `Git "${sub || args[0] || ""}" is blocked in safe mode (only read-only git is allowed). Use git_status/git_diff, or set AGENT_MODE=full.`
-          );
-        }
-      }
       const workdir = resolvePath(cwd);
       const result = await spawnCapture("git", args, workdir, DEFAULT_CMD_TIMEOUT);
       return jsonResult({ cwd: workdir, args, ...result });
@@ -2992,9 +3089,9 @@ function registerGitTool(mcp) {
     "git_status",
     {
       title: "Git status",
-      description: "Parsed working-tree status (git status --porcelain) for a repo inside a root. Returns a structured list of changed files with their index/worktree codes.",
+      description: "Parsed working-tree status (git status --porcelain) for a project-relative or absolute repository. Returns a structured list of changed files with their index/worktree codes.",
       inputSchema: {
-        cwd: z.string().optional().describe("Repository directory inside a root (default the primary root).")
+        cwd: z.string().optional().describe("Project-relative or absolute repository directory (default the primary project).")
       }
     },
     async ({ cwd = "." }) => {
@@ -3027,11 +3124,11 @@ function registerGitTool(mcp) {
     "git_diff",
     {
       title: "Git diff",
-      description: "Show a git diff for a repo inside a root. Optionally limit to a path; pass staged:true to diff the index against HEAD.",
+      description: "Show a git diff for a project-relative or absolute repository. Optionally limit to a path; pass staged:true to diff the index against HEAD.",
       inputSchema: {
         path: z.string().optional().describe("Limit the diff to this file or directory."),
         staged: z.boolean().optional().describe("Diff staged changes (--staged) instead of the working tree."),
-        cwd: z.string().optional().describe("Repository directory inside a root (default the primary root).")
+        cwd: z.string().optional().describe("Project-relative or absolute repository directory (default the primary project).")
       }
     },
     async ({ path: rel, staged = false, cwd = "." }) => {
@@ -3095,46 +3192,10 @@ function parsePorcelain(out) {
 // ----------------------------------------------------------------------------
 // Path safety
 // ----------------------------------------------------------------------------
-// Canonical (symlink/junction-resolved) form of the roots, computed once.
-const REAL_ROOTS = ROOTS.map((r) => {
-  try {
-    return realpathSync(r);
-  } catch {
-    return r;
-  }
-});
-
-// Resolve the longest existing ancestor with realpath, then re-append the
-// not-yet-existing tail. This canonicalizes symlinks/junctions even for files
-// that don't exist yet (e.g. write_file targets).
-function canonicalize(p) {
-  let cur = path.resolve(p);
-  const tail = [];
-  for (let i = 0; i < 64; i++) {
-    try {
-      const real = realpathSync(cur);
-      return tail.length ? path.join(real, ...tail) : real;
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) return path.resolve(p);
-      tail.unshift(path.basename(cur));
-      cur = parent;
-    }
-  }
-  return path.resolve(p);
-}
-
+// Absolute paths are accepted. Relative paths resolve from the primary project.
 function resolvePath(input = ".") {
-  const raw = String(input ?? ".").trim();
-  const resolved = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(PRIMARY_ROOT, raw);
-  // Validate the canonical path. Besides blocking symlink/junction escapes,
-  // this avoids false rejections on case-insensitive macOS volumes when the
-  // caller uses different path casing than the filesystem stores.
-  const canon = canonicalize(resolved);
-  if (!isWithinRoots(canon, REAL_ROOTS)) {
-    throw new Error(`Path is outside the allowed roots or resolves outside via a link: ${input}`);
-  }
-  return resolved;
+  const raw = String(input ?? ".").trim() || ".";
+  return path.normalize(path.isAbsolute(raw) ? raw : path.resolve(PRIMARY_ROOT, raw));
 }
 
 function isWithinRoots(p, roots = ROOTS) {
@@ -3426,18 +3487,8 @@ async function searchTree(start, query, { regex, limit, glob }) {
 }
 
 // ----------------------------------------------------------------------------
-// Command policy + execution
+// Command execution
 // ----------------------------------------------------------------------------
-function assertCommandAllowed(command) {
-  const cmd = String(command);
-  if (!ALLOW_DANGEROUS && CATASTROPHIC.some((re) => re.test(cmd))) {
-    throw new Error("Command blocked: catastrophic system operation (set AGENT_ALLOW_DANGEROUS=1 to override).");
-  }
-  if (MODE !== "full" && SAFE_MODE_BLOCKS.some((re) => re.test(cmd))) {
-    throw new Error("Command blocked by safe mode. Switch to AGENT_MODE=full for unrestricted in-root commands.");
-  }
-}
-
 function defaultShell() {
   if (process.platform === "win32") return "cmd";
   return hasCommand("bash") ? "bash" : "sh";
@@ -3750,6 +3801,16 @@ function trimOutput(s, { tail_lines, head_lines, max_chars }) {
 
 function log(message) {
   console.log(`${isoNow()} ${message}`);
+}
+
+async function lifecycleLog(message) {
+  const line = `${isoNow()} pid=${process.pid} ${message}\n`;
+  try {
+    await mkdir(DATA_DIR, { recursive: true });
+    await appendFile(LIFECYCLE_LOG_PATH, line, "utf8");
+  } catch {
+    // Lifecycle logging must never block process cleanup.
+  }
 }
 
 function audit(entry) {
@@ -4282,8 +4343,6 @@ async function collectWorkspaceDoctor(rootDir) {
 
   add("version", "pass", "Version", `Local Coding Agent ${VERSION} (${PRODUCT_TIER})`, null);
   add("roots", ROOTS.length ? "pass" : "fail", "Workspace roots", `${ROOTS.length} root(s) configured`, ROOTS.length ? null : "Set AGENT_WORKSPACE to the repository you want to work on.");
-  add("policy", AGENT_POLICY === "balanced" ? "pass" : "warn", "Policy", `AGENT_POLICY=${AGENT_POLICY}`, AGENT_POLICY === "full" ? "Use balanced for day-to-day work unless this is trusted automation." : AGENT_POLICY === "strict" ? "Strict is safe but write flows will be blocked." : null);
-  add("mode", MODE === "safe" ? "pass" : "warn", "Command mode", `AGENT_MODE=${MODE}`, MODE === "full" ? "Use safe mode for normal agent work; full is best reserved for trusted automation." : null);
   add("auth", AUTH_TOKEN ? "pass" : "warn", "MCP auth", AUTH_TOKEN ? "Bearer auth enabled" : "MCP_AUTH_TOKEN is not set", AUTH_TOKEN ? null : "Set MCP_AUTH_TOKEN if exposing beyond the private OpenAI tunnel/local loopback.");
   add("origin", ALLOWED_ORIGINS.size ? "warn" : "pass", "Browser Origin policy", ALLOWED_ORIGINS.size ? `${ALLOWED_ORIGINS.size} browser origin(s) allowed` : "Browser-origin MCP calls blocked by default", ALLOWED_ORIGINS.size ? "Keep MCP_ALLOWED_ORIGINS as narrow as possible." : null);
   add("rg", RG_BIN ? "pass" : "warn", "ripgrep", RG_BIN ? `Found: ${RG_BIN}` : "ripgrep not found; search_text falls back to slower scanning", RG_BIN ? null : "Install ripgrep for faster searches on large repos.");
@@ -4304,8 +4363,6 @@ async function collectWorkspaceDoctor(rootDir) {
     root: toRel(rootDir),
     version: VERSION,
     tier: PRODUCT_TIER,
-    mode: MODE,
-    policy: AGENT_POLICY,
     checks,
     summary: { pass: checks.filter((c) => c.status === "pass").length, warn, fail },
     profile,
@@ -4337,7 +4394,6 @@ async function runQualityGate({ cwd = ".", include, timeout_ms = 120_000, stop_o
       gates.push({ name: gate.name, status: "skipped", ok: true, reason: "command not detected" });
       continue;
     }
-    assertCommandAllowed(gate.command);
     const result = await runGatedCommand(gate.command, rootDir, timeout_ms);
     const entry = { name: gate.name, status: result.ok ? "pass" : "fail", ...result };
     gates.push(entry);
@@ -4368,8 +4424,6 @@ async function buildSessionReport(rootDir) {
     tier: PRODUCT_TIER,
     ts: isoNow(),
     root: toRel(rootDir),
-    mode: MODE,
-    policy: AGENT_POLICY,
     git,
     doctor: {
       status: doctor.status,
@@ -4525,6 +4579,46 @@ function analyzeDiff(diff) {
 function registerRepoIntelTools(mcp) {
   reg(
     mcp,
+    "workspace_context",
+    {
+      title: "Workspace task context",
+      description: "Build task context by always querying current filesystem search, CodeGraph, and AgentMemory in parallel. Use this first for coding tasks so graph relationships and prior project decisions are never skipped.",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+      inputSchema: {
+        task: z.string().min(1).describe("Concrete coding task or question to investigate."),
+        path: z.string().optional().describe("Project root or subdirectory. Defaults to the primary workspace root."),
+        intent: z.enum(["understand", "debug", "implement", "refactor", "review"]).optional(),
+        changed_files: z.array(z.string().min(1)).max(100).optional().describe("Known changed or relevant files to seed graph context."),
+        max_items: z.number().int().min(3).max(100).optional().describe("Maximum evidence items returned. Defaults to 18."),
+        max_chars: z.number().int().min(1000).max(200000).optional().describe("Approximate context character budget. Defaults to 60000.")
+      }
+    },
+    async ({ task, path: rel = ".", intent, changed_files = [], max_items = 18, max_chars = 60000 }) => {
+      const rootDir = resolvePath(rel);
+      const runtime = await getNextApplicationRuntime();
+      const context = await runtime.application.buildTaskContext.execute({
+        task,
+        root: rootDir,
+        ...(intent ? { intent } : {}),
+        ...(changed_files.length ? { changedFiles: changed_files } : {}),
+        budget: { maxItems: max_items, maxChars: max_chars }
+      });
+      const coverage = context.coverage;
+      const summary = [
+        `Context ready: ${context.evidence.length} evidence item(s).`,
+        `filesystem=${coverage.filesystem.hits}`,
+        `CodeGraph=${coverage.codegraph.hits}`,
+        `AgentMemory=${coverage.agentmemory.hits}`
+      ].join(" ");
+      return {
+        structuredContent: context,
+        content: [{ type: "text", text: summary }]
+      };
+    }
+  );
+
+  reg(
+    mcp,
     "workspace_doctor",
     {
       title: "Workspace doctor Pro",
@@ -4570,12 +4664,11 @@ function registerRepoIntelTools(mcp) {
         ts: isoNow(),
         root: toRel(rootDir),
         roots: ROOTS,
-        mode: MODE,
-        policy: AGENT_POLICY,
         auth: AUTH_TOKEN ? "bearer" : "none",
-        safety: {
-          file_tools_root_confined: true,
-          command_cwd_root_confined: true,
+        execution_model: {
+          trusted_local_engine: true,
+          configured_roots_are_discovery_only: true,
+          absolute_paths_allowed: true,
           command_os_sandbox: false,
           browser_origin_mcp_default: ALLOWED_ORIGINS.size ? "allowlist" : "blocked"
         },
@@ -5203,7 +5296,6 @@ function registerTestRunnerTools(mcp) {
         cmd = cmds.test;
         if (!cmd) throw new Error("Could not detect test command. Provide command explicitly.");
       }
-      assertCommandAllowed(cmd);
       const res = await runGatedCommand(cmd, rootDir, timeout_ms);
       return jsonResult(res);
     }
@@ -5229,7 +5321,6 @@ function registerTestRunnerTools(mcp) {
         cmd = cmds.build;
         if (!cmd) throw new Error("Could not detect build command. Provide command explicitly.");
       }
-      assertCommandAllowed(cmd);
       return jsonResult(await runGatedCommand(cmd, rootDir, timeout_ms));
     }
   );
@@ -5254,7 +5345,6 @@ function registerTestRunnerTools(mcp) {
         cmd = cmds.lint;
         if (!cmd) throw new Error("Could not detect lint command. Provide command explicitly.");
       }
-      assertCommandAllowed(cmd);
       return jsonResult(await runGatedCommand(cmd, rootDir, timeout_ms));
     }
   );
@@ -5303,7 +5393,6 @@ function registerTestRunnerTools(mcp) {
       if (testFiles.size === 0) {
         // Fall back to full test run
         if (!cmds.test) throw new Error("No changed test files found and no test command detected.");
-        assertCommandAllowed(cmds.test);
         const res = await runGatedCommand(cmds.test, rootDir, timeout_ms);
         return jsonResult({ ...res, strategy: "full_fallback", changed_files: changedFiles.length });
       }
@@ -5319,8 +5408,6 @@ function registerTestRunnerTools(mcp) {
       } else {
         cmd = cmds.test || `echo "No test command"`;
       }
-
-      assertCommandAllowed(cmd);
       const res = await runGatedCommand(cmd, rootDir, timeout_ms);
       return jsonResult({ ...res, strategy: "targeted", test_files: [...testFiles], changed_files: changedFiles });
     }
@@ -5339,7 +5426,7 @@ function registerReviewTools(mcp) {
       title: "Session report Pro",
       description: "PRO end-of-session report: git state, doctor summary, mode, policy, root, and version.",
       inputSchema: {
-        cwd: z.string().optional().describe("Repository directory inside a root (default primary root).")
+        cwd: z.string().optional().describe("Project-relative or absolute repository directory (default primary project).")
       }
     },
     async ({ cwd = "." }) => {
@@ -5595,372 +5682,6 @@ function registerPlannerTools(mcp) {
 const _origCheckpoint = null; // we'll patch via the registration
 
 // ============================================================================
-// v2.6 — Approval / Policy Layer
-// ============================================================================
-
-const POLICY_RULES = {
-  strict: {
-    description: "Read and analyze only. No writes, installs, external network, deletes, or git mutations. Read-only Figma Desktop loopback tools are allowed.",
-    blocked: ["write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
-              "run_command", "proc_start", "git"],
-    needs_approval: [],
-    allowed_patterns: []
-  },
-  balanced: {
-    description: "Read + edit allowed. Manual verification tools remain available only when explicitly requested. Delete, install, network commands need approval.",
-    blocked: [],
-    needs_approval: [],
-    dangerous_patterns: [
-      /\b(npm|pip|pip3|yarn|pnpm|cargo|apt|brew|gem|composer)\s+install\b/i,
-      /\bcurl\b.*-[oO]/i,
-      /\bwget\b/i,
-      /\bgit\s+(push|fetch|pull|clone)\b/i,
-      /\bdocker\s+(push|pull|run|build)\b/i
-    ],
-    allowed: ["read_file", "write_file", "replace_in_file", "apply_patch", "search_text", "find_files"]
-  },
-  full: {
-    description: "Full access (same as before, catastrophic commands still blocked).",
-    blocked: [],
-    needs_approval: [],
-    allowed: ["*"]
-  }
-};
-
-const STRICT_MUTATION_TOOLS = new Set([
-  "figma_call_tool", "dbeaver_prepare_sql_execution", "dbeaver_execute_sql", "dbeaver_simulate_change",
-  "dbeaver_begin_transaction", "dbeaver_commit", "dbeaver_rollback",
-  "save_note", "checkpoint", "write_file", "replace_in_file", "apply_patch", "make_dir", "move_path", "delete_path",
-  "run_command", "run_commands", "proc_start", "proc_stop", "git", "create_skill", "delete_skill", "undo_last_patch",
-  "quality_gate", "run_tests", "run_build", "run_lint", "run_changed_tests", "task_plan", "task_state", "decision_log"
-]);
-
-function approvalActionForTool(tool, args) {
-  if (tool === "figma_call_tool") {
-    const upstreamTool = String(args?.tool || "");
-    if (upstreamTool && !FIGMA_DESKTOP_READ_ONLY_TOOLS.has(upstreamTool)) {
-      return `figma:${upstreamTool}:${JSON.stringify(args.arguments || {})}`;
-    }
-  }
-  if (tool === "delete_path") return `delete_path:${String(args.path || "")}`;
-  if (tool === "delete_skill") return `delete_skill:${String(args.name || "")}`;
-  if (tool === "run_command" || tool === "proc_start") {
-    const command = String(args.command || "");
-    return policyCheck(command).needsApproval ? `${tool}:${command}` : null;
-  }
-  if (tool === "run_commands") {
-    const risky = (Array.isArray(args.commands) ? args.commands : [])
-      .filter((item) => policyCheck(String(item?.command || "")).needsApproval)
-      .map((item) => ({ command: String(item.command), cwd: String(item.cwd || "."), shell: item.shell || null }));
-    return risky.length ? `run_commands:${JSON.stringify(risky)}` : null;
-  }
-  if (tool === "git") {
-    const argv = Array.isArray(args.args) ? args.args : [];
-    const sub = (argv.find((a) => !String(a).startsWith("-")) || "").toLowerCase();
-    return GIT_READONLY.has(sub) || argv.some((a) => /^(--version|--help)$/i.test(String(a)))
-      ? null
-      : `git:${JSON.stringify(argv)}`;
-  }
-  if (tool === "apply_patch") {
-    const deletes = Array.isArray(args.operations) && args.operations.some((op) => op?.op === "delete");
-    const diffDeletes = typeof args.diff === "string" && /^\+\+\+\s+\/dev\/null$/m.test(args.diff);
-    if (deletes || diffDeletes) return `apply_patch:delete`;
-  }
-  return null;
-}
-
-async function enforceToolPolicy(tool, args) {
-  if (["policy_status", "explain_risk", "request_approval", "request_approval_batch", "approve_request", "deny_request"].includes(tool)) return;
-  if (AGENT_POLICY === "full") return;
-  if (AGENT_POLICY === "strict" && STRICT_MUTATION_TOOLS.has(tool)) {
-    throw new Error(`Tool "${tool}" is blocked by policy=strict.`);
-  }
-  if (AGENT_POLICY !== "balanced") return;
-  const action = approvalActionForTool(tool, args);
-  if (!action) return;
-  const previous = approvalLock;
-  let release;
-  approvalLock = new Promise((resolve) => { release = resolve; });
-  await previous;
-  try {
-    const approval = await checkApprovalExists(action);
-    if (!approval) {
-      throw new Error(`Approval required. Call request_approval with action=${JSON.stringify(action)}, then call approve_request with AGENT_APPROVAL_TOKEN.`);
-    }
-    const consumed = new Set(Array.isArray(approval.consumed_actions) ? approval.consumed_actions : []);
-    consumed.add(action);
-    approval.consumed_actions = [...consumed];
-    const actions = approvalActions(approval);
-    if (actions.every((candidate) => consumed.has(candidate))) {
-      approval.status = "consumed";
-      approval.consumed_at = isoNow();
-    }
-    await writeFile(path.join(APPROVALS_DIR, `${approval.id}.json`), JSON.stringify(approval, null, 2), "utf8");
-  } finally {
-    release();
-  }
-}
-
-function approvalActions(record) {
-  if (Array.isArray(record?.actions)) return record.actions.map(String);
-  return record?.action ? [String(record.action)] : [];
-}
-
-function approvalIsExpired(record) {
-  return Boolean(record?.expires_at && Date.parse(record.expires_at) <= Date.now());
-}
-
-function classifyAction(action) {
-  const patterns = {
-    install: /\b(npm|pip|pip3|yarn|pnpm|cargo|apt|brew|gem|composer)\s+install\b/i,
-    network: /\b(curl|wget|fetch|git\s+push|git\s+fetch|git\s+pull|git\s+clone)\b/i,
-    delete: /\b(delete_path|rm\s+-rf|remove-item)\b/i,
-    git_mutation: /\bgit\s+(push|reset|clean|restore|checkout)\b/i,
-    catastrophic: CATASTROPHIC
-  };
-
-  for (const [kind, pat] of Object.entries(patterns)) {
-    if (Array.isArray(pat)) {
-      if (pat.some((p) => p.test(action))) return kind;
-    } else if (pat.test(action)) {
-      return kind;
-    }
-  }
-  return "general";
-}
-
-function policyCheck(action) {
-  const rules = POLICY_RULES[AGENT_POLICY];
-  const kind = classifyAction(action);
-
-  if (AGENT_POLICY === "strict") {
-    if (kind !== "general") {
-      throw new Error(`Action blocked by policy=strict: "${kind}" operations are not allowed. Use policy_status to see what's allowed.`);
-    }
-  }
-
-  if (AGENT_POLICY === "balanced") {
-    const dangerous = rules.dangerous_patterns || [];
-    if (dangerous.some((p) => p.test(action))) {
-      // Check if there's a valid approval
-      return { needsApproval: true, kind };
-    }
-    if (kind === "delete" || kind === "git_mutation") {
-      return { needsApproval: true, kind };
-    }
-  }
-
-  return { needsApproval: false, kind };
-}
-
-async function checkApprovalExists(action) {
-  try {
-    const files = await readdir(APPROVALS_DIR);
-    for (const f of files) {
-      if (!f.endsWith(".json")) continue;
-      try {
-        const rec = JSON.parse(await readFile(path.join(APPROVALS_DIR, f), "utf8"));
-        if (rec.status !== "approved") continue;
-        if (approvalIsExpired(rec)) {
-          rec.status = "expired";
-          rec.expired_at = isoNow();
-          await writeFile(path.join(APPROVALS_DIR, f), JSON.stringify(rec, null, 2), "utf8");
-          continue;
-        }
-        const consumed = new Set(Array.isArray(rec.consumed_actions) ? rec.consumed_actions : []);
-        if (approvalActions(rec).includes(action) && !consumed.has(action)) return rec;
-      } catch { /* skip */ }
-    }
-  } catch { /* dir may not exist */ }
-  return null;
-}
-
-function registerPolicyTools(mcp) {
-  reg(
-    mcp,
-    "policy_status",
-    {
-      title: "Policy status",
-      description: "Return current policy (strict|balanced|full) and what operations are allowed, need approval, or are blocked.",
-      inputSchema: {}
-    },
-    async () => {
-      const rules = POLICY_RULES[AGENT_POLICY];
-      return jsonResult({
-        policy: AGENT_POLICY,
-        mode: MODE,
-        description: rules.description,
-        allowed: AGENT_POLICY === "full" ? ["*"] : AGENT_POLICY === "balanced" ? ["read", "write", "edit", "test", "build"] : ["read", "search", "analyze"],
-        needs_approval: AGENT_POLICY === "balanced" ? ["delete_path", "mutating Figma tools", "npm/pip install", "curl/wget", "git push/fetch/pull", "risky run_commands batch"] : [],
-        approval_options: AGENT_POLICY === "balanced" ? ["one exact action", "2-20 exact actions in one expiring batch"] : [],
-        approval_method: AGENT_POLICY === "balanced" ? "Use request_approval/request_approval_batch, then approve_request or deny_request with AGENT_APPROVAL_TOKEN." : null,
-        approval_ttl_minutes: APPROVAL_TTL_MINUTES,
-        blocked: AGENT_POLICY === "strict" ? ["all writes", "installs", "external network", "delete", "git mutations", "generic Figma passthrough"] : []
-      });
-    }
-  );
-
-  reg(
-    mcp,
-    "explain_risk",
-    {
-      title: "Explain risk",
-      description: "Classify a proposed action and explain the risk level + policy decision.",
-      inputSchema: {
-        action: z.string().min(1).describe("The action or command you want to run.")
-      }
-    },
-    async ({ action }) => {
-      const kind = classifyAction(action);
-      const riskLevels = {
-        install: "HIGH — installs packages, may download malicious code or change locked dependencies",
-        network: "HIGH — network operation, may expose data or fetch untrusted content",
-        delete: "HIGH — permanently removes files",
-        git_mutation: "MEDIUM — mutates git history or remote state",
-        catastrophic: "CRITICAL — system-level destructive operation",
-        general: "LOW — standard operation"
-      };
-      const risk = riskLevels[kind] || "LOW";
-
-      let decision;
-      if (AGENT_POLICY === "strict") {
-        decision = kind === "general" ? "ALLOWED" : "BLOCKED";
-      } else if (AGENT_POLICY === "balanced") {
-        decision = (kind === "general") ? "ALLOWED" : "NEEDS_APPROVAL";
-      } else {
-        decision = kind === "catastrophic" ? "BLOCKED" : "ALLOWED";
-      }
-
-      return jsonResult({ action, kind, risk, decision, policy: AGENT_POLICY });
-    }
-  );
-
-  reg(
-    mcp,
-    "request_approval",
-    {
-      title: "Request approval",
-      description: "Create an expiring pending request for one exact action. Approve or deny it with approve_request/deny_request using AGENT_APPROVAL_TOKEN.",
-      inputSchema: {
-        action: z.string().min(1),
-        reason: z.string().min(1).describe("Why this action is needed.")
-      }
-    },
-    async ({ action, reason }) => {
-      const id = randomUUID();
-      const created = isoNow();
-      const record = {
-        id,
-        action,
-        actions: [action],
-        consumed_actions: [],
-        reason,
-        status: "pending",
-        created,
-        expires_at: new Date(Date.now() + APPROVAL_TTL_MINUTES * 60_000).toISOString()
-      };
-      await mkdir(APPROVALS_DIR, { recursive: true });
-      await writeFile(path.join(APPROVALS_DIR, `${id}.json`), JSON.stringify(record, null, 2), "utf8");
-      return jsonResult({
-        id,
-        status: "pending",
-        expires_at: record.expires_at,
-        message: "Approval request created. Call approve_request or deny_request with AGENT_APPROVAL_TOKEN.",
-        action,
-        reason
-      });
-    }
-  );
-
-  reg(
-    mcp,
-    "request_approval_batch",
-    {
-      title: "Request exact batch approval",
-      description: "Request one local decision for 2-20 exact risky actions. Each listed action can be consumed once before expiry; wildcards and implicit extra permissions are not supported.",
-      inputSchema: {
-        actions: z.array(z.string().min(1).max(4000)).min(2).max(20),
-        reason: z.string().min(1).max(2000).describe("Why this exact action batch is needed."),
-        expires_in_minutes: z.number().int().min(1).max(30).optional()
-      }
-    },
-    async ({ actions, reason, expires_in_minutes = APPROVAL_TTL_MINUTES }) => {
-      const exactActions = dedupe(actions.map((action) => action.trim()).filter(Boolean));
-      if (exactActions.length < 2) throw new Error("Provide at least two distinct exact actions.");
-      const id = randomUUID();
-      const record = {
-        id,
-        action: `batch:${exactActions.length}`,
-        actions: exactActions,
-        consumed_actions: [],
-        reason,
-        status: "pending",
-        created: isoNow(),
-        expires_at: new Date(Date.now() + expires_in_minutes * 60_000).toISOString()
-      };
-      await mkdir(APPROVALS_DIR, { recursive: true });
-      await writeFile(path.join(APPROVALS_DIR, `${id}.json`), JSON.stringify(record, null, 2), "utf8");
-      return jsonResult({
-        id,
-        status: "pending",
-        actions: exactActions,
-        expires_at: record.expires_at,
-        message: "Exact batch approval created. Call approve_request or deny_request with AGENT_APPROVAL_TOKEN."
-      });
-    }
-  );
-
-  reg(
-    mcp,
-    "approve_request",
-    {
-      title: "Approve request",
-      description: "Approve a pending action using the local operator token configured in AGENT_APPROVAL_TOKEN.",
-      inputSchema: { id: z.string().min(1), approval_token: z.string().min(1) }
-    },
-    async ({ id, approval_token }) => {
-      if (!APPROVAL_TOKEN) throw new Error("MCP approval is disabled. Set AGENT_APPROVAL_TOKEN locally or approve out of band.");
-      if (!safeEqual(approval_token, APPROVAL_TOKEN)) throw new Error("Invalid local operator approval token.");
-      if (!APPROVAL_ID_RE.test(id)) throw new Error("Invalid approval id.");
-      const fp = path.join(APPROVALS_DIR, `${id}.json`);
-      if (!existsSync(fp)) throw new Error(`No approval request with id ${id}`);
-      const rec = JSON.parse(await readFile(fp, "utf8"));
-      if (rec.status !== "pending") throw new Error(`Approval is ${rec.status}; only pending requests can be approved.`);
-      if (approvalIsExpired(rec)) throw new Error("Approval request is expired.");
-      rec.status = "approved";
-      rec.approved_at = isoNow();
-      rec.approved_via = "mcp_operator_token";
-      await writeFile(fp, JSON.stringify(rec, null, 2), "utf8");
-      return jsonResult({ ok: true, id, action: rec.action, status: "approved" });
-    }
-  );
-
-  reg(
-    mcp,
-    "deny_request",
-    {
-      title: "Deny request",
-      description: "Deny a pending action using the local operator token configured in AGENT_APPROVAL_TOKEN.",
-      inputSchema: { id: z.string().min(1), approval_token: z.string().min(1) }
-    },
-    async ({ id, approval_token }) => {
-      if (!APPROVAL_TOKEN) throw new Error("MCP denial is disabled. Set AGENT_APPROVAL_TOKEN locally or deny out of band.");
-      if (!safeEqual(approval_token, APPROVAL_TOKEN)) throw new Error("Invalid local operator approval token.");
-      if (!APPROVAL_ID_RE.test(id)) throw new Error("Invalid approval id.");
-      const fp = path.join(APPROVALS_DIR, `${id}.json`);
-      if (!existsSync(fp)) throw new Error(`No approval request with id ${id}`);
-      const rec = JSON.parse(await readFile(fp, "utf8"));
-      if (rec.status !== "pending") throw new Error(`Approval is ${rec.status}; only pending requests can be denied.`);
-      if (approvalIsExpired(rec)) throw new Error("Approval request is expired.");
-      rec.status = "denied";
-      rec.denied_at = isoNow();
-      await writeFile(fp, JSON.stringify(rec, null, 2), "utf8");
-      return jsonResult({ ok: true, id, action: rec.action, status: "denied" });
-    }
-  );
-}
-
-// ============================================================================
 // v2.8 — Workspace Profile
 // ============================================================================
 
@@ -5989,10 +5710,8 @@ function registerProfileTools(mcp) {
         return jsonResult({
           loaded: false,
           path: path.join(PRIMARY_ROOT, ".agent", "profile.json"),
-          message: "No profile.json found. Create one to configure ignored dirs, conventions, policy, and optional manual test commands.",
+          message: "No profile.json found. Create one to configure ignored dirs, conventions, project roots, and optional manual test commands.",
           schema: {
-            mode: "safe|full",
-            policy: "strict|balanced|full",
             extraRoots: ["array of extra root paths"],
             testCommands: { test: "command", build: "command", lint: "command" },
             ignoredDirs: ["array of dir names to skip"],

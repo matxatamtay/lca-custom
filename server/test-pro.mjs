@@ -10,6 +10,7 @@ import path from "node:path";
 import { Script } from "node:vm";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { callCompactTool } from "./compact-test-client.mjs";
 
 const SERVER = path.resolve("server.mjs");
 let pass = 0;
@@ -62,9 +63,8 @@ async function startServer(workspace, extraRoots = []) {
       ...process.env,
       PORT: String(port),
       AGENT_WORKSPACE: workspace,
-      AGENT_MODE: "safe",
-      AGENT_POLICY: "full",
       AGENT_EXTRA_ROOTS_JSON: JSON.stringify(extraRoots),
+      AGENTMEMORY_RECORD_SESSIONS: "0",
       MCP_AUTH_TOKEN: "",
       AGENT_AUDIT: "0"
     },
@@ -106,7 +106,7 @@ function runLocal(command, args, cwd) {
 }
 
 async function callJson(client, name, args = {}) {
-  const result = await client.callTool({ name, arguments: args });
+  const result = await callCompactTool(client, name, args);
   const text = result.content?.[0]?.text ?? "";
   if (result.isError) throw new Error(`${name} failed: ${text}`);
   return JSON.parse(text);
@@ -133,13 +133,13 @@ try {
 
   const info = await callJson(client, "workspace_info");
   check("workspace_info exposes pro tier", info.tier === "pro", `tier=${info.tier}`);
-  check("workspace_info exposes policy", typeof info.policy === "string" && info.policy.length > 0);
+  check("workspace_info exposes trusted compact runtime", info.runtime === "trusted-local" && info.tool_surface === "compact" && info.policy === undefined && info.mode === undefined, JSON.stringify(info));
 
   const snap = await callJson(client, "workspace_snapshot", { depth: 3, max_entries: 120, include_symbols: true, refresh: true });
   check("snapshot kind is workspace_snapshot", snap.kind === "workspace_snapshot");
   check("snapshot is pro", snap.pro === true && snap.tier === "pro");
   check("snapshot version is 4.4.0-pro", snap.version === "4.4.0-pro", `version=${snap.version}`);
-  check("snapshot includes safety model", snap.safety?.file_tools_root_confined === true && snap.safety?.command_os_sandbox === false);
+  check("snapshot exposes trusted execution model", snap.execution_model?.trusted_local_engine === true && snap.execution_model?.configured_roots_are_discovery_only === true && snap.execution_model?.absolute_paths_allowed === true && snap.execution_model?.command_os_sandbox === false, JSON.stringify(snap.execution_model));
   check("snapshot detects javascript", snap.profile?.languages?.includes("javascript"), JSON.stringify(snap.profile));
   check("snapshot omits fast-workflow commands", snap.commands === undefined, JSON.stringify(snap.commands));
   check("snapshot includes ripgrep status", typeof snap.ripgrep?.available === "boolean", JSON.stringify(snap.ripgrep));
@@ -197,9 +197,15 @@ try {
   check("companion standalone HTTP page is not exposed", companionPage.status === 404, `status=${companionPage.status}`);
 
   const tools = await client.listTools();
-  const lcaTool = tools.tools?.find((t) => t.name === "lca");
+  const toolNames = tools.tools?.map((t) => t.name) || [];
+  const workspaceContextTool = tools.tools?.find((t) => t.name === "workspace_context");
+  const workspaceStatusTool = tools.tools?.find((t) => t.name === "workspace_status");
   const lcaInfo = await callJson(client, "lca", {});
-  check("lca alias tool is listed", Boolean(lcaTool), JSON.stringify(tools.tools?.map((t) => t.name)));
+  check("model-facing surface stays at fourteen tools", toolNames.length === 14, JSON.stringify(toolNames));
+  check("workspace_status facade is listed", Boolean(workspaceStatusTool), JSON.stringify(toolNames));
+  check("legacy lca alias is hidden from the model", !toolNames.includes("lca"), JSON.stringify(toolNames));
+  check("workspace_context tool is listed", Boolean(workspaceContextTool), JSON.stringify(toolNames));
+  check("workspace_context requires CodeGraph and AgentMemory", /CodeGraph/.test(workspaceContextTool?.description || "") && /AgentMemory/.test(workspaceContextTool?.description || "") && /always/i.test(workspaceContextTool?.description || ""), workspaceContextTool?.description || "missing");
   check("lca alias returns workspace info", lcaInfo.primary_root === info.primary_root && lcaInfo.version === info.version, JSON.stringify(lcaInfo));
   const openCompanionTool = tools.tools?.find((t) => t.name === "open_companion");
   const lcaInputTool = tools.tools?.find((t) => t.name === "lca_input");
@@ -225,7 +231,7 @@ try {
 
   const doctor = await callJson(client, "workspace_doctor", {});
   check("doctor returns score", Number.isInteger(doctor.score) && doctor.score >= 0 && doctor.score <= 100);
-  check("doctor checks policy", doctor.checks?.some((c) => c.id === "policy"));
+  check("doctor omits removed policy and mode checks", !doctor.checks?.some((c) => c.id === "policy" || c.id === "mode"), JSON.stringify(doctor.checks));
   check("doctor does not check commands", !doctor.checks?.some((c) => c.id === "commands"), JSON.stringify(doctor.checks));
 
   const detected = await callJson(client, "detect_test_commands", {});

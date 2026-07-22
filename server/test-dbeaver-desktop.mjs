@@ -12,9 +12,11 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { callCompactTool } from "./compact-test-client.mjs";
 import {
   callDBeaverDesktopTool,
   callReadOnlyDBeaverDesktopTool,
+  closeDBeaverDesktopClients,
   dbeaverDesktopStatus,
   listDBeaverDesktopTools,
   normalizeDBeaverDesktopEndpoint
@@ -180,12 +182,15 @@ function createMockDBeaver(calls) {
 
 async function startMockDBeaver() {
   const calls = [];
+  let initializeCount = 0;
   const server = http.createServer(async (req, res) => {
     if (req.url !== "/mcp" || req.method !== "POST") {
       res.statusCode = 405;
       res.end();
       return;
     }
+    const body = await readJsonBody(req);
+    if (body?.method === "initialize") initializeCount += 1;
     const mcp = createMockDBeaver(calls);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
@@ -193,14 +198,19 @@ async function startMockDBeaver() {
       mcp.close().catch(() => {});
     });
     await mcp.connect(transport);
-    await transport.handleRequest(req, res, await readJsonBody(req));
+    await transport.handleRequest(req, res, body);
   });
   const port = await getFreePort();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
   });
-  return { server, calls, endpoint: `http://127.0.0.1:${port}/mcp` };
+  return {
+    server,
+    calls,
+    endpoint: `http://127.0.0.1:${port}/mcp`,
+    get initializeCount() { return initializeCount; }
+  };
 }
 
 async function waitForHealth(port, stderrRef) {
@@ -214,7 +224,7 @@ async function waitForHealth(port, stderrRef) {
   throw new Error(`LCA did not become ready on port ${port}\n${stderrRef.value}`);
 }
 
-async function startLca(workspace, endpoint, policy = "full") {
+async function startLca(workspace, endpoint) {
   await mkdir(workspace, { recursive: true });
   const port = await getFreePort();
   const stderrRef = { value: "" };
@@ -224,8 +234,7 @@ async function startLca(workspace, endpoint, policy = "full") {
       ...process.env,
       PORT: String(port),
       AGENT_WORKSPACE: workspace,
-      AGENT_MODE: "safe",
-      AGENT_POLICY: policy,
+      AGENTMEMORY_RECORD_SESSIONS: "0",
       AGENT_EXTRA_ROOTS_JSON: "[]",
       AGENT_AUDIT: "0",
       MCP_AUTH_TOKEN: "",
@@ -253,7 +262,7 @@ async function connect(port) {
 }
 
 async function callRaw(client, name, args = {}) {
-  return client.callTool({ name, arguments: args });
+  return callCompactTool(client, name, args);
 }
 
 async function call(client, name, args = {}) {
@@ -295,54 +304,33 @@ try {
     rejectedWriteTool = /not declared read-only/.test(error.message);
   }
   check("read-only passthrough rejects write-capable tools", rejectedWriteTool);
+  check("module reuses one persistent upstream connection", mock.initializeCount === 1, `initialize_count=${mock.initializeCount}`);
 
   lca = await startLca(path.join(base, "workspace"), mock.endpoint);
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  for (const name of [
-    "dbeaver_status",
-    "dbeaver_list_tools",
-    "dbeaver_call_tool",
-    "dbeaver_list_connections",
-    "dbeaver_propose_sql",
-    "dbeaver_save_sql_snippet",
-    "dbeaver_prepare_sql_execution",
-    "dbeaver_execute_sql",
-    "dbeaver_get_last_result",
-    "dbeaver_fetch_result",
-    "dbeaver_simulate_change"
-  ]) {
-    check(`${name} is exposed by LCA`, names.has(name), JSON.stringify([...names]));
-  }
-  const proposalDescriptor = tools.tools.find((tool) => tool.name === "dbeaver_propose_sql");
-  const artifactResourceUri = proposalDescriptor?._meta?.["openai/outputTemplate"] || "";
-  check(
-    "SQL proposal exposes a fingerprinted artifact widget",
-    /^ui:\/\/widget\/dbeaver-sql-artifact-[0-9a-f]{12}\.html$/.test(artifactResourceUri) &&
-      proposalDescriptor?._meta?.ui?.resourceUri === artifactResourceUri,
-    JSON.stringify(proposalDescriptor)
-  );
+  check("DBeaver is exposed through one compact facade", names.has("dbeaver") && !names.has("dbeaver_execute_sql") && tools.tools.length === 14, JSON.stringify([...names]));
   const resources = await client.listResources();
-  const resourceUris = new Set(resources.resources?.map((resource) => resource.uri));
-  check("fingerprinted SQL artifact resource is listed", resourceUris.has(artifactResourceUri), JSON.stringify(resources.resources));
-  check("legacy SQL artifact resource remains listed", resourceUris.has("ui://widget/dbeaver-sql-artifact.html"), JSON.stringify(resources.resources));
+  const fingerprintedArtifact = resources.resources?.find((resource) => /^ui:\/\/widget\/dbeaver-sql-artifact-[0-9a-f]{12}\.html$/.test(resource.uri));
+  check("fingerprinted SQL artifact resource is listed", Boolean(fingerprintedArtifact), JSON.stringify(resources.resources));
+  check("legacy SQL artifact resource remains listed", resources.resources?.some((resource) => resource.uri === "ui://widget/dbeaver-sql-artifact.html"), JSON.stringify(resources.resources));
   let stableResourceReads = true;
-  for (let index = 0; index < 20; index++) {
-    const widgetResource = await client.readResource({ uri: artifactResourceUri });
-    const html = widgetResource.contents?.[0]?.text || "";
-    if (widgetResource.contents?.[0]?.mimeType !== "text/html;profile=mcp-app" || !html.includes("SQL ARTIFACT")) {
-      stableResourceReads = false;
-      break;
+  if (fingerprintedArtifact) {
+    for (let index = 0; index < 20; index++) {
+      const widgetResource = await client.readResource({ uri: fingerprintedArtifact.uri });
+      const html = widgetResource.contents?.[0]?.text || "";
+      if (widgetResource.contents?.[0]?.mimeType !== "text/html;profile=mcp-app" || !html.includes("SQL ARTIFACT")) {
+        stableResourceReads = false;
+        break;
+      }
     }
+  } else {
+    stableResourceReads = false;
   }
   check("SQL artifact template is stable across repeated reads", stableResourceReads);
   const legacyWidgetResource = await client.readResource({ uri: "ui://widget/dbeaver-sql-artifact.html" });
   check("legacy SQL artifact alias serves the cached template", /SQL ARTIFACT/.test(legacyWidgetResource.contents?.[0]?.text || ""));
-  const prepareDescriptor = tools.tools.find((tool) => tool.name === "dbeaver_prepare_sql_execution");
-  const executeDescriptor = tools.tools.find((tool) => tool.name === "dbeaver_execute_sql");
-  check("SQL preparation is app-only", JSON.stringify(prepareDescriptor?._meta?.ui?.visibility) === JSON.stringify(["app"]), JSON.stringify(prepareDescriptor));
-  check("SQL execution is app-only", JSON.stringify(executeDescriptor?._meta?.ui?.visibility) === JSON.stringify(["app"]), JSON.stringify(executeDescriptor));
 
   const connections = await call(client, "dbeaver_list_connections", { connected_only: true });
   check("LCA forwards connection listing", /Demo/.test(connections.content?.[0]?.text || ""), JSON.stringify(connections));
@@ -368,7 +356,7 @@ try {
   const blockedExecute = await callRaw(client, "dbeaver_execute_sql", { approval_id: "approved-1" });
   check("model-style SQL execution without widget capability is blocked", blockedExecute.isError === true && /run_intent_token|SQL Artifact Run button/.test(blockedExecute.content?.[0]?.text || ""), JSON.stringify(blockedExecute));
   const query = await call(client, "dbeaver_execute_sql", { approval_id: "approved-1", run_intent_token: runIntentToken });
-  check("SQL Artifact Run forwards one-time approved SQL", /42/.test(query.content?.[0]?.text || ""), JSON.stringify(query));
+  check("SQL Artifact Run forwards user-confirmed SQL", /42/.test(query.content?.[0]?.text || ""), JSON.stringify(query));
   check(
     "mock received the exact proposed SQL and connection without editor selection",
     mock.calls.some((entry) =>
@@ -394,29 +382,10 @@ try {
   });
   check("LCA forwards transactional simulation", /rollback_succeeded/.test(simulation.content?.[0]?.text || ""), JSON.stringify(simulation));
 
-  await client.close();
-  client = null;
-  await stopChild(lca.child);
-  lca = null;
-
-  lca = await startLca(path.join(base, "strict-workspace"), mock.endpoint, "strict");
-  client = await connect(lca.port);
-  const strictRead = await call(client, "dbeaver_call_tool", { tool: "dbeaver_database_summary", arguments: { connection: "demo" } });
-  check("strict policy keeps read-only DBeaver discovery available", /SQLite/.test(strictRead.content?.[0]?.text || ""), JSON.stringify(strictRead));
-  const strictPrepare = await callRaw(client, "dbeaver_prepare_sql_execution", { connection: "demo", sql: "select 42", run_intent_token: "strict-test-token" });
-  check("strict policy blocks operator execution preparation", strictPrepare.isError === true && /policy=strict/.test(strictPrepare.content?.[0]?.text || ""), JSON.stringify(strictPrepare));
-  const strictExecute = await callRaw(client, "dbeaver_execute_sql", { approval_id: "approved-1", run_intent_token: "strict-test-token" });
-  check("strict policy blocks approved SQL execution", strictExecute.isError === true && /policy=strict/.test(strictExecute.content?.[0]?.text || ""), JSON.stringify(strictExecute));
-  const strictSimulation = await callRaw(client, "dbeaver_simulate_change", {
-    connection: "demo",
-    sql: "update t set x=1",
-    allow_simulation: true,
-    acknowledge_external_side_effects: true
-  });
-  check("strict policy blocks change simulation", strictSimulation.isError === true && /policy=strict/.test(strictSimulation.content?.[0]?.text || ""), JSON.stringify(strictSimulation));
 } finally {
   await client?.close().catch(() => {});
   await stopChild(lca?.child);
+  await closeDBeaverDesktopClients();
   await new Promise((resolve) => mock.server.close(resolve));
   await rm(base, { recursive: true, force: true });
 }

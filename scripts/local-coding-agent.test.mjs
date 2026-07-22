@@ -1,23 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
   chooseManagedTunnelKeeper,
+  hashDirectoryTree,
   isManagedTunnelArgv,
+  nextRuntimeBuildSpec,
+  parseArgs,
   mergeDotEnvText,
   normalize,
   normalizeProjectRoots,
   normalizeTunnelArch,
   parseDotEnv,
   ripgrepInstallCommand,
-  setupSecurityDefaults,
   tunnelAssetName,
   tunnelAssetUrl
 } from "./local-coding-agent.mjs";
 
-test("normalizes isolated staging CLI port to 8790", () => {
-  assert.equal(normalize({}).port, "8790");
+test("normalizes trusted compact runtime defaults", () => {
+  const value = normalize({ mode: "safe", policy: "strict", surface: "legacy" });
+  assert.equal(value.port, "8790");
+  assert.equal(Object.hasOwn(value, "mode"), false);
+  assert.equal(Object.hasOwn(value, "policy"), false);
+  assert.equal(Object.hasOwn(value, "surface"), false);
 });
 
 test("normalizes and deduplicates multi-project roots", () => {
@@ -109,11 +117,6 @@ test("empty dotenv merge starts with the requested key", () => {
   assert.equal(merged, "CONTROL_PLANE_TUNNEL_ID=tunnel_new\n");
 });
 
-test("setup defaults to full mode and full policy unless flags override", () => {
-  assert.deepEqual(setupSecurityDefaults({}), { mode: "full", policy: "full" });
-  assert.deepEqual(setupSecurityDefaults({ mode: "safe", policy: "balanced" }), { mode: "safe", policy: "balanced" });
-});
-
 test("selects ripgrep install command by platform", () => {
   assert.deepEqual(ripgrepInstallCommand({ id: "darwin" }, ["brew"]), {
     label: "Homebrew",
@@ -129,4 +132,47 @@ test("selects ripgrep install command by platform", () => {
   assert.equal(linux.label, "apt-get");
   assert.match(`${linux.command} ${linux.args.join(" ")}`, /apt-get .*install -y ripgrep|apt-get install -y ripgrep/);
   assert.equal(ripgrepInstallCommand({ id: "linux" }, []), null);
+});
+
+
+test("hashes runtime build directories deterministically and detects changes", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "lca-runtime-hash-"));
+  try {
+    mkdirSync(path.join(root, "nested"), { recursive: true });
+    writeFileSync(path.join(root, "b.js"), "export const b = 2;\n");
+    writeFileSync(path.join(root, "nested", "a.js"), "export const a = 1;\n");
+    const first = hashDirectoryTree(root);
+    const second = hashDirectoryTree(root);
+    assert.equal(first, second);
+    writeFileSync(path.join(root, "nested", "a.js"), "export const a = 3;\n");
+    assert.notEqual(hashDirectoryTree(root), first);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("selects the deterministic TypeScript build command by platform", () => {
+  assert.deepEqual(nextRuntimeBuildSpec("linux").args, ["run", "build:next"]);
+  assert.equal(nextRuntimeBuildSpec("linux").command, "npm");
+  assert.equal(nextRuntimeBuildSpec("win32").command, "npm.cmd");
+  assert.match(nextRuntimeBuildSpec("linux").cwd, /server$/);
+});
+
+
+test("parses AgentMemory portability command flags", () => {
+  const parsed = parseArgs([
+    "memory",
+    "import",
+    "backup.json",
+    "--dry-run",
+    "--strategy",
+    "merge",
+    "--json"
+  ]);
+  assert.equal(parsed.command, "memory");
+  assert.deepEqual(parsed.rest, ["import", "backup.json"]);
+  assert.equal(parsed.flags.dryRun, true);
+  assert.equal(parsed.flags.strategy, "merge");
+  assert.equal(parsed.flags.json, true);
 });

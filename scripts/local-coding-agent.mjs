@@ -23,6 +23,20 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { stdin as input, stdout as output } from "node:process";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  MIN_NODE_MAJOR,
+  createManagedRuntimePaths,
+  inspectManagedRuntime,
+  installManagedRuntime,
+  runtimeInstallPlan
+} from "./managed-runtime.mjs";
+import {
+  ManagedAgentMemoryService,
+  agentMemoryPortabilityStatus,
+  createAgentMemoryPortabilityPaths,
+  exportAgentMemoryBackup,
+  importAgentMemoryBackup
+} from "./agentmemory-portability.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
@@ -36,6 +50,15 @@ const PID_PATH = join(dirname(CONFIG_PATH), "processes.json");
 const LOG_PATH = join(dirname(CONFIG_PATH), "launcher.log");
 const START_LOCK_PATH = join(dirname(CONFIG_PATH), "start.lock");
 const START_LOCK_OWNER_PATH = join(START_LOCK_PATH, "owner.json");
+const MANAGED_RUNTIME_PATHS = createManagedRuntimePaths({
+  repoRoot: REPO_ROOT,
+  configPath: CONFIG_PATH
+});
+const AGENTMEMORY_PORTABILITY_PATHS = createAgentMemoryPortabilityPaths({
+  configPath: CONFIG_PATH,
+  memoryCliPath: MANAGED_RUNTIME_PATHS.memoryCliPath
+});
+const LCA_VERSION = "4.4.0-pro";
 const DEFAULT_PORT = "8790";
 const DEFAULT_TUNNEL_VERSION = process.env.TUNNEL_CLIENT_VERSION || "v0.0.10";
 const DEFAULT_FIGMA_DESKTOP_MCP_URL = "http://127.0.0.1:3845/mcp";
@@ -65,8 +88,6 @@ function defaultOptions() {
     workspace: process.env.AGENT_WORKSPACE || "",
     extraRoots: process.env.AGENT_EXTRA_ROOTS || "",
     extraRootsJson: process.env.AGENT_EXTRA_ROOTS_JSON || "",
-    mode: process.env.AGENT_MODE || "safe",
-    policy: process.env.AGENT_POLICY || "balanced",
     port: process.env.PORT || DEFAULT_PORT,
     authToken: process.env.MCP_AUTH_TOKEN || "",
     tunnelBin:
@@ -89,7 +110,11 @@ Usage:
   lca-custom start [--background] [--no-tunnel]
   lca-custom stop
   lca-custom status
-  lca-custom doctor
+  lca-custom doctor [--json]
+  lca-custom install [--force] [--json]
+  lca-custom memory status [--json]
+  lca-custom memory export [file] [--json]
+  lca-custom memory import <file> [--dry-run] [--strategy skip|merge|replace] [--force] [--json]
   lca-custom add [path]
   lca-custom remove [path]
   lca-custom reset [path]
@@ -101,13 +126,13 @@ Usage:
   lca-custom update
 
 Options:
-  --workspace <path>          Workspace root the agent may access
-  --mode <safe|full>          Command guardrail mode
-  --policy <strict|balanced|full>
+  --workspace <path>          Primary project root for discovery and relative paths
   --port <port>               MCP server port
   --auth-token <token>        Optional MCP bearer token
   --node <path>               Node executable
   --background                Keep server/tunnel running after this command exits
+  --dry-run                   Validate without changing AgentMemory
+  --strategy <mode>           Import strategy: skip, merge, or replace
 
 Tunnel options:
   --no-tunnel                 Start only the local MCP server
@@ -134,6 +159,7 @@ Usage:
 
 The wizard uses only Node.js built-ins. It auto-detects the current OS, checks
 prerequisites, creates or updates .env.local, installs server dependencies,
+installs the pinned server + lean AgentMemory managed runtime, builds the compact interface,
 checks the local Figma Desktop MCP bridge, downloads tunnel-client when possible,
 writes an isolated staging CLI config, installs the global lca-custom command, and prints health/status checks.
 
@@ -141,7 +167,7 @@ Use --choose-os only when you want instruction mode for another OS.
 `);
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   if (argv.length === 0) {
     return { command: "help", rest: [], flags: {} };
   }
@@ -167,12 +193,6 @@ function parseArgs(argv) {
         break;
       case "--extra-roots":
         flags.extraRoots = next();
-        break;
-      case "--mode":
-        flags.mode = next();
-        break;
-      case "--policy":
-        flags.policy = next();
         break;
       case "--port":
         flags.port = next();
@@ -220,6 +240,12 @@ function parseArgs(argv) {
       case "--force":
         flags.force = true;
         break;
+      case "--dry-run":
+        flags.dryRun = true;
+        break;
+      case "--strategy":
+        flags.strategy = next();
+        break;
       case "--json":
         flags.json = true;
         break;
@@ -264,8 +290,9 @@ function effectiveOptions(flags = {}) {
 export function normalize(opts) {
   const out = { ...opts };
   out.port = String(out.port || DEFAULT_PORT);
-  out.mode = out.mode || "safe";
-  out.policy = out.policy || "balanced";
+  delete out.mode;
+  delete out.policy;
+  delete out.surface;
   out.runtimeKeyEnv = out.runtimeKeyEnv || "CONTROL_PLANE_API_KEY";
   out.profile = out.profile || "local-coding-agent";
   out.profileDir = out.profileDir || join(REPO_ROOT, "tools", "profiles");
@@ -319,12 +346,6 @@ export function normalizeProjectRoots(opts = {}) {
   return roots;
 }
 
-export function setupSecurityDefaults(flags = {}) {
-  return {
-    mode: flags.mode || "full",
-    policy: flags.policy || "full"
-  };
-}
 
 function toBool(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
@@ -488,8 +509,6 @@ function sha256(buffer) {
 }
 
 function validate(opts, { requireWorkspace = false, requireTunnel = false } = {}) {
-  if (!["safe", "full"].includes(opts.mode)) throw new Error("--mode must be safe or full.");
-  if (!["strict", "balanced", "full"].includes(opts.policy)) throw new Error("--policy must be strict, balanced, or full.");
   const port = Number(opts.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be a TCP port.");
   if (requireWorkspace) {
@@ -508,18 +527,48 @@ function yamlEscape(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
+export function hashDirectoryTree(directory) {
+  if (!existsSync(directory)) return "missing";
+  const hash = createHash("sha256");
+  const visit = (current, relative) => {
+    const entries = readdirSync(current, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const absolute = join(current, entry.name);
+      const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        hash.update(`dir:${childRelative}\0`);
+        visit(absolute, childRelative);
+      } else if (entry.isFile()) {
+        hash.update(`file:${childRelative}\0`);
+        hash.update(readFileSync(absolute));
+        hash.update("\0");
+      }
+    }
+  };
+  visit(directory, "");
+  return hash.digest("hex").slice(0, 16);
+}
+
 function configId(opts) {
   const serverPath = join(SERVER_DIR, SERVER_SCRIPT);
   const figmaBridgePath = join(SERVER_DIR, "figma-desktop.mjs");
+  const dbeaverBridgePath = join(SERVER_DIR, "dbeaver-desktop.mjs");
+  const brunoBridgePath = join(SERVER_DIR, "bruno-desktop.mjs");
+  const persistentHttpBridgePath = join(SERVER_DIR, "persistent-http-mcp-client.mjs");
+  const nextRuntimePath = join(SERVER_DIR, "dist");
   const material = JSON.stringify({
     projects: opts.projects || [],
-    mode: opts.mode,
-    policy: opts.policy,
+    runtime: "trusted-local-compact",
     extraRoots: opts.extraRoots || "",
     authEnabled: Boolean(opts.authToken),
     port: String(opts.port),
     serverHash: existsSync(serverPath) ? sha256(readFileSync(serverPath)).slice(0, 16) : "missing",
+    nextRuntimeHash: hashDirectoryTree(nextRuntimePath),
     figmaBridgeHash: existsSync(figmaBridgePath) ? sha256(readFileSync(figmaBridgePath)).slice(0, 16) : "missing",
+    dbeaverBridgeHash: existsSync(dbeaverBridgePath) ? sha256(readFileSync(dbeaverBridgePath)).slice(0, 16) : "missing",
+    brunoBridgeHash: existsSync(brunoBridgePath) ? sha256(readFileSync(brunoBridgePath)).slice(0, 16) : "missing",
+    persistentHttpBridgeHash: existsSync(persistentHttpBridgePath) ? sha256(readFileSync(persistentHttpBridgePath)).slice(0, 16) : "missing",
     figmaDesktopMcpUrl: figmaDesktopEndpoint(),
     figmaDesktopTimeoutMs: process.env.FIGMA_DESKTOP_TIMEOUT_MS || "30000",
     figmaDesktopAllowRemote: process.env.FIGMA_DESKTOP_ALLOW_REMOTE === "1"
@@ -899,8 +948,8 @@ async function ensureRipgrep(platform = detectSetupPlatform()) {
 
 async function checkPrerequisites(platform = detectSetupPlatform()) {
   const nodeMajor = Number(process.versions.node.split(".")[0]);
-  if (!Number.isInteger(nodeMajor) || nodeMajor < 18) {
-    throw new Error(`Node.js 18+ is required. Current version: ${process.version}`);
+  if (!Number.isInteger(nodeMajor) || nodeMajor < MIN_NODE_MAJOR) {
+    throw new Error(`Node.js ${MIN_NODE_MAJOR}+ is required. Current version: ${process.version}`);
   }
   console.log(`OK node ${process.version}`);
   const npm = await capture(npmCommand(), ["--version"]);
@@ -1207,7 +1256,7 @@ async function installCliCommand() {
         throw new Error(`Refusing to overwrite: ${target}`);
       }
     }
-    writeFileSync(cmdPath, `@echo off\r\nrem ${marker}\r\nwhere node >nul 2>nul\r\nif errorlevel 1 (\r\n  echo ERROR: Node.js 18+ is required but node was not found in PATH.\r\n  echo Install Node.js LTS from https://nodejs.org/ then open a new terminal and rerun setup.\r\n  exit /b 1\r\n)\r\nnode "${join(SCRIPT_DIR, "local-coding-agent.mjs")}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
+    writeFileSync(cmdPath, `@echo off\r\nrem ${marker}\r\nwhere node >nul 2>nul\r\nif errorlevel 1 (\r\n  echo ERROR: Node.js 20+ is required but node was not found in PATH.\r\n  echo Install Node.js LTS from https://nodejs.org/ then open a new terminal and rerun setup.\r\n  exit /b 1\r\n)\r\nnode "${join(SCRIPT_DIR, "local-coding-agent.mjs")}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
     writeFileSync(psPath, `# ${marker}\n& node "${join(SCRIPT_DIR, "local-coding-agent.mjs")}" @args\nexit $LASTEXITCODE\n`, "utf8");
     console.log(`Installed: ${cmdPath}`);
     const pathResult = await configureShellPath(binDir);
@@ -1278,26 +1327,16 @@ async function setup(flags) {
       console.log("Tunnel disabled; .env.local can be filled later.");
     }
 
-    printStep(4, 9, "Configure agent defaults");
+    printStep(4, 9, "Configure trusted local runtime");
     cfg.node = cfg.node || "node";
     cfg.workspace = await promptLine(rl, "First project root", cfg.workspace || process.cwd());
-    const securityDefaults = setupSecurityDefaults(flags);
-    cfg.mode = (await promptChoice(rl, "Mode", [{ id: "full", label: "full" }, { id: "safe", label: "safe" }], securityDefaults.mode)).id;
-    cfg.policy = (await promptChoice(rl, "Policy", [
-      { id: "full", label: "full" },
-      { id: "balanced", label: "balanced" },
-      { id: "strict", label: "strict" }
-    ], securityDefaults.policy)).id;
     cfg.port = await promptLine(rl, "MCP port", cfg.port || DEFAULT_PORT);
+    console.log("Runtime: trusted-local, compact 14-tool facade, direct execution without policy or approval round-trips.");
     cfg.extraRoots = flags.extraRoots ?? cfg.extraRoots ?? "";
     cfg.authToken = flags.authToken ?? cfg.authToken ?? "";
 
-    printStep(5, 9, "Install server dependencies");
-    if (!existsSync(join(SERVER_DIR, "node_modules"))) {
-      await installDeps(cfg);
-    } else {
-      console.log("Server dependencies already installed.");
-    }
+    printStep(5, 9, "Install managed runtime");
+    await installManagedRuntimeCommand({ ...flags, json: false });
 
     printStep(6, 9, "Connect Figma Desktop MCP");
     const useFigmaDesktop = await promptYesNo(rl, "Enable Figma Desktop integration", true);
@@ -1358,15 +1397,138 @@ function stripRuntimeFields(cfg) {
   delete out.background;
   delete out.json;
   delete out.force;
+  delete out.mode;
+  delete out.policy;
+  delete out.surface;
   return out;
 }
 
-async function installDeps(opts) {
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const child = spawnLogged("install", npm, ["install"], { cwd: SERVER_DIR });
-  const code = await new Promise((resolveExit) => child.on("exit", resolveExit));
-  if (code !== 0) throw new Error(`npm install failed with exit code ${code}`);
-  console.log("Install complete.");
+export function nextRuntimeBuildSpec(platform = process.platform) {
+  return {
+    command: platform === "win32" ? "npm.cmd" : "npm",
+    args: ["run", "build:next"],
+    cwd: SERVER_DIR
+  };
+}
+
+function managedRuntimeOptions(overrides = {}) {
+  return {
+    paths: MANAGED_RUNTIME_PATHS,
+    platform: process.platform,
+    arch: process.arch,
+    nodeVersion: process.versions.node,
+    agentMemoryUrl: process.env.AGENTMEMORY_URL || "http://127.0.0.1:3111",
+    ...overrides
+  };
+}
+
+async function runManagedRuntimeCommand(command, args, options = {}) {
+  const label = options.cwd === MANAGED_RUNTIME_PATHS.memoryDirectory
+    ? "agentmemory"
+    : args.includes("build:next")
+      ? "build-next"
+      : "server-deps";
+  await runChecked(label, command, args, {
+    cwd: options.cwd,
+    env: options.env
+  });
+  return { code: 0, signal: null, stdout: "", stderr: "" };
+}
+
+async function runManagedRuntimeQuiet(command, args, options = {}) {
+  const result = await capture(command, args, { cwd: options.cwd, env: options.env });
+  if (result.code !== 0) {
+    throw new Error(`${command} ${args.join(" ")} failed with exit ${result.code}: ${result.stderr || result.stdout}`);
+  }
+  return result;
+}
+
+async function installManagedRuntimeCommand(flags = {}) {
+  const quiet = flags.quiet === true || flags.json === true;
+  const result = await installManagedRuntime(managedRuntimeOptions({
+    force: flags.force === true,
+    probeEngine: flags.probeEngine,
+    probeServices: flags.probeServices,
+    run: quiet ? runManagedRuntimeQuiet : runManagedRuntimeCommand,
+    log: (message) => {
+      if (!quiet) console.log(`[runtime] ${message}`);
+    }
+  }));
+  if (flags.json) {
+    console.log(JSON.stringify({
+      kind: "managed_runtime_install",
+      plan: result.plan,
+      repaired: result.plan.installServer || result.plan.installAgentMemory || result.plan.initializeAgentMemory,
+      rebuilt: result.plan.buildCompactRuntime,
+      receipt: result.after
+    }, null, 2));
+  } else if (!quiet) {
+    printManagedRuntimeReceipt(result.after);
+  }
+  return result.after;
+}
+
+async function managedRuntimeFastReport() {
+  return inspectManagedRuntime(managedRuntimeOptions({
+    probeEngine: false,
+    probeServices: false
+  }));
+}
+
+async function stopManagedServerForRepair(opts, { quiet = false } = {}) {
+  const state = readPidState();
+  const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
+  const serverPid = health?.pid || state.serverPid;
+  if (!serverPid || !isPidAlive(serverPid)) return false;
+  if (!quiet) console.log(`[runtime] stopping server PID ${serverPid} before replacing dependencies`);
+  killPid(serverPid);
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline && isPidAlive(serverPid)) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  if (isPidAlive(serverPid)) throw new Error(`Server PID ${serverPid} did not exit before managed runtime repair.`);
+  return true;
+}
+
+async function ensureManagedRuntime(opts) {
+  const before = await managedRuntimeFastReport();
+  const plan = runtimeInstallPlan(before);
+  if (plan.installServer || plan.installAgentMemory) {
+    await stopManagedServerForRepair(opts, { quiet: true });
+  }
+  return installManagedRuntimeCommand({
+    quiet: true,
+    force: false,
+    probeEngine: false,
+    probeServices: false
+  });
+}
+
+async function withMutedConsoleLog(operation) {
+  const original = console.log;
+  console.log = () => {};
+  try {
+    return await operation();
+  } finally {
+    console.log = original;
+  }
+}
+
+async function installCommand(flags) {
+  const opts = effectiveOptions(flags);
+  const before = await managedRuntimeFastReport();
+  const plan = runtimeInstallPlan(before, { force: flags.force === true });
+  const needsReplacement = plan.installServer || plan.installAgentMemory;
+  const stoppedServer = needsReplacement
+    ? await stopManagedServerForRepair(opts, { quiet: flags.json === true })
+    : false;
+  const receipt = await installManagedRuntimeCommand(flags);
+  if (stoppedServer) {
+    const restart = () => start({ ...opts, background: true, skipManagedRuntime: true });
+    if (flags.json) await withMutedConsoleLog(restart);
+    else await restart();
+  }
+  return receipt;
 }
 
 async function runChecked(label, command, args, options = {}) {
@@ -1398,6 +1560,8 @@ async function capture(command, args, options = {}) {
 
 async function updateSelf(flags) {
   const git = process.platform === "win32" ? "git.exe" : "git";
+  const currentConfig = effectiveOptions(flags);
+  const runningBefore = await runningStatusForConfig(currentConfig);
   const before = await capture(git, ["status", "--short", "--branch"], { cwd: REPO_ROOT });
   if (before.code !== 0) throw new Error(`git status failed: ${before.stderr || before.stdout}`);
   console.log(before.stdout.trim() || "working tree clean");
@@ -1405,6 +1569,7 @@ async function updateSelf(flags) {
   if (dirtyLines.length && !flags.force) {
     throw new Error("Local changes detected. Review them first, then rerun with --force only if you want to proceed.");
   }
+  if (runningBefore.running) await stop(currentConfig);
   await runChecked("git", git, ["fetch", "origin", "main", "--tags"], { cwd: REPO_ROOT });
   const incoming = await capture(git, ["log", "--oneline", "--decorate", "--max-count=10", "HEAD..origin/main"], { cwd: REPO_ROOT });
   if (incoming.stdout.trim()) {
@@ -1414,10 +1579,11 @@ async function updateSelf(flags) {
     console.log("\nAlready up to date with origin/main.");
   }
   await runChecked("git", git, ["pull", "--ff-only", "origin", "main"], { cwd: REPO_ROOT });
-  await installDeps(effectiveOptions(flags));
+  await installManagedRuntimeCommand({ ...flags, force: true, json: false });
   await runChecked("check", process.execPath, ["--check", join(SCRIPT_DIR, "local-coding-agent.mjs")], { cwd: REPO_ROOT });
   await runChecked("check", process.execPath, ["--check", join(SCRIPT_DIR, "network-doctor.mjs")], { cwd: REPO_ROOT });
   await runChecked("skills", process.execPath, [join(SCRIPT_DIR, "validate-skills.mjs")], { cwd: REPO_ROOT });
+  if (runningBefore.running) await start({ ...currentConfig, background: true, skipManagedRuntime: true });
   await doctor(flags);
   console.log("\nUpdate complete.");
 }
@@ -1430,9 +1596,7 @@ async function start(flags) {
     const opts = effectiveOptions(flags);
     validate(opts, { requireWorkspace: true, requireTunnel: true });
     if (!existsSync(join(SERVER_DIR, SERVER_SCRIPT))) throw new Error(`Missing ${SERVER_SCRIPT} in ${SERVER_DIR}`);
-    if (!existsSync(join(SERVER_DIR, "node_modules"))) {
-      throw new Error("server/node_modules is missing. Run `node scripts/local-coding-agent.mjs install` first.");
-    }
+    if (!flags.skipManagedRuntime) await ensureManagedRuntime(opts);
     if (flags.save) await saveConfig(stripRuntimeFields(opts));
 
     const id = configId(opts);
@@ -1452,8 +1616,6 @@ async function start(flags) {
         PORT: String(opts.port),
         AGENT_HOST: "127.0.0.1",
         AGENT_WORKSPACE: opts.workspace,
-        AGENT_MODE: opts.mode,
-        AGENT_POLICY: opts.policy,
         AGENT_CONFIG_ID: id,
         AGENT_EXTRA_ROOTS: opts.extraRoots || "",
         AGENT_EXTRA_ROOTS_JSON: JSON.stringify(opts.projects.slice(1)),
@@ -1634,37 +1796,71 @@ async function status(flags) {
     console.log(`MCP URL:   ${data.mcp_url}`);
     console.log(`Projects:  ${data.projects.length}`);
     for (const project of data.projects) console.log(`  - ${project}`);
-    console.log(`Server:    ${health ? `ONLINE ${health.version || ""} (${health.mode || "mode?"}/${health.policy || "policy?"}) pid=${health.pid || "?"}` : "offline"}`);
+    console.log(`Server:    ${health ? `ONLINE ${health.version || ""} (${health.runtime || "trusted-local"}/${health.tool_surface || "compact"}) pid=${health.pid || "?"}` : "offline"}`);
     console.log(`Tunnel:    ${data.pids.tunnel_alive ? `running pid=${data.pids.tunnel}` : "unknown/offline"} managed=${data.pids.tunnel_count} duplicates=${data.pids.tunnel_duplicates}`);
   }
 }
 
+function printManagedRuntimeReceipt(receipt) {
+  for (const check of receipt.checks) {
+    const prefix = check.status === "pass" ? "OK " : check.status === "warn" ? "WARN" : "ERR";
+    console.log(`${prefix} ${check.title}: ${check.detail}`);
+  }
+  console.log(`Managed runtime: ${receipt.status.toUpperCase()} (${receipt.summary.pass} pass, ${receipt.summary.warn} warn, ${receipt.summary.fail} fail)`);
+}
+
 async function doctor(flags) {
   const opts = effectiveOptions(flags);
+  const runtime = await inspectManagedRuntime(managedRuntimeOptions());
   const checks = [];
-  const add = (name, ok, detail = "") => checks.push({ name, ok, detail });
-  add("server directory", existsSync(SERVER_DIR), SERVER_DIR);
-  add("server.mjs", existsSync(join(SERVER_DIR, SERVER_SCRIPT)), join(SERVER_DIR, SERVER_SCRIPT));
-  add("server node_modules", existsSync(join(SERVER_DIR, "node_modules")), join(SERVER_DIR, "node_modules"));
-  add("projects configured", opts.projects.length > 0, opts.projects.length ? `${opts.projects.length} project(s)` : "none; run lca-custom add [path]");
-  for (const project of opts.projects) add("project", isDirectory(project), project);
-  add("tunnel-client", opts.noTunnel || existsSync(opts.tunnelBin), opts.noTunnel ? "disabled" : opts.tunnelBin);
-  add("runtime key", opts.noTunnel || Boolean(process.env[opts.runtimeKeyEnv] || opts.runtimeKey), opts.noTunnel ? "disabled" : opts.runtimeKeyEnv);
+  const add = (id, status, title, detail, repair = null) => checks.push({ id, status, title, detail, repair });
+  add("server_directory", existsSync(SERVER_DIR) ? "pass" : "fail", "Server directory", SERVER_DIR);
+  add("server_entry", existsSync(join(SERVER_DIR, SERVER_SCRIPT)) ? "pass" : "fail", "server.mjs", join(SERVER_DIR, SERVER_SCRIPT));
+  add("projects", opts.projects.length > 0 ? "pass" : "fail", "Projects configured", opts.projects.length ? `${opts.projects.length} project(s)` : "none", "Run lca-custom add [path].");
+  for (const project of opts.projects) add(`project:${project}`, isDirectory(project) ? "pass" : "fail", "Project root", project);
+  add("tunnel_client", opts.noTunnel || existsSync(opts.tunnelBin) ? "pass" : "fail", "Tunnel client", opts.noTunnel ? "disabled" : opts.tunnelBin);
+  add("runtime_key", opts.noTunnel || Boolean(process.env[opts.runtimeKeyEnv] || opts.runtimeKey) ? "pass" : "fail", "Runtime key", opts.noTunnel ? "disabled" : opts.runtimeKeyEnv);
   const rg = await capture(process.platform === "win32" ? "rg.exe" : "rg", ["--version"]);
-  add("ripgrep", rg.code === 0, rg.code === 0 ? rg.stdout.split(/\r?\n/)[0] : "missing; run lca-custom setup to auto-install or install ripgrep manually");
+  add("ripgrep", rg.code === 0 ? "pass" : "warn", "ripgrep", rg.code === 0 ? rg.stdout.split(/\r?\n/)[0] : "missing; search falls back to scanning");
   const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`);
-  add("server health", Boolean(health), health ? `${health.version} pid=${health.pid || "?"}` : "offline");
+  add("server_health", health ? "pass" : "warn", "Server health", health ? `${health.version} pid=${health.pid || "?"} surface=${health.tool_surface || "?"}` : "offline");
   const managedTunnels = opts.noTunnel ? [] : await findManagedTunnelProcesses(opts);
   add(
-    "tunnel singleton",
-    opts.noTunnel || managedTunnels.length === 1,
+    "tunnel_singleton",
+    opts.noTunnel || managedTunnels.length === 1 ? "pass" : managedTunnels.length === 0 ? "warn" : "fail",
+    "Tunnel singleton",
     opts.noTunnel ? "disabled" : `${managedTunnels.length} managed process(es): ${managedTunnels.map((entry) => entry.pid).join(", ") || "none"}`
   );
-  for (const check of checks) {
-    console.log(`${check.ok ? "OK " : "ERR"} ${check.name}: ${check.detail}`);
+
+  const allChecks = [...runtime.checks, ...checks];
+  const fail = allChecks.filter((check) => check.status === "fail").length;
+  const warn = allChecks.filter((check) => check.status === "warn").length;
+  const data = {
+    kind: "lca_custom_doctor",
+    status: fail ? "fail" : warn ? "warn" : "pass",
+    ready: fail === 0,
+    runtime,
+    checks,
+    summary: { pass: allChecks.filter((check) => check.status === "pass").length, warn, fail },
+    server: health || null,
+    projects: opts.projects,
+    tunnel: {
+      enabled: !opts.noTunnel,
+      processes: managedTunnels.map((entry) => entry.pid)
+    }
+  };
+
+  if (flags.json) console.log(JSON.stringify(data, null, 2));
+  else {
+    printManagedRuntimeReceipt(runtime);
+    for (const check of checks) {
+      const prefix = check.status === "pass" ? "OK " : check.status === "warn" ? "WARN" : "ERR";
+      console.log(`${prefix} ${check.title}: ${check.detail}`);
+    }
+    console.log(`Doctor: ${data.status.toUpperCase()} (${data.summary.pass} pass, ${data.summary.warn} warn, ${data.summary.fail} fail)`);
   }
-  const failed = checks.filter((c) => !c.ok).length;
-  if (failed) process.exitCode = 1;
+  if (fail) process.exitCode = 1;
+  return data;
 }
 
 function redactConfigForDisplay(cfg) {
@@ -1686,14 +1882,11 @@ async function promptConfigWizard() {
     while (true) {
       console.log("\nLocal Coding Agent config");
       console.log(`  Workspace: ${cfg.workspace || "(not set)"}`);
-      console.log(`  Mode:      ${cfg.mode}`);
-      console.log(`  Policy:    ${cfg.policy}`);
+      console.log("  Runtime:   trusted-local / compact");
       console.log(`  MCP port:  ${cfg.port}`);
       console.log(`  Tunnel:    ${cfg.noTunnel ? "disabled" : "enabled"}`);
       console.log("");
       const action = await promptChoice(rl, "Choose what to change", [
-        { id: "mode", label: "Mode" },
-        { id: "policy", label: "Policy" },
         { id: "workspace", label: "Workspace path" },
         { id: "port", label: "MCP port" },
         { id: "tunnel", label: "Tunnel on/off" },
@@ -1701,18 +1894,7 @@ async function promptConfigWizard() {
         { id: "save", label: "Save and apply" },
         { id: "cancel", label: "Cancel" }
       ], "save");
-      if (action.id === "mode") {
-        cfg.mode = (await promptChoice(rl, "Mode", [
-          { id: "full", label: "full - fewer command blocks" },
-          { id: "safe", label: "safe - stricter command guardrail" }
-        ], cfg.mode)).id;
-      } else if (action.id === "policy") {
-        cfg.policy = (await promptChoice(rl, "Policy", [
-          { id: "full", label: "full - fewer approval gates" },
-          { id: "balanced", label: "balanced - approval for risky actions" },
-          { id: "strict", label: "strict - tighter/read-review focused" }
-        ], cfg.policy)).id;
-      } else if (action.id === "workspace") {
+      if (action.id === "workspace") {
         cfg.workspace = await promptLine(rl, "Workspace path", cfg.workspace || process.cwd());
       } else if (action.id === "port") {
         cfg.port = await promptLine(rl, "MCP port", cfg.port || DEFAULT_PORT);
@@ -1867,6 +2049,88 @@ async function ensureFigmaDesktopConnected(rl, { interactive = false, failOnMiss
   if (failOnMissing) throw new Error(statusValue.error || "Figma Desktop MCP is not available.");
   console.log("You can finish later with: lca-custom figma");
   return statusValue;
+}
+
+function agentMemoryPortabilityOptions() {
+  const baseUrl = process.env.AGENTMEMORY_URL || "http://127.0.0.1:3111";
+  const service = new ManagedAgentMemoryService({
+    paths: AGENTMEMORY_PORTABILITY_PATHS,
+    baseUrl
+  });
+  return {
+    paths: AGENTMEMORY_PORTABILITY_PATHS,
+    baseUrl,
+    secret: process.env.AGENTMEMORY_SECRET || "",
+    service,
+    lcaVersion: LCA_VERSION
+  };
+}
+
+function printMemoryReceipt(receipt) {
+  if (receipt.kind === "agentmemory_export") {
+    console.log(`AgentMemory backup: ${receipt.path}`);
+    console.log(`Checksum: ${receipt.checksum}`);
+    console.log(`Sessions: ${receipt.counts.sessions}, observations: ${receipt.counts.observations}, memories: ${receipt.counts.memories}`);
+    return;
+  }
+  if (receipt.kind === "agentmemory_import") {
+    console.log(`${receipt.dry_run ? "Validated" : "Imported"}: ${receipt.input}`);
+    console.log(`Strategy: ${receipt.strategy}; checksum: ${receipt.checksum}`);
+    if (receipt.pre_import_backup?.path) console.log(`Pre-import backup: ${receipt.pre_import_backup.path}`);
+    if (receipt.result) console.log(`Result: ${JSON.stringify(receipt.result)}`);
+    return;
+  }
+  if (receipt.kind === "agentmemory_portability_status") {
+    console.log(`AgentMemory service: ${receipt.service.ready ? "healthy" : "offline"}`);
+    console.log(`Backup directory: ${receipt.backup_directory}`);
+    console.log(`Backups: ${receipt.backups.length}`);
+    for (const backup of receipt.backups.slice(0, 10)) console.log(`  - ${backup.path} (${backup.bytes} bytes)`);
+  }
+}
+
+async function memoryCommand(rest, flags = {}) {
+  const [sub = "status", file, ...extra] = rest;
+  if (extra.length > 0) throw new Error("Too many memory command arguments.");
+  const common = agentMemoryPortabilityOptions();
+
+  if (sub === "status") {
+    if (file) throw new Error("Usage: lca-custom memory status [--json]");
+    const receipt = await agentMemoryPortabilityStatus(common);
+    if (flags.json) console.log(JSON.stringify(receipt, null, 2));
+    else printMemoryReceipt(receipt);
+    return receipt;
+  }
+
+  if (sub === "export") {
+    await ensureManagedRuntime(effectiveOptions(flags));
+    const receipt = await exportAgentMemoryBackup({
+      ...common,
+      ...(file ? { outputPath: resolve(file) } : {})
+    });
+    if (flags.json) console.log(JSON.stringify(receipt, null, 2));
+    else printMemoryReceipt(receipt);
+    return receipt;
+  }
+
+  if (sub === "import") {
+    if (!file) throw new Error("Usage: lca-custom memory import <file> [--dry-run] [--strategy skip|merge|replace] [--force] [--json]");
+    const strategy = String(flags.strategy || "skip").toLowerCase();
+    if (strategy === "replace" && flags.force !== true) {
+      throw new Error("AgentMemory replace import requires --force because it clears existing memory state.");
+    }
+    if (!flags.dryRun) await ensureManagedRuntime(effectiveOptions(flags));
+    const receipt = await importAgentMemoryBackup({
+      ...common,
+      inputPath: resolve(file),
+      strategy,
+      dryRun: flags.dryRun === true
+    });
+    if (flags.json) console.log(JSON.stringify(receipt, null, 2));
+    else printMemoryReceipt(receipt);
+    return receipt;
+  }
+
+  throw new Error("Usage: lca-custom memory status|export [file]|import <file>");
 }
 
 async function figmaCommand(rest, flags = {}) {
@@ -2156,13 +2420,14 @@ async function main() {
   if (command === "help") return usage();
   if (command === "run" || command === "here") return runCurrentWorkspace(flags);
   if (command === "setup" || command === "init") return setup(flags);
-  if (command === "install") return installDeps(effectiveOptions(flags));
+  if (command === "install") return installCommand(flags);
   if (command === "cli") return cliCommand();
   if (command === "keys") return keysCommand();
   if (command === "add") return addProjectCommand(rest, flags);
   if (command === "remove") return removeProjectCommand(rest, flags);
   if (command === "reset") return resetProjectsCommand(rest, flags);
   if (command === "workspace") return workspaceCommand(flags);
+  if (command === "memory") return memoryCommand(rest, flags);
   if (command === "figma") return figmaCommand(rest, flags);
   if (command === "start") return start(flags);
   if (command === "stop") return stop(flags);

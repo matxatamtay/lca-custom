@@ -77,11 +77,10 @@ Không dùng URL local `http://127.0.0.1:8790/mcp` cho ChatGPT Web.
 Trong ChatGPT, hỏi:
 
 ```text
-call workspace_info
-# or call lca
+call workspace_status with action=info
 ```
 
-Kết quả phải trả về root đúng với repo bạn vừa chạy `lca-custom`.
+Kết quả phải trả về `runtime=trusted-local`, `tool_surface=compact` và project root đúng với repo bạn vừa chạy `lca-custom`.
 
 Để kiểm tra Apps SDK và PiP, gọi:
 

@@ -1,0 +1,52 @@
+{
+  "generatedAt": "2026-07-22T18:49:47.858Z",
+  "gitHead": "f7ff6e6cd7226582d9b1016ed9dd716c190d6c82",
+  "surface": "compact",
+  "runtime": {
+    "node": "v20.20.2",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "toolSurface": {
+    "count": 14,
+    "jsonBytes": 9895,
+    "nameChars": 178,
+    "descriptionChars": 2278,
+    "schemaChars": 5420
+  },
+  "instructions": {
+    "chars": 738,
+    "bytes": 738,
+    "lines": 5
+  },
+  "latencyMs": {
+    "listTools": {
+      "runs": 8,
+      "min": 4.12,
+      "median": 4.81,
+      "max": 5.25
+    },
+    "workspaceStatusWarm": {
+      "runs": 8,
+      "min": 2.31,
+      "median": 2.99,
+      "max": 4.9
+    },
+    "workspaceReadWarm": {
+      "runs": 8,
+      "min": 2.68,
+      "median": 3.21,
+      "max": 3.7
+    }
+  },
+  "improvementVsBaselinePercent": {
+    "toolCount": 90.21,
+    "toolSurfaceBytes": 89.18,
+    "instructionChars": 83.45
+  },
+  "targets": {
+    "toolCountMax": 16,
+    "toolSurfaceBytesMax": 20000,
+    "instructionCharsMax": 1000
+  }
+}

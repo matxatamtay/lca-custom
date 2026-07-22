@@ -4,26 +4,42 @@
   "private": true,
   "type": "module",
   "description": "Local MCP server that lets ChatGPT Web work with files and commands on your own machine.",
-  "author": "Lương Duy",
+  "author": "L\u01b0\u01a1ng Duy",
   "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
     "url": "https://github.com/luongduy2798/local-coding-agent.git"
   },
   "scripts": {
-    "start": "node server.mjs",
+    "start": "npm run build:next && node server.mjs",
     "test:agent": "node test-agent.mjs",
-    "test:security": "node test-security-runner.mjs",
-    "test:security:baseline": "node security-test.mjs",
+    "test:security": "npm run test:trusted-runtime",
     "test:hardening": "node test-hardening.mjs",
     "test:pro": "node test-pro.mjs",
     "eval": "node ../evals/run.mjs",
     "test:figma": "node test-figma-desktop.mjs",
     "test:dbeaver": "node test-dbeaver-desktop.mjs",
-    "test:bruno": "node test-bruno-desktop.mjs"
+    "test:bruno": "node test-bruno-desktop.mjs",
+    "test:persistent-http": "node --test test-persistent-http-mcp-client.mjs",
+    "benchmark:compact": "node ../evals/compact.mjs",
+    "build:next": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "tsx --test src/application/context/build-task-context.test.ts src/infrastructure/mcp/persistent-mcp-tool-client.test.ts src/adapters/codegraph/codegraph-adapter.test.ts src/adapters/agentmemory/agentmemory-http-adapter.test.ts src/adapters/filesystem/ripgrep-filesystem-context-adapter.test.ts src/orchestration/agentmemory-supervisor.test.ts src/orchestration/agentmemory-session-manager.test.ts src/interfaces/mcp/tool-catalog.test.ts src/interfaces/mcp/compact-mcp-interface.test.ts",
+    "test:integration:context": "tsx --test src/integration/task-context.integration.test.ts",
+    "test:compact": "npm run build:next && node test-compact-surface.mjs",
+    "test:next": "npm run typecheck && npm run test:unit",
+    "test:trusted-runtime": "node test-security-runner.mjs",
+    "test:all": "npm run typecheck && npm run test:unit && npm run test:integration:context && npm run test:persistent-http && npm run test:figma && npm run test:dbeaver && npm run test:bruno && npm run test:compact && npm run test:agent:isolated && npm run test:pro && npm run test:trusted-runtime && npm run test:hardening && npm run eval",
+    "test:agent:isolated": "node test-agent-runner.mjs"
   },
   "dependencies": {
+    "@colbymchenry/codegraph": "1.5.0",
     "@modelcontextprotocol/sdk": "^1.20.0",
     "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2"
   }
 }

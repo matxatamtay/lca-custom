@@ -21,11 +21,10 @@ const server = spawn(process.execPath, ["server.mjs"], {
     ...process.env,
     PORT: String(port),
     AGENT_HOST: "127.0.0.1",
-    AGENT_MODE: "safe",
-    AGENT_POLICY: "balanced",
     AGENT_WORKSPACE: workspace,
     AGENT_EXTRA_ROOTS: "",
-    AGENT_AUDIT: "0",
+    AGENTMEMORY_RECORD_SESSIONS: "0",
+    AGENT_AUDIT: "1",
     AGENT_HTTP_LOG: "0",
     MCP_AUTH_TOKEN: ""
   },
@@ -78,9 +77,9 @@ ${output}`);
 
 function runTest(testEndpoint) {
   return new Promise((resolve, reject) => {
-    const test = spawn(process.execPath, ["test-security.mjs"], {
+    const test = spawn(process.execPath, ["security-test.mjs"], {
       cwd: APP_DIR,
-      env: { ...process.env, TEST_ENDPOINT: testEndpoint },
+      env: { ...process.env, TEST_ENDPOINT: testEndpoint, AUDIT_LOG: path.join(APP_DIR, "data", "audit.log") },
       stdio: "inherit"
     });
     test.once("error", reject);

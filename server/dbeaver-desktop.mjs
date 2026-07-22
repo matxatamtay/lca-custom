@@ -2,9 +2,13 @@
 // Copyright (c) 2026 Lương Duy
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { pathToFileURL } from "node:url";
+import {
+  PersistentHttpMcpClient,
+  PersistentHttpMcpClientRegistry,
+  normalizeTimeout,
+  persistentHttpClientKey
+} from "./persistent-http-mcp-client.mjs";
 
 export const DEFAULT_DBEAVER_DESKTOP_MCP_URL = "http://127.0.0.1:3846/mcp";
 const DEFAULT_TIMEOUT_MS = 45_000;
@@ -26,19 +30,7 @@ export function normalizeDBeaverDesktopEndpoint(value = process.env.DBEAVER_DESK
   return url.toString();
 }
 
-function timeoutMs(value) {
-  const parsed = Number(value ?? process.env.DBEAVER_DESKTOP_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
-  if (!Number.isFinite(parsed)) return DEFAULT_TIMEOUT_MS;
-  return Math.min(300_000, Math.max(1_000, Math.trunc(parsed)));
-}
-
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms.`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
+const dbeaverClients = new PersistentHttpMcpClientRegistry();
 
 export function friendlyDBeaverDesktopError(error, endpoint = normalizeDBeaverDesktopEndpoint()) {
   const message = String(error?.cause?.message || error?.message || error || "Unknown error");
@@ -53,55 +45,57 @@ export function friendlyDBeaverDesktopError(error, endpoint = normalizeDBeaverDe
   return new Error(`DBeaver Desktop MCP error: ${message}`);
 }
 
-export async function withDBeaverDesktopClient(callback, options = {}) {
+function getDBeaverDesktopClient(options = {}) {
   const endpoint = normalizeDBeaverDesktopEndpoint(options.endpoint);
-  const ms = timeoutMs(options.timeoutMs);
+  const ms = normalizeTimeout(options.timeoutMs ?? process.env.DBEAVER_DESKTOP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
   const authToken = String(options.authToken ?? process.env.DBEAVER_DESKTOP_AUTH_TOKEN ?? "").trim();
-  const client = new Client({ name: options.clientName || "local-coding-agent-dbeaver-bridge", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
-    requestInit: authToken ? { headers: { Authorization: `Bearer ${authToken}` } } : undefined
-  });
-  try {
-    await withTimeout(client.connect(transport), ms, "Connecting to DBeaver Desktop MCP");
-    return await withTimeout(Promise.resolve(callback(client)), ms, "DBeaver Desktop MCP request");
-  } catch (error) {
-    throw friendlyDBeaverDesktopError(error, endpoint);
-  } finally {
-    await client.close().catch(() => {});
-  }
+  const clientName = options.clientName || "local-coding-agent-dbeaver-bridge";
+  const key = `${persistentHttpClientKey({ endpoint, authToken, clientName })}|timeout=${ms}`;
+  return dbeaverClients.get(key, () => new PersistentHttpMcpClient({
+    endpoint,
+    clientName,
+    clientVersion: "1.0.0",
+    timeoutMs: ms,
+    ...(authToken ? { requestInit: { headers: { Authorization: `Bearer ${authToken}` } } } : {}),
+    mapError: (error) => friendlyDBeaverDesktopError(error, endpoint)
+  }));
+}
+
+export async function withDBeaverDesktopClient(callback, options = {}) {
+  return callback(getDBeaverDesktopClient(options));
+}
+
+export async function closeDBeaverDesktopClients() {
+  await dbeaverClients.closeAll();
 }
 
 export async function listDBeaverDesktopTools(options = {}) {
-  return withDBeaverDesktopClient((client) => client.listTools(), options);
+  return getDBeaverDesktopClient(options).listTools({ refresh: options.refresh === true });
 }
 
 export async function callDBeaverDesktopTool(name, args = {}, options = {}) {
   const toolName = String(name || "").trim();
   if (!toolName) throw new Error("DBeaver tool name is required.");
-  return withDBeaverDesktopClient(async (client) => {
-    const listed = await client.listTools();
-    const tool = listed.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new Error(`DBeaver Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
-    }
-    return client.callTool({ name: toolName, arguments: args || {} });
-  }, options);
+  const client = getDBeaverDesktopClient(options);
+  const { listed, tool } = await client.findTool(toolName);
+  if (!tool) {
+    throw new Error(`DBeaver Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
+  }
+  return client.callTool({ name: toolName, arguments: args || {} });
 }
 
 export async function callReadOnlyDBeaverDesktopTool(name, args = {}, options = {}) {
   const toolName = String(name || "").trim();
   if (!toolName) throw new Error("DBeaver tool name is required.");
-  return withDBeaverDesktopClient(async (client) => {
-    const listed = await client.listTools();
-    const tool = listed.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new Error(`DBeaver Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
-    }
-    if (tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true) {
-      throw new Error(`DBeaver tool "${toolName}" is not declared read-only and cannot be called through dbeaver_call_tool.`);
-    }
-    return client.callTool({ name: toolName, arguments: args || {} });
-  }, options);
+  const client = getDBeaverDesktopClient(options);
+  const { listed, tool } = await client.findTool(toolName);
+  if (!tool) {
+    throw new Error(`DBeaver Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
+  }
+  if (tool.annotations?.readOnlyHint !== true || tool.annotations?.destructiveHint === true) {
+    throw new Error(`DBeaver tool "${toolName}" is not declared read-only and cannot be called through dbeaver_call_tool.`);
+  }
+  return client.callTool({ name: toolName, arguments: args || {} });
 }
 
 export async function dbeaverDesktopStatus(options = {}) {
