@@ -79,6 +79,12 @@ lca-custom primary /path/to/project
 
 `primary` reorders the existing project list without dropping secondary roots. `reset` still replaces the whole list with one project.
 
+## Runtime path contract
+
+File-list and search results returned by the MCP backend are relative to the primary workspace. The TUI resolves those rows from the primary root, even when the visible browser or search directory is nested, so paths such as `evals/run.mjs` never become `evals/evals/run.mjs`. Absolute paths remain unchanged.
+
+Tasks & Notes requests are capped at 50 entries, matching the backend schema. The client clamps larger caller values before sending them over MCP.
+
 ## Architecture
 
 The TUI is a separate MCP client, not an import of the server monolith:
