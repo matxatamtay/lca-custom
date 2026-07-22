@@ -83,6 +83,7 @@ export class LcaTuiClient {
     const location = action === "detect" ? { path: cwd } : { cwd };
     return this.data("workspace_verify", action, { ...location, ...options });
   }
+  notes(limit = 50) { return this.data("workspace_read", "notes", { limit: Math.max(1, Math.min(50, Number(limit) || 50)) }); }
   taskState(args = {}) { return this.data("workspace_edit", "state", args); }
   taskPlan(goal, steps) { return this.data("workspace_edit", "plan", { goal, steps }); }
   note(title, body) { return this.data("workspace_edit", "note", { title, body }); }

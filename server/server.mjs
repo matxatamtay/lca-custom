@@ -272,6 +272,10 @@ function detectRg() {
   });
 }
 
+const compactMcpInterface = await import("./dist/interfaces/mcp/compact-mcp-interface.js").catch((error) => {
+  throw new Error(`Compiled compact MCP interface is unavailable. Run npm run build:next. ${error?.message || error}`);
+});
+
 const httpServer = http.createServer(async (req, res) => {
   try {
     const requestUrl = new URL(req.url || "/", `http://${req.headers.host || HOST}`);
@@ -440,10 +444,6 @@ async function handleMcp(req, res) {
   const body = await readJsonBody(req, MAX_BODY_BYTES);
   await transport.handleRequest(req, res, body);
 }
-
-const compactMcpInterface = await import("./dist/interfaces/mcp/compact-mcp-interface.js").catch((error) => {
-  throw new Error(`Compiled compact MCP interface is unavailable. Run npm run build:next. ${error?.message || error}`);
-});
 
 const INTERNAL_MCP_SERVERS = new WeakSet();
 let legacyBackendRuntimePromise = null;

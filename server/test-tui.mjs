@@ -14,9 +14,11 @@ import {
   normalizeFileEntries,
   normalizeProcesses,
   normalizeSearchMatches,
+  resolveBackendPath,
   safeJsonParse,
   viewByShortcut
 } from "./tui/model.mjs";
+import { LcaTuiApp } from "./tui/app.mjs";
 import { LcaTuiClient } from "./tui/client.mjs";
 import { launcherInvocation } from "./tui/launcher-bridge.mjs";
 import { parseArgs, promoteProjectRoot } from "../scripts/local-coding-agent.mjs";
@@ -68,6 +70,35 @@ test("file, search, and process rows are mouse-list ready", () => {
   assert.match(processes[0].label, /● dev/);
 });
 
+test("backend paths resolve from the primary workspace without duplicating the current folder", () => {
+  const root = path.resolve("/tmp/lca-root");
+  assert.equal(resolveBackendPath(root, "evals/run.mjs"), path.join(root, "evals", "run.mjs"));
+  assert.equal(resolveBackendPath(root, "/tmp/external.txt"), path.resolve("/tmp/external.txt"));
+});
+
+test("file and search row handlers round-trip backend paths from the primary workspace", async () => {
+  const root = path.resolve("/tmp/lca-root");
+  const reads = [];
+  const app = Object.create(LcaTuiApp.prototype);
+  app.primaryRoot = root;
+  app.currentPath = path.join(root, "evals");
+  app.searchRoot = app.currentPath;
+  app.client = {
+    async readFile(file, options) {
+      reads.push({ file, options });
+      return { content: "ok" };
+    }
+  };
+  app.setDetail = () => {};
+
+  await app.openFileRow({ path: "evals/run.mjs", type: "file" });
+  await app.openSearchMatch({ path: "evals/run.mjs", line: 12 });
+
+  assert.equal(reads[0].file, path.join(root, "evals", "run.mjs"));
+  assert.equal(reads[1].file, path.join(root, "evals", "run.mjs"));
+  assert.deepEqual(reads[1].options, { startLine: 1, lineCount: 80 });
+});
+
 test("TUI client routes all operations through compact facades", async () => {
   const calls = [];
   let closes = 0;
@@ -97,6 +128,11 @@ test("TUI client routes all operations through compact facades", async () => {
   assert.deepEqual(calls[3], {
     name: "workspace_verify",
     arguments: { action: "tests", arguments: { cwd: "/tmp/other-repo" } }
+  });
+  await client.notes(100);
+  assert.deepEqual(calls[4], {
+    name: "workspace_read",
+    arguments: { action: "notes", arguments: { limit: 50 } }
   });
   await client.close();
   assert.equal(closes, 1);

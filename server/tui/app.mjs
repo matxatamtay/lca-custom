@@ -20,6 +20,7 @@ import {
   normalizeProcesses,
   normalizeSearchMatches,
   normalizeSkills,
+  resolveBackendPath,
   safeJsonParse,
   selectedRow,
   textFromToolResult,
@@ -584,7 +585,7 @@ export class LcaTuiApp {
   }
 
   async openFileRow(row) {
-    const target = resolveAgainst(this.currentPath, row.path);
+    const target = resolveBackendPath(this.primaryRoot, row.path);
     if (row.type === "directory") {
       this.currentPath = target;
       await this.refreshFiles();
@@ -640,7 +641,7 @@ export class LcaTuiApp {
   }
 
   async openSearchMatch(row) {
-    const target = resolveAgainst(this.searchRoot, row.path);
+    const target = resolveBackendPath(this.primaryRoot, row.path);
     const startLine = Math.max(1, Number(row.line || 1) - 20);
     const value = await this.client.readFile(target, { startLine, lineCount: 80 });
     this.setDetail(`${compactPath(target, 60)}:${row.line}`, fileContent(value), { raw: true });
@@ -846,7 +847,7 @@ export class LcaTuiApp {
     ]);
     const [task, notes] = await Promise.all([
       this.client.taskState().catch(() => null),
-      this.client.data("workspace_read", "notes", { limit: 100 }).catch(() => ({ notes: [] }))
+      this.client.notes().catch(() => ({ notes: [] }))
     ]);
     const rows = [];
     for (const [index, step] of (task?.steps || []).entries()) {

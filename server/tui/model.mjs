@@ -101,6 +101,14 @@ export function compactPath(value, max = 72) {
   return `…/${tail.replace(/^[/\\]+/, "")}`;
 }
 
+// Backend file and search paths are relative to the primary workspace, not to
+// the directory currently displayed by the TUI. Absolute paths remain exact.
+export function resolveBackendPath(primaryRoot, value) {
+  const text = String(value ?? "").trim();
+  if (!text) return path.resolve(primaryRoot);
+  return path.isAbsolute(text) ? path.resolve(text) : path.resolve(primaryRoot, text);
+}
+
 export function safeJsonParse(value, fallback = {}) {
   if (value && typeof value === "object") return value;
   const text = String(value ?? "").trim();
