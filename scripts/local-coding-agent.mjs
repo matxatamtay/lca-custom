@@ -111,12 +111,14 @@ Usage:
   lca-custom stop
   lca-custom status
   lca-custom doctor [--json]
+  lca-custom tui
   lca-custom install [--force] [--json]
   lca-custom memory status [--json]
   lca-custom memory export [file] [--json]
   lca-custom memory import <file> [--dry-run] [--strategy skip|merge|replace] [--force] [--json]
   lca-custom add [path]
   lca-custom remove [path]
+  lca-custom primary [path]
   lca-custom reset [path]
   lca-custom profile
   lca-custom url
@@ -309,6 +311,11 @@ export function normalize(opts) {
   out.extraRoots = projects.slice(1).join(";");
   delete out.extraRootsJson;
   return out;
+}
+
+export function promoteProjectRoot(projects, project) {
+  const target = resolve(project);
+  return [target, ...normalizeProjectRoots({ projects }).filter((item) => item !== target)];
 }
 
 export function normalizeProjectRoots(opts = {}) {
@@ -1240,8 +1247,32 @@ async function verifyCliShim(cliPath) {
   console.log(`OK ${CLI_NAME} wrapper: ${cliPath}`);
 }
 
+function bashSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function powershellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function batchQuotedValue(value) {
+  return String(value).replace(/%/g, "%%");
+}
+
+export function cliWrapperContents({ marker, scriptPath, configPath }) {
+  const bash = `#!/usr/bin/env bash\n# ${marker}\nexport LCA_CUSTOM_CONFIG_PATH=${bashSingleQuote(configPath)}\nexec node ${bashSingleQuote(scriptPath)} "$@"\n`;
+  const cmd = `@echo off\r\nrem ${marker}\r\nwhere node >nul 2>nul\r\nif errorlevel 1 (\r\n  echo ERROR: Node.js 20+ is required but node was not found in PATH.\r\n  echo Install Node.js LTS from https://nodejs.org/ then open a new terminal and rerun setup.\r\n  exit /b 1\r\n)\r\nset "LCA_CUSTOM_CONFIG_PATH=${batchQuotedValue(configPath)}"\r\nnode "${batchQuotedValue(scriptPath)}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
+  const powershell = `# ${marker}\n$env:LCA_CUSTOM_CONFIG_PATH = ${powershellSingleQuote(configPath)}\n& node ${powershellSingleQuote(scriptPath)} @args\nexit $LASTEXITCODE\n`;
+  return { bash, cmd, powershell };
+}
+
 async function installCliCommand() {
   const marker = `local-coding-agent ${CLI_NAME} wrapper`;
+  const wrapper = cliWrapperContents({
+    marker,
+    scriptPath: join(SCRIPT_DIR, "local-coding-agent.mjs"),
+    configPath: CONFIG_PATH
+  });
   const preferredBinDir = process.env.LCA_CUSTOM_BIN_DIR || defaultCliBinDir();
   const binDir = chooseCliBinDir();
   if (binDir !== preferredBinDir) {
@@ -1256,8 +1287,8 @@ async function installCliCommand() {
         throw new Error(`Refusing to overwrite: ${target}`);
       }
     }
-    writeFileSync(cmdPath, `@echo off\r\nrem ${marker}\r\nwhere node >nul 2>nul\r\nif errorlevel 1 (\r\n  echo ERROR: Node.js 20+ is required but node was not found in PATH.\r\n  echo Install Node.js LTS from https://nodejs.org/ then open a new terminal and rerun setup.\r\n  exit /b 1\r\n)\r\nnode "${join(SCRIPT_DIR, "local-coding-agent.mjs")}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
-    writeFileSync(psPath, `# ${marker}\n& node "${join(SCRIPT_DIR, "local-coding-agent.mjs")}" @args\nexit $LASTEXITCODE\n`, "utf8");
+    writeFileSync(cmdPath, wrapper.cmd, "utf8");
+    writeFileSync(psPath, wrapper.powershell, "utf8");
     console.log(`Installed: ${cmdPath}`);
     const pathResult = await configureShellPath(binDir);
     if (pathResult.message) console.log(pathResult.message);
@@ -1268,7 +1299,7 @@ async function installCliCommand() {
   if (existsSync(target) && !readFileSync(target, "utf8").includes(marker)) {
     throw new Error(`Refusing to overwrite: ${target}`);
   }
-  writeFileSync(target, `#!/usr/bin/env bash\n# ${marker}\nexec node "${join(SCRIPT_DIR, "local-coding-agent.mjs")}" "$@"\n`, "utf8");
+  writeFileSync(target, wrapper.bash, "utf8");
   await chmod(target, 0o755);
   console.log(`Installed: ${target}`);
   const pathResult = await configureShellPath(binDir);
@@ -2256,6 +2287,24 @@ async function removeProjectCommand(rest, flags) {
   await restartIfRunning(before, next);
 }
 
+async function primaryProjectCommand(rest, flags) {
+  const before = effectiveProjectCommandOptions(flags);
+  const project = await resolveProjectArgument(rest, flags);
+  if (!isDirectory(project)) throw new Error(`Project directory does not exist: ${project}`);
+  if (before.projects[0] === project) {
+    output.write(`Already primary: ${project}\n`);
+    printProjectList(before.projects);
+    return;
+  }
+  const nextProjects = promoteProjectRoot(before.projects, project);
+  const next = projectConfig(before, nextProjects);
+  await saveConfig(stripRuntimeFields(next));
+  output.write(`Primary project: ${project}\n`);
+  printProjectList(next.projects);
+  const restarted = await restartIfRunning(before, next);
+  if (!restarted) output.write("Agent is offline. Start it with: lca-custom start --background\n");
+}
+
 async function resetProjectsCommand(rest, flags) {
   const before = effectiveProjectCommandOptions(flags);
   const project = await resolveProjectArgument(rest, flags);
@@ -2396,6 +2445,49 @@ function listRepoSkills() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+async function tuiCommand(flags = {}) {
+  if (!input.isTTY || !output.isTTY) {
+    throw new Error("Interactive terminal required for lca-custom tui.");
+  }
+  const opts = effectiveOptions(flags);
+  validate(opts, { requireWorkspace: true, requireTunnel: true });
+  await ensureManagedRuntime(opts);
+  const running = await runningStatusForConfig(opts);
+  if (!running.health?.status || running.health.status !== "ok") {
+    await start({ ...opts, background: true, skipManagedRuntime: true });
+  }
+  const health = await readJson(`http://127.0.0.1:${opts.port}/healthz`, 5_000);
+  if (!health?.status || health.status !== "ok") {
+    throw new Error(`LCA server is unavailable at http://127.0.0.1:${opts.port}/healthz`);
+  }
+  const tuiPath = join(SERVER_DIR, "tui.mjs");
+  if (!existsSync(tuiPath)) throw new Error(`Missing TUI entrypoint: ${tuiPath}`);
+  const child = spawn(opts.node, [tuiPath], {
+    cwd: SERVER_DIR,
+    env: {
+      ...process.env,
+      LCA_CUSTOM_CONFIG_PATH: CONFIG_PATH,
+      LCA_TUI_CONFIG_PATH: CONFIG_PATH,
+      LCA_TUI_CLI_SCRIPT: fileURLToPath(import.meta.url),
+      LCA_TUI_ENDPOINT: `http://127.0.0.1:${opts.port}/mcp`,
+      LCA_TUI_AUTH_TOKEN: opts.authToken || "",
+      LCA_TUI_WORKSPACE: opts.workspace,
+      LCA_TUI_REPO_ROOT: REPO_ROOT,
+      LCA_TUI_SERVER_DATA: join(SERVER_DIR, "data"),
+      LCA_TUI_LAUNCHER_LOG: LOG_PATH,
+      LCA_TUI_VERSION: LCA_VERSION
+    },
+    stdio: "inherit",
+    windowsHide: false,
+    shell: false
+  });
+  const code = await new Promise((resolveExit, rejectExit) => {
+    child.once("error", rejectExit);
+    child.once("exit", (value) => resolveExit(value ?? 1));
+  });
+  if (code !== 0) throw new Error(`LCA TUI exited with code ${code}`);
+}
+
 async function skillsCommand(rest) {
   const [sub = "list"] = rest;
   if (sub === "list") {
@@ -2425,6 +2517,7 @@ async function main() {
   if (command === "keys") return keysCommand();
   if (command === "add") return addProjectCommand(rest, flags);
   if (command === "remove") return removeProjectCommand(rest, flags);
+  if (command === "primary") return primaryProjectCommand(rest, flags);
   if (command === "reset") return resetProjectsCommand(rest, flags);
   if (command === "workspace") return workspaceCommand(flags);
   if (command === "memory") return memoryCommand(rest, flags);
@@ -2433,6 +2526,7 @@ async function main() {
   if (command === "stop") return stop(flags);
   if (command === "status") return status(flags);
   if (command === "doctor") return doctor(flags);
+  if (command === "tui") return tuiCommand(flags);
   if (command === "profile") {
     const opts = effectiveOptions(flags);
     validate(opts);

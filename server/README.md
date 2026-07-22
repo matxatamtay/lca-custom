@@ -25,6 +25,14 @@ Use `workspace_context` first for coding tasks. It always fans out to current fi
 
 Actions execute directly without mode, policy, or approval turns. Project roots support discovery and relative paths; absolute paths are accepted. LCA is not an OS sandbox.
 
+## Terminal UI
+
+```bash
+lca-custom tui
+```
+
+The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fourteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
+
 ## Run
 
 The managed CLI is the supported entrypoint:
@@ -98,4 +106,4 @@ Direct model-style preparation or execution without the widget capability is rej
 npm run test:all
 ```
 
-Focused gates include `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
+Focused gates include `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.

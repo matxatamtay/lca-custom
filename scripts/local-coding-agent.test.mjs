@@ -14,6 +14,8 @@ import {
   normalize,
   normalizeProjectRoots,
   normalizeTunnelArch,
+  promoteProjectRoot,
+  cliWrapperContents,
   parseDotEnv,
   ripgrepInstallCommand,
   tunnelAssetName,
@@ -35,6 +37,13 @@ test("normalizes and deduplicates multi-project roots", () => {
     workspace: first,
     extraRoots: `${second};${first}`
   }), [first, second]);
+});
+
+test("promotes one project without dropping the remaining roots", () => {
+  const first = path.resolve("project-a");
+  const second = path.resolve("project-b");
+  const third = path.resolve("project-c");
+  assert.deepEqual(promoteProjectRoot([first, second, third], second), [second, first, third]);
 });
 
 test("normalize keeps the primary project first and derives extra roots", () => {
@@ -159,6 +168,25 @@ test("selects the deterministic TypeScript build command by platform", () => {
   assert.match(nextRuntimeBuildSpec("linux").cwd, /server$/);
 });
 
+
+test("CLI wrappers pin the source and isolated config on every shell", () => {
+  const wrapper = cliWrapperContents({
+    marker: "local-coding-agent lca-custom wrapper",
+    scriptPath: "/tmp/LCA next/scripts/local-coding-agent.mjs",
+    configPath: "/tmp/Config's Next/cli-config.json"
+  });
+  assert.match(wrapper.bash, /export LCA_CUSTOM_CONFIG_PATH=/);
+  assert.match(wrapper.bash, /Config'\\''s Next/);
+  assert.match(wrapper.bash, /LCA next\/scripts\/local-coding-agent\.mjs/);
+  assert.match(wrapper.cmd, /set "LCA_CUSTOM_CONFIG_PATH=/);
+  assert.match(wrapper.powershell, /\$env:LCA_CUSTOM_CONFIG_PATH/);
+  assert.match(wrapper.powershell, /Config''s Next/);
+});
+
+test("parses TUI and primary project commands", () => {
+  assert.deepEqual(parseArgs(["tui"]), { command: "tui", rest: [], flags: {} });
+  assert.deepEqual(parseArgs(["primary", "/tmp/project"]), { command: "primary", rest: ["/tmp/project"], flags: {} });
+});
 
 test("parses AgentMemory portability command flags", () => {
   const parsed = parseArgs([

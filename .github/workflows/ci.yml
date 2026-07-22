@@ -34,6 +34,12 @@ jobs:
           node --check server.mjs
           node --check test-agent.mjs
           node --check test-agent-runner.mjs
+          node --check tui.mjs
+          node --check tui/app.mjs
+          node --check tui/client.mjs
+          node --check tui/model.mjs
+          node --check tui/launcher-bridge.mjs
+          node --check test-tui.mjs
           node --check compact-test-client.mjs
           node --check security-test.mjs
           node --check test-pro.mjs
@@ -70,6 +76,7 @@ jobs:
           npm run test:unit
           npm run test:integration:context
           npm run test:persistent-http
+          npm run test:tui
           npm run test:figma
           npm run test:dbeaver
           npm run test:bruno
@@ -132,7 +139,9 @@ jobs:
         working-directory: server
       - name: Run trusted runtime suite
         working-directory: server
-        run: npm run test:trusted-runtime
+        run: |
+          npm run test:trusted-runtime
+          npm run test:tui:pty
 
   eval:
     name: Eval suite

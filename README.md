@@ -58,14 +58,18 @@ The installer pins and verifies the core server, CodeGraph `1.5.0`, AgentMemory 
 lca-custom reset /path/to/main-project
 lca-custom add /path/to/another-project
 lca-custom start --background
+lca-custom tui
 lca-custom status
 lca-custom doctor
 ```
 
+`lca-custom tui` opens the mouse-enabled terminal dashboard for projects, files, search, mandatory context, Git, commands, processes, verification, tasks, skills, integrations, memory, tools, and logs. Full guide: [docs/TUI.md](docs/TUI.md).
+
 Project changes restart the managed server only when needed. Useful maintenance commands:
 
 ```bash
-lca-custom doctor --fix
+lca-custom primary /path/to/new-primary
+lca-custom doctor
 lca-custom install --force
 lca-custom memory status
 lca-custom memory export
