@@ -8,7 +8,7 @@ export const COMPACT_SERVER_INSTRUCTIONS = [
   "Use the compact facade tools. Each facade accepts a short action alias or an exact hidden backend tool name plus an arguments object. Call action=discover only when you need facade action discovery.",
   "Actions execute directly in the trusted local runtime without policy or approval round-trips. Project roots are discovery defaults, not authorization boundaries.",
   "Batch work, keep outputs bounded, and avoid repeating reads or commands. Use workspace_verify before declaring code changes complete.",
-  "Use figma, dbeaver, and bruno for desktop integrations. Use lca_input for the ChatGPT companion UI."
+  "Use figma, dbeaver, and bruno for desktop integrations, and coolify for the configured remote Coolify MCP. Use lca_input for the ChatGPT companion UI."
 ].join("\n");
 
 export interface BackendToolDefinition {
@@ -136,6 +136,11 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
     defaultAction: "bruno_status",
     aliases: { status: "bruno_status", actions: "bruno_list_tools", call: "bruno_call_tool", run: "bruno_run_request" },
     prefix: "bruno_"
+  },
+  coolify: {
+    defaultAction: "coolify_status",
+    aliases: { status: "coolify_status", actions: "coolify_list_tools", call: "coolify_call_tool" },
+    prefix: "coolify_"
   }
 });
 
@@ -151,7 +156,8 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
   figma: "Use the persistent Figma Desktop integration. Common actions: status, actions, call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",
-  bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action."
+  bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action.",
+  coolify: "Use the configured remote Coolify MCP integration. Common actions: status, actions, call, or an exact coolify_* backend action."
 });
 
 export interface CompactMcpInterfaceDependencies {

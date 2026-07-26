@@ -51,6 +51,13 @@ import {
   closeBrunoDesktopClients,
   listBrunoDesktopTools
 } from "./bruno-desktop.mjs";
+import {
+  DEFAULT_COOLIFY_MCP_URL,
+  callCoolifyMcpTool,
+  closeCoolifyMcpClients,
+  coolifyMcpStatus,
+  listCoolifyMcpTools
+} from "./coolify-mcp.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
@@ -168,6 +175,9 @@ const dbeaverRunIntents = new Map();
 const BRUNO_DESKTOP_MCP_URL = String(process.env.BRUNO_DESKTOP_MCP_URL || DEFAULT_BRUNO_DESKTOP_MCP_URL).trim();
 const BRUNO_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.BRUNO_DESKTOP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const BRUNO_DESKTOP_AUTH_TOKEN = String(process.env.BRUNO_DESKTOP_AUTH_TOKEN || "").trim();
+const COOLIFY_MCP_URL = String(process.env.COOLIFY_MCP_URL || DEFAULT_COOLIFY_MCP_URL).trim();
+const COOLIFY_MCP_TIMEOUT_MS = boundedNumber(process.env.COOLIFY_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
+const COOLIFY_MCP_AUTH_TOKEN = String(process.env.COOLIFY_MCP_AUTH_TOKEN || "").trim();
 
 const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "get_code_connect_map",
@@ -389,7 +399,8 @@ async function gracefulExit(signal) {
     await Promise.all([
       closeFigmaDesktopClients(),
       closeDBeaverDesktopClients(),
-      closeBrunoDesktopClients()
+      closeBrunoDesktopClients(),
+      closeCoolifyMcpClients()
     ]);
     await lifecycleLog(`${signal} cleanup completed`);
   } catch (error) {
@@ -463,6 +474,7 @@ function registerBackendTools(mcp) {
   registerFigmaDesktopTools(mcp);
   registerDBeaverDesktopTools(mcp);
   registerBrunoDesktopTools(mcp);
+  registerCoolifyMcpTools(mcp);
   registerFsReadTools(mcp);
   registerFsWriteTools(mcp);
   registerExecTools(mcp);
@@ -911,6 +923,58 @@ function registerBrunoDesktopTools(mcp) {
   });
   forward("bruno_get_request_run", "Get Bruno request run", "Read a previously started request run and its complete result.", readOnly, { run_id: z.string().min(1) });
   forward("bruno_list_request_runs", "List Bruno request runs", "List request runs retained by the current Bruno Desktop process.", readOnly, { limit: z.number().int().min(1).max(1000).optional() });
+}
+
+function registerCoolifyMcpTools(mcp) {
+  const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true };
+  const mutation = { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false };
+  const bridgeOptions = {
+    endpoint: COOLIFY_MCP_URL,
+    timeoutMs: COOLIFY_MCP_TIMEOUT_MS,
+    authToken: COOLIFY_MCP_AUTH_TOKEN
+  };
+
+  reg(
+    mcp,
+    "coolify_status",
+    {
+      title: "Coolify MCP status",
+      description: "Check the configured remote Coolify MCP endpoint and list its live tools without exposing the bearer token.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => jsonResult(await coolifyMcpStatus(bridgeOptions))
+  );
+
+  reg(
+    mcp,
+    "coolify_list_tools",
+    {
+      title: "List Coolify MCP tools",
+      description: "List every tool and JSON schema exposed by the configured Coolify MCP server.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => {
+      const result = await listCoolifyMcpTools(bridgeOptions);
+      return jsonResult({ endpoint: COOLIFY_MCP_URL, count: result.tools.length, tools: result.tools });
+    }
+  );
+
+  reg(
+    mcp,
+    "coolify_call_tool",
+    {
+      title: "Call any Coolify MCP tool",
+      description: "Forward a call to any currently exposed Coolify MCP tool. Use coolify_list_tools first to inspect the exact upstream schema.",
+      annotations: mutation,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callCoolifyMcpTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
 }
 
 function registerDBeaverDesktopTools(mcp) {

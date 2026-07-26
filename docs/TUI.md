@@ -32,9 +32,9 @@ Requirements:
 | Verify | Detect commands, run focused tests/build/lint, review diffs, security scan, and quality gates |
 | Tasks & Notes | Task plans, step completion, local notes, checkpoints, and patch undo |
 | Skills | List, read, create, and delete reusable LCA skills |
-| Integrations | Live Figma, DBeaver, and Bruno status plus action discovery |
+| Integrations | Live Figma, DBeaver, Bruno, and Coolify status plus action discovery |
 | Memory | AgentMemory health, private backup-directory export, offline validation, and safe import |
-| Tool Console | Inspect the 14 compact tools, discover hidden actions, and call any façade with JSON |
+| Tool Console | Inspect the 15 compact tools, discover hidden actions, and call any façade with JSON |
 | Logs | Tail launcher, lifecycle, and audit logs |
 | Help | Complete keyboard and mouse reference |
 
@@ -94,7 +94,7 @@ neo-blessed renderer
         ↓
 LcaTuiClient
         ↓ persistent Streamable HTTP
-14 compact MCP façades
+15 compact MCP façades
         ↓ in-memory backend
 136 implementation actions
 ```

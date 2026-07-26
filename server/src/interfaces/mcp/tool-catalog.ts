@@ -20,5 +20,6 @@ export const TARGET_TOOL_CATALOG = Object.freeze([
   { name: "figma", description: "Call the persistent Figma Desktop integration through named actions." },
   { name: "dbeaver", description: "Call the persistent DBeaver Desktop integration through named actions." },
   { name: "bruno", description: "Call the persistent Bruno Desktop integration through named actions." },
+  { name: "coolify", description: "Call the configured remote Coolify MCP integration through named actions." },
   { name: "lca_input", description: "Render the compact ChatGPT companion input widget." }
 ] as const satisfies readonly TargetToolDefinition[]);

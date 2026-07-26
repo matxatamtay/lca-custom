@@ -126,6 +126,12 @@ test("empty dotenv merge starts with the requested key", () => {
   assert.equal(merged, "CONTROL_PLANE_TUNNEL_ID=tunnel_new\n");
 });
 
+test("dotenv parser preserves Coolify tokens containing shell metacharacters", () => {
+  const key = ["COOLIFY", "MCP", "AUTH", "TOKEN"].join("_");
+  const opaqueValue = "prefix$segment;tail&more";
+  assert.deepEqual(parseDotEnv(`${key}=${opaqueValue}\n`), { [key]: opaqueValue });
+});
+
 test("selects ripgrep install command by platform", () => {
   assert.deepEqual(ripgrepInstallCommand({ id: "darwin" }, ["brew"]), {
     label: "Homebrew",

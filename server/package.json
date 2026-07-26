@@ -21,6 +21,7 @@
     "test:figma": "node test-figma-desktop.mjs",
     "test:dbeaver": "node test-dbeaver-desktop.mjs",
     "test:bruno": "node test-bruno-desktop.mjs",
+    "test:coolify": "node --test test-coolify-mcp.mjs",
     "test:persistent-http": "node --test test-persistent-http-mcp-client.mjs",
     "test:tui": "node --test test-tui.mjs",
     "test:tui:pty": "npm run build:next && python3 test-tui-pty.py",
@@ -32,7 +33,7 @@
     "test:compact": "npm run build:next && node test-compact-surface.mjs",
     "test:next": "npm run typecheck && npm run test:unit",
     "test:trusted-runtime": "node test-security-runner.mjs",
-    "test:all": "npm run typecheck && npm run test:unit && npm run test:integration:context && npm run test:persistent-http && npm run test:tui && npm run test:figma && npm run test:dbeaver && npm run test:bruno && npm run test:compact && npm run test:agent:isolated && npm run test:pro && npm run test:trusted-runtime && npm run test:hardening && npm run eval",
+    "test:all": "npm run typecheck && npm run test:unit && npm run test:integration:context && npm run test:persistent-http && npm run test:tui && npm run test:figma && npm run test:dbeaver && npm run test:bruno && npm run test:coolify && npm run test:compact && npm run test:agent:isolated && npm run test:pro && npm run test:trusted-runtime && npm run test:hardening && npm run eval",
     "test:agent:isolated": "node test-agent-runner.mjs"
   },
   "dependencies": {

@@ -562,6 +562,7 @@ function configId(opts) {
   const figmaBridgePath = join(SERVER_DIR, "figma-desktop.mjs");
   const dbeaverBridgePath = join(SERVER_DIR, "dbeaver-desktop.mjs");
   const brunoBridgePath = join(SERVER_DIR, "bruno-desktop.mjs");
+  const coolifyBridgePath = join(SERVER_DIR, "coolify-mcp.mjs");
   const persistentHttpBridgePath = join(SERVER_DIR, "persistent-http-mcp-client.mjs");
   const nextRuntimePath = join(SERVER_DIR, "dist");
   const material = JSON.stringify({
@@ -575,10 +576,15 @@ function configId(opts) {
     figmaBridgeHash: existsSync(figmaBridgePath) ? sha256(readFileSync(figmaBridgePath)).slice(0, 16) : "missing",
     dbeaverBridgeHash: existsSync(dbeaverBridgePath) ? sha256(readFileSync(dbeaverBridgePath)).slice(0, 16) : "missing",
     brunoBridgeHash: existsSync(brunoBridgePath) ? sha256(readFileSync(brunoBridgePath)).slice(0, 16) : "missing",
+    coolifyBridgeHash: existsSync(coolifyBridgePath) ? sha256(readFileSync(coolifyBridgePath)).slice(0, 16) : "missing",
     persistentHttpBridgeHash: existsSync(persistentHttpBridgePath) ? sha256(readFileSync(persistentHttpBridgePath)).slice(0, 16) : "missing",
     figmaDesktopMcpUrl: figmaDesktopEndpoint(),
     figmaDesktopTimeoutMs: process.env.FIGMA_DESKTOP_TIMEOUT_MS || "30000",
-    figmaDesktopAllowRemote: process.env.FIGMA_DESKTOP_ALLOW_REMOTE === "1"
+    figmaDesktopAllowRemote: process.env.FIGMA_DESKTOP_ALLOW_REMOTE === "1",
+    coolifyMcpUrl: process.env.COOLIFY_MCP_URL || "http://36.50.55.5:8000/mcp",
+    coolifyMcpAuthHash: process.env.COOLIFY_MCP_AUTH_TOKEN
+      ? sha256(Buffer.from(process.env.COOLIFY_MCP_AUTH_TOKEN)).slice(0, 16)
+      : "none"
   });
   return createHash("sha256").update(material).digest("hex").slice(0, 16);
 }

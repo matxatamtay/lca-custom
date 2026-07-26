@@ -15,7 +15,8 @@ const GROUPS = [
   ["workspace_skill", new Set(["list_skills", "read_skill", "create_skill", "delete_skill", "slash_commands", "compose_prompt"])],
   ["figma", (name) => name.startsWith("figma_")],
   ["dbeaver", (name) => name.startsWith("dbeaver_")],
-  ["bruno", (name) => name.startsWith("bruno_")]
+  ["bruno", (name) => name.startsWith("bruno_")],
+  ["coolify", (name) => name.startsWith("coolify_")]
 ];
 
 export function compactFacadeFor(name) {

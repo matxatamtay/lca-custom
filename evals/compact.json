@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-07-22T18:49:47.858Z",
-  "gitHead": "f7ff6e6cd7226582d9b1016ed9dd716c190d6c82",
+  "generatedAt": "2026-07-26T14:26:31.667Z",
+  "gitHead": "6aadb81e64f0b9798f49084250e03484051825cd",
   "surface": "compact",
   "runtime": {
     "node": "v20.20.2",
@@ -8,41 +8,41 @@
     "arch": "x64"
   },
   "toolSurface": {
-    "count": 14,
-    "jsonBytes": 9895,
-    "nameChars": 178,
-    "descriptionChars": 2278,
-    "schemaChars": 5420
+    "count": 15,
+    "jsonBytes": 10592,
+    "nameChars": 185,
+    "descriptionChars": 2477,
+    "schemaChars": 5809
   },
   "instructions": {
-    "chars": 738,
-    "bytes": 738,
+    "chars": 789,
+    "bytes": 789,
     "lines": 5
   },
   "latencyMs": {
     "listTools": {
       "runs": 8,
-      "min": 4.12,
-      "median": 4.81,
-      "max": 5.25
+      "min": 4.55,
+      "median": 5.55,
+      "max": 6.1
     },
     "workspaceStatusWarm": {
       "runs": 8,
-      "min": 2.31,
-      "median": 2.99,
-      "max": 4.9
+      "min": 2.74,
+      "median": 3.46,
+      "max": 5.66
     },
     "workspaceReadWarm": {
       "runs": 8,
-      "min": 2.68,
-      "median": 3.21,
-      "max": 3.7
+      "min": 2.84,
+      "median": 3.71,
+      "max": 6.06
     }
   },
   "improvementVsBaselinePercent": {
-    "toolCount": 90.21,
-    "toolSurfaceBytes": 89.18,
-    "instructionChars": 83.45
+    "toolCount": 89.51,
+    "toolSurfaceBytes": 88.41,
+    "instructionChars": 82.3
   },
   "targets": {
     "toolCountMax": 16,

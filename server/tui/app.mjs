@@ -942,7 +942,7 @@ export class LcaTuiApp {
       { label: "Refresh", handler: () => this.refreshIntegrations() },
       { label: "Discover", handler: () => this.discoverIntegration() }
     ]);
-    const names = ["figma", "dbeaver", "bruno"];
+    const names = ["figma", "dbeaver", "bruno", "coolify"];
     const settled = await Promise.allSettled(names.map((name) => this.client.integration(name, "status")));
     const rows = names.map((name, index) => {
       const result = settled[index];
@@ -954,8 +954,8 @@ export class LcaTuiApp {
         preview: result.status === "fulfilled" ? JSON.stringify(result.value, null, 2) : String(result.reason)
       };
     });
-    this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), "Desktop MCP");
-    this.setDetail("Integrations", "Figma, DBeaver, and Bruno use persistent Streamable HTTP clients. Select one and click Discover to inspect its live upstream actions.", { raw: true });
+    this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), "MCP integrations");
+    this.setDetail("Integrations", "Figma, DBeaver, Bruno, and Coolify use persistent Streamable HTTP clients. Coolify reads COOLIFY_MCP_AUTH_TOKEN from .env.local. Select one and click Discover to inspect its live upstream actions.", { raw: true });
   }
 
   async discoverIntegration() {
@@ -1018,7 +1018,7 @@ export class LcaTuiApp {
       label: `⌘ ${tool.name}  ${tool.description || ""}`,
       preview: JSON.stringify(tool, null, 2)
     }));
-    this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), "14 compact tools");
+    this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), `${rows.length} compact tools`);
     this.setDetail("Tool console", "This is the escape hatch to every compact façade and all 136 hidden backend actions.\n\nSelect a façade, click Discover, then Call with a JSON input object.", { raw: true });
   }
 

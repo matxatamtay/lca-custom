@@ -98,7 +98,7 @@ The model-facing MCP server dispatches into an internal in-memory backend contai
 
 CodeGraph runs through a lazy persistent stdio MCP connection. AgentMemory runs as a separately pinned companion service with automatic health checking, startup, session lifecycle, observations, decision memories, export, and import. Its default lean install uses BM25 without requiring an external LLM key.
 
-Figma, DBeaver, and Bruno share persistent Streamable HTTP MCP clients with single-flight connection setup, cached `tools/list`, one retry after transport failure, and graceful close.
+Figma, DBeaver, Bruno, and the remote Coolify MCP share persistent Streamable HTTP clients with single-flight connection setup, cached `tools/list`, one retry after transport failure, and graceful close.
 
 More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITECTURE.md).
 
@@ -111,6 +111,10 @@ Enable the official Figma Desktop MCP server in Dev Mode. LCA defaults to `http:
 ### Bruno
 
 Enable Bruno Desktop MCP and configure its local bearer token. LCA exposes collection, folder, request, environment, dotenv, preparation, execution, and retained-result capabilities through the single `bruno` facade.
+
+### Coolify
+
+Set `COOLIFY_MCP_URL` and `COOLIFY_MCP_AUTH_TOKEN` in `.env.local`. LCA exposes the upstream server through the single `coolify` facade; future upstream tools become callable through `coolify_call_tool` without adding another model-facing tool.
 
 ### DBeaver
 

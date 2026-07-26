@@ -62,9 +62,9 @@ AgentMemory `0.9.28` is installed as a separate managed companion runtime under 
 
 Neither dependency is exposed as a separate ChatGPT tool surface. The application layer requires both on every `workspace_context` call.
 
-## Desktop integrations
+## MCP integrations
 
-Figma, DBeaver, and Bruno use persistent Streamable HTTP MCP clients. Connections and `tools/list` responses are reused, concurrent connects are deduplicated, retryable transport failures reconnect once, and all clients close during graceful server exit.
+Figma, DBeaver, Bruno, and the remote Coolify MCP use persistent Streamable HTTP clients. Connections and `tools/list` responses are reused, concurrent connects are deduplicated, retryable transport failures reconnect once, and all clients close during graceful server exit. Coolify transport credentials come only from `COOLIFY_MCP_AUTH_TOKEN` and are never returned in status results.
 
 ### DBeaver SQL flow
 
