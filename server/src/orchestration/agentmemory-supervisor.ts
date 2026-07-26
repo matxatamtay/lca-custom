@@ -79,27 +79,31 @@ export interface HttpAgentMemoryHealthProbeOptions {
   baseUrl?: string;
   timeoutMs?: number;
   fetch?: typeof fetch;
+  secret?: string;
 }
 
 export class HttpAgentMemoryHealthProbe implements AgentMemoryHealthProbe {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly secret: string | undefined;
 
   constructor(options: HttpAgentMemoryHealthProbeOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "http://127.0.0.1:3111").replace(/\/$/, "");
     this.timeoutMs = options.timeoutMs ?? 1_000;
     this.fetchImpl = options.fetch ?? fetch;
+    this.secret = options.secret;
   }
 
   async isReady(): Promise<boolean> {
     try {
-      const response = await this.fetchImpl(`${this.baseUrl}/agentmemory/livez`, {
+      const headers = new Headers({ Accept: "application/json" });
+      if (this.secret) headers.set("Authorization", `Bearer ${this.secret}`);
+      const response = await this.fetchImpl(`${this.baseUrl}/agentmemory/diagnostics/followup`, {
+        headers,
         signal: AbortSignal.timeout(this.timeoutMs)
       });
-      if (!response.ok) return false;
-      const body = await response.json() as { status?: unknown };
-      return body.status === "ok";
+      return response.ok;
     } catch {
       return false;
     }
@@ -112,6 +116,7 @@ export interface AgentMemoryCliControllerOptions {
   env?: Readonly<Record<string, string>>;
   enginePort?: number;
   installIfMissing?: boolean;
+  prepareRuntime?: (runtimeDirectory: string) => Promise<void>;
 }
 
 export class AgentMemoryCliController implements AgentMemoryRuntimeController {
@@ -137,6 +142,7 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
   async start(): Promise<void> {
     if (this.child && this.child.exitCode === null && !this.child.killed) return;
     await this.ensureInstalled();
+    await this.options.prepareRuntime?.(this.runtimeDirectory);
     await this.ensureInitialized();
     await this.recoverOrphanEngine();
 

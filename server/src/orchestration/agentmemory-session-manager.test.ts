@@ -73,6 +73,23 @@ test("deduplicates concurrent session starts per project root", async () => {
   assert.equal(sessions.currentSessionId("/repo"), `lca-${process.pid}-fixed`);
 });
 
+test("rechecks runtime readiness when reusing an existing session", async () => {
+  const events: string[] = [];
+  const client = fakeClient(events);
+  const sessions = new AgentMemorySessionManager({
+    supervisor: fakeSupervisor(events),
+    client,
+    createId: () => "existing"
+  });
+
+  await sessions.ensureSession("/repo", "First task");
+  events.length = 0;
+  await sessions.ensureSession("/repo", "Second task");
+
+  assert.deepEqual(events, ["ready"]);
+  assert.equal(client.starts.length, 1);
+});
+
 test("starts a session before delegated memory recall", async () => {
   const events: string[] = [];
   const client = fakeClient(events);

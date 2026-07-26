@@ -95,6 +95,7 @@ export class AgentMemorySessionManager {
 
   async ensureSession(root: string, title?: string): Promise<SessionState> {
     if (this.closed) throw new Error("AgentMemory session manager is closed.");
+    await this.options.supervisor.ensureReady();
     const normalizedRoot = normalizeRoot(root);
     const existing = this.sessions.get(normalizedRoot);
     if (existing) {
@@ -143,7 +144,6 @@ export class AgentMemorySessionManager {
   }
 
   private async createSession(root: string, title?: string): Promise<SessionState> {
-    await this.options.supervisor.ensureReady();
     const project = this.options.client.projectForRoot(root);
     await this.reconcileStaleSessions(project);
     const sessionId = `lca-${process.pid}-${this.createId()}`;

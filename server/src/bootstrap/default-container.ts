@@ -11,7 +11,7 @@ import {
   SessionAwareMemoryPort
 } from "../orchestration/agentmemory-session-manager.js";
 import { createApplicationContainer, type ApplicationContainer } from "./container.js";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
 export interface DefaultContainerOptions {
@@ -41,9 +41,23 @@ export function createDefaultApplicationContainer(
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const runtimeDirectory = options.agentMemoryRuntimeDirectory
     ?? path.join(repoRoot, "runtime", "agentmemory");
+  const patchModuleUrl = pathToFileURL(
+    path.join(repoRoot, "scripts", "agentmemory-runtime-patches.mjs")
+  ).href;
   const supervisor = new AgentMemorySupervisor({
-    probe: new HttpAgentMemoryHealthProbe({ baseUrl: agentMemoryUrl }),
-    runtime: new AgentMemoryCliController({ runtimeDirectory })
+    probe: new HttpAgentMemoryHealthProbe({
+      baseUrl: agentMemoryUrl,
+      ...(options.agentMemorySecret ? { secret: options.agentMemorySecret } : {})
+    }),
+    runtime: new AgentMemoryCliController({
+      runtimeDirectory,
+      prepareRuntime: async (directory) => {
+        const patches = await import(patchModuleUrl) as {
+          applyAgentMemoryRuntimePatches(runtimeDirectory: string): unknown;
+        };
+        patches.applyAgentMemoryRuntimePatches(directory);
+      }
+    })
   });
   memorySessions = new AgentMemorySessionManager({
     supervisor,

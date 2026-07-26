@@ -1495,7 +1495,7 @@ async function installManagedRuntimeCommand(flags = {}) {
     console.log(JSON.stringify({
       kind: "managed_runtime_install",
       plan: result.plan,
-      repaired: result.plan.installServer || result.plan.installAgentMemory || result.plan.initializeAgentMemory,
+      repaired: result.plan.installServer || result.plan.installAgentMemory || result.plan.patchAgentMemory || result.plan.initializeAgentMemory,
       rebuilt: result.plan.buildCompactRuntime,
       receipt: result.after
     }, null, 2));
@@ -1530,7 +1530,7 @@ async function stopManagedServerForRepair(opts, { quiet = false } = {}) {
 async function ensureManagedRuntime(opts) {
   const before = await managedRuntimeFastReport();
   const plan = runtimeInstallPlan(before);
-  if (plan.installServer || plan.installAgentMemory) {
+  if (plan.installServer || plan.installAgentMemory || plan.patchAgentMemory) {
     await stopManagedServerForRepair(opts, { quiet: true });
   }
   return installManagedRuntimeCommand({
@@ -1555,7 +1555,7 @@ async function installCommand(flags) {
   const opts = effectiveOptions(flags);
   const before = await managedRuntimeFastReport();
   const plan = runtimeInstallPlan(before, { force: flags.force === true });
-  const needsReplacement = plan.installServer || plan.installAgentMemory;
+  const needsReplacement = plan.installServer || plan.installAgentMemory || plan.patchAgentMemory;
   const stoppedServer = needsReplacement
     ? await stopManagedServerForRepair(opts, { quiet: flags.json === true })
     : false;

@@ -67,12 +67,14 @@ test("install plan repairs only missing runtime layers and always rebuilds", () 
       { id: "codegraph", status: "pass" },
       { id: "agentmemory_dependencies", status: "fail" },
       { id: "agentmemory_cli", status: "fail" },
+      { id: "agentmemory_patches", status: "fail" },
       { id: "agentmemory_config", status: "fail" }
     ]
   };
   assert.deepEqual(runtimeInstallPlan(report), {
     installServer: false,
     installAgentMemory: true,
+    patchAgentMemory: true,
     buildCompactRuntime: true,
     initializeAgentMemory: true
   });
@@ -83,6 +85,7 @@ test("force install refreshes both dependency trees", () => {
   const plan = runtimeInstallPlan(report, { force: true });
   assert.equal(plan.installServer, true);
   assert.equal(plan.installAgentMemory, true);
+  assert.equal(plan.patchAgentMemory, true);
   assert.equal(plan.buildCompactRuntime, true);
   assert.equal(plan.initializeAgentMemory, true);
 });
@@ -133,6 +136,21 @@ test("installs both managed runtime layers once and is idempotent", async () => 
         mkdirSync(path.join(packageDirectory, "dist"), { recursive: true });
         writeFileSync(path.join(packageDirectory, "package.json"), JSON.stringify({ name: "@agentmemory/agentmemory", version: "0.9.28" }));
         writeFileSync(paths.memoryCliPath, "// cli\n");
+        const runtimeFixture = [
+          "function registerEventTriggers(sdk, kv) {",
+          "\tsdk.registerFunction(\"event::session::stopped\", async (data) => {",
+          "\t\tconst summary = await sdk.trigger({",
+          "\t\t\tfunction_id: \"mem::summarize\",",
+          "\t\t\tpayload: data",
+          "\t\t});",
+          "\t\treturn summary;",
+          "\t});",
+          "}",
+          "\tregisterEventTriggers(sdk, kv);",
+          ""
+        ].join("\n");
+        writeFileSync(path.join(packageDirectory, "dist", "index.mjs"), runtimeFixture);
+        writeFileSync(path.join(packageDirectory, "dist", "src-CzgoepGU.mjs"), runtimeFixture);
       }
       if (options.cwd === paths.serverDirectory && args.includes("build:next")) {
         mkdirSync(path.dirname(paths.compactEntryPath), { recursive: true });
@@ -176,6 +194,7 @@ test("installs both managed runtime layers once and is idempotent", async () => 
     assert.deepEqual(first.plan, {
       installServer: true,
       installAgentMemory: true,
+      patchAgentMemory: true,
       buildCompactRuntime: true,
       initializeAgentMemory: true
     });
@@ -198,6 +217,7 @@ test("installs both managed runtime layers once and is idempotent", async () => 
     });
     assert.equal(second.plan.installServer, false);
     assert.equal(second.plan.installAgentMemory, false);
+    assert.equal(second.plan.patchAgentMemory, false);
     assert.equal(second.plan.initializeAgentMemory, false);
     assert.deepEqual(actions.map((action) => action.args), [["run", "build:next"]]);
   } finally {

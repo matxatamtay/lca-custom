@@ -14,6 +14,11 @@ import {
 import os from "node:os";
 import path from "node:path";
 
+import {
+  applyAgentMemoryRuntimePatches,
+  inspectAgentMemoryRuntimePatches
+} from "./agentmemory-runtime-patches.mjs";
+
 export const MIN_NODE_MAJOR = 20;
 export const EXPECTED_III_ENGINE_VERSION = "0.11.2";
 
@@ -41,6 +46,7 @@ export function createManagedRuntimePaths({
     memoryPackagePath: path.join(memoryDirectory, "package.json"),
     memoryLockPath: path.join(memoryDirectory, "package-lock.json"),
     memoryNpmrcPath: path.join(memoryDirectory, ".npmrc"),
+    memoryPatchModulePath: path.join(root, "scripts", "agentmemory-runtime-patches.mjs"),
     memoryCliPath: path.join(memoryDirectory, "node_modules", "@agentmemory", "agentmemory", "dist", "cli.mjs"),
     memoryEnvPath: path.join(homeDirectory, ".agentmemory", ".env"),
     privateIiiPath: path.join(homeDirectory, ".agentmemory", "bin", `iii${nativeSuffix}`)
@@ -54,7 +60,8 @@ export function managedRuntimeFingerprint(paths) {
     paths.serverLockPath,
     paths.memoryPackagePath,
     paths.memoryLockPath,
-    paths.memoryNpmrcPath
+    paths.memoryNpmrcPath,
+    paths.memoryPatchModulePath
   ]) {
     hash.update(path.basename(file));
     hash.update("\0");
@@ -83,10 +90,12 @@ export function runtimeInstallPlan(report, { force = false } = {}) {
   const failed = new Set(report.checks.filter((check) => check.status === "fail").map((check) => check.id));
   const server = force || failed.has("runtime_state") || failed.has("server_dependencies") || failed.has("codegraph");
   const memory = force || failed.has("runtime_state") || failed.has("agentmemory_dependencies") || failed.has("agentmemory_cli");
+  const patchMemory = force || memory || failed.has("agentmemory_patches");
   const initializeMemory = force || failed.has("agentmemory_config");
   return {
     installServer: server,
     installAgentMemory: memory,
+    patchAgentMemory: patchMemory,
     buildCompactRuntime: true,
     initializeAgentMemory: initializeMemory
   };
@@ -174,6 +183,14 @@ export async function inspectManagedRuntime(options) {
     "AgentMemory CLI",
     installedAgentMemory ? `${installedAgentMemory} (expected ${expectedAgentMemory})` : paths.memoryCliPath,
     "Reinstall the managed AgentMemory runtime."
+  );
+  const memoryPatches = inspectAgentMemoryRuntimePatches(paths.memoryDirectory);
+  add(
+    "agentmemory_patches",
+    memoryPatches.ok ? "pass" : "fail",
+    "AgentMemory compatibility patches",
+    memoryPatches.detail,
+    "Run lca-custom install to reapply managed AgentMemory patches."
   );
   add(
     "agentmemory_config",
@@ -271,6 +288,10 @@ export async function installManagedRuntime(options) {
   if (plan.installAgentMemory) {
     log("Installing lean AgentMemory companion runtime");
     await run(npmCommand, ["ci", "--ignore-scripts"], { cwd: paths.memoryDirectory, timeoutMs: 600_000 });
+  }
+  if (plan.patchAgentMemory) {
+    log("Applying managed AgentMemory compatibility patches");
+    applyAgentMemoryRuntimePatches(paths.memoryDirectory);
   }
   if (plan.buildCompactRuntime) {
     log("Building compact TypeScript runtime");
