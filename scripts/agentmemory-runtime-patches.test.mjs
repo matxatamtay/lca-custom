@@ -10,12 +10,13 @@ import {
   ZERO_LLM_SUMMARIZE_OTEL_PATCH_ID
 } from "./agentmemory-runtime-patches.mjs";
 
-function createRuntimeFixture() {
-  const root = mkdtempSync(path.join(os.tmpdir(), "lca-agentmemory-patch-"));
-  const packageRoot = path.join(root, "node_modules", "@agentmemory", "agentmemory");
-  const dist = path.join(packageRoot, "dist");
-  mkdirSync(dist, { recursive: true });
-  const source = [
+function originalRuntimeSource() {
+  return [
+    "function registerSummarizeFunction(sdk, kv, provider, metricsStore) {",
+    "\tsdk.registerFunction(\"mem::summarize\", async (data) => {",
+    "\t\tif (provider.name === \"noop\") return { success: false, error: \"no_provider\" };",
+    "\t});",
+    "}",
     "function registerEventTriggers(sdk, kv) {",
     "\tsdk.registerFunction(\"event::session::stopped\", async (data) => {",
     "\t\tconst summary = await sdk.trigger({",
@@ -28,13 +29,20 @@ function createRuntimeFixture() {
     "\tregisterEventTriggers(sdk, kv);",
     ""
   ].join("\n");
+}
+
+function createRuntimeFixture(source = originalRuntimeSource()) {
+  const root = mkdtempSync(path.join(os.tmpdir(), "lca-agentmemory-patch-"));
+  const packageRoot = path.join(root, "node_modules", "@agentmemory", "agentmemory");
+  const dist = path.join(packageRoot, "dist");
+  mkdirSync(dist, { recursive: true });
   for (const name of ["index.mjs", "src-CzgoepGU.mjs"]) {
     writeFileSync(path.join(dist, name), source);
   }
   return { root, dist };
 }
 
-test("patches zero-LLM session stop without changing explicit summarize behavior", () => {
+test("recognizes wrapped zero-LLM providers in explicit and automatic summarize paths", () => {
   const { root, dist } = createRuntimeFixture();
   try {
     const before = inspectAgentMemoryRuntimePatches(root);
@@ -46,12 +54,45 @@ test("patches zero-LLM session stop without changing explicit summarize behavior
 
     const content = readFileSync(path.join(dist, "index.mjs"), "utf8");
     assert.match(content, /function registerEventTriggers\(sdk, kv, provider\)/);
-    assert.match(content, /provider\.name === "noop"/);
+    assert.equal((content.match(/resilient\(noop\)/g) ?? []).length, 2);
     assert.match(content, /success: true/);
     assert.match(content, /skipped: true/);
     assert.match(content, /reason: "no_provider"/);
     assert.match(content, /registerEventTriggers\(sdk, kv, provider\)/);
     assert.match(content, /function_id: "mem::summarize"/);
+    assert.equal(inspectAgentMemoryRuntimePatches(root).ok, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("migrates the v1 patch that missed ResilientProvider wrappers", () => {
+  const v1 = originalRuntimeSource()
+    .replace("function registerEventTriggers(sdk, kv) {", "function registerEventTriggers(sdk, kv, provider) {")
+    .replace([
+      "\t\tconst summary = await sdk.trigger({",
+      "\t\t\tfunction_id: \"mem::summarize\",",
+      "\t\t\tpayload: data",
+      "\t\t});"
+    ].join("\n"), [
+      "\t\t// lca-patch:zero-llm-summarize-otel-v1: zero-LLM is an intentional mode, not a failed function call.",
+      "\t\tconst summary = provider.name === \"noop\" ? {",
+      "\t\t\tsuccess: true,",
+      "\t\t\tskipped: true,",
+      "\t\t\treason: \"no_provider\"",
+      "\t\t} : await sdk.trigger({",
+      "\t\t\tfunction_id: \"mem::summarize\",",
+      "\t\t\tpayload: data",
+      "\t\t});"
+    ].join("\n"))
+    .replace("\tregisterEventTriggers(sdk, kv);", "\tregisterEventTriggers(sdk, kv, provider);");
+  const { root, dist } = createRuntimeFixture(v1);
+  try {
+    assert.equal(applyAgentMemoryRuntimePatches(root).changed, true);
+    const content = readFileSync(path.join(dist, "index.mjs"), "utf8");
+    assert.match(content, /zero-llm-summarize-otel-v2/);
+    assert.doesNotMatch(content, /zero-llm-summarize-otel-v1/);
+    assert.equal((content.match(/resilient\(noop\)/g) ?? []).length, 2);
     assert.equal(inspectAgentMemoryRuntimePatches(root).ok, true);
   } finally {
     rmSync(root, { recursive: true, force: true });

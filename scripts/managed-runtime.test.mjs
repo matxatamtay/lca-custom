@@ -137,6 +137,11 @@ test("installs both managed runtime layers once and is idempotent", async () => 
         writeFileSync(path.join(packageDirectory, "package.json"), JSON.stringify({ name: "@agentmemory/agentmemory", version: "0.9.28" }));
         writeFileSync(paths.memoryCliPath, "// cli\n");
         const runtimeFixture = [
+          "function registerSummarizeFunction(sdk, kv, provider, metricsStore) {",
+          "\tsdk.registerFunction(\"mem::summarize\", async (data) => {",
+          "\t\tif (provider.name === \"noop\") return { success: false, error: \"no_provider\" };",
+          "\t});",
+          "}",
           "function registerEventTriggers(sdk, kv) {",
           "\tsdk.registerFunction(\"event::session::stopped\", async (data) => {",
           "\t\tconst summary = await sdk.trigger({",

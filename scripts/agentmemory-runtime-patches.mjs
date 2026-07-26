@@ -11,9 +11,10 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-export const ZERO_LLM_SUMMARIZE_OTEL_PATCH_ID = "zero-llm-summarize-otel-v1";
+export const ZERO_LLM_SUMMARIZE_OTEL_PATCH_ID = "zero-llm-summarize-otel-v2";
 
 const PATCH_MARKER = `lca-patch:${ZERO_LLM_SUMMARIZE_OTEL_PATCH_ID}`;
+const PREVIOUS_PATCH_MARKER = "lca-patch:zero-llm-summarize-otel-v1";
 const TARGET_FILES = [
   path.join("dist", "index.mjs"),
   path.join("dist", "src-CzgoepGU.mjs")
@@ -23,6 +24,8 @@ const EVENT_SIGNATURE_BEFORE = "function registerEventTriggers(sdk, kv) {";
 const EVENT_SIGNATURE_AFTER = "function registerEventTriggers(sdk, kv, provider) {";
 const EVENT_CALL_BEFORE = "\tregisterEventTriggers(sdk, kv);";
 const EVENT_CALL_AFTER = "\tregisterEventTriggers(sdk, kv, provider);";
+const NOOP_PROVIDER_CHECK_BEFORE = "provider.name === \"noop\"";
+const NOOP_PROVIDER_CHECK_AFTER = "(provider.name === \"noop\" || provider.name === \"resilient(noop)\")";
 const SUMMARY_TRIGGER_BEFORE = [
   "\t\tconst summary = await sdk.trigger({",
   "\t\t\tfunction_id: \"mem::summarize\",",
@@ -31,7 +34,7 @@ const SUMMARY_TRIGGER_BEFORE = [
 ].join("\n");
 const SUMMARY_TRIGGER_AFTER = [
   `\t\t// ${PATCH_MARKER}: zero-LLM is an intentional mode, not a failed function call.`,
-  "\t\tconst summary = provider.name === \"noop\" ? {",
+  `\t\tconst summary = ${NOOP_PROVIDER_CHECK_AFTER} ? {`,
   "\t\t\tsuccess: true,",
   "\t\t\tskipped: true,",
   "\t\t\treason: \"no_provider\"",
@@ -52,7 +55,8 @@ export function inspectAgentMemoryRuntimePatches(memoryDirectory) {
     const content = readFileSync(file, "utf8");
     const patched = content.includes(PATCH_MARKER)
       && content.includes(EVENT_SIGNATURE_AFTER)
-      && content.includes(EVENT_CALL_AFTER);
+      && content.includes(EVENT_CALL_AFTER)
+      && countOccurrences(content, NOOP_PROVIDER_CHECK_AFTER) === 2;
     return { file, exists: true, patched, detail: patched ? "patched" : "unpatched" };
   });
   const ok = targets.length > 0 && targets.every((target) => target.patched);
@@ -80,12 +84,27 @@ function patchTarget(file) {
     assertPatchedLayout(file, original);
     return { file, changed: false };
   }
+  if (original.includes(PREVIOUS_PATCH_MARKER)) {
+    assertSingleOccurrence(file, original, PREVIOUS_PATCH_MARKER, "previous patch marker");
+    assertSingleOccurrence(file, original, EVENT_SIGNATURE_AFTER, "patched event trigger signature");
+    assertSingleOccurrence(file, original, EVENT_CALL_AFTER, "patched event trigger registration");
+    assertOccurrenceCount(file, original, NOOP_PROVIDER_CHECK_BEFORE, 2, "zero-LLM provider checks");
+    const migrated = original
+      .replace(PREVIOUS_PATCH_MARKER, PATCH_MARKER)
+      .split(NOOP_PROVIDER_CHECK_BEFORE)
+      .join(NOOP_PROVIDER_CHECK_AFTER);
+    assertPatchedLayout(file, migrated);
+    writeAtomic(file, migrated);
+    return { file, changed: true };
+  }
 
   assertSingleOccurrence(file, original, EVENT_SIGNATURE_BEFORE, "event trigger signature");
   assertSingleOccurrence(file, original, SUMMARY_TRIGGER_BEFORE, "session-stop summarize trigger");
   assertSingleOccurrence(file, original, EVENT_CALL_BEFORE, "event trigger registration");
+  assertSingleOccurrence(file, original, NOOP_PROVIDER_CHECK_BEFORE, "zero-LLM provider check");
 
   const patched = original
+    .replace(NOOP_PROVIDER_CHECK_BEFORE, NOOP_PROVIDER_CHECK_AFTER)
     .replace(EVENT_SIGNATURE_BEFORE, EVENT_SIGNATURE_AFTER)
     .replace(SUMMARY_TRIGGER_BEFORE, SUMMARY_TRIGGER_AFTER)
     .replace(EVENT_CALL_BEFORE, EVENT_CALL_AFTER);
@@ -97,17 +116,32 @@ function patchTarget(file) {
 function assertPatchedLayout(file, content) {
   if (!content.includes(PATCH_MARKER)
     || !content.includes(EVENT_SIGNATURE_AFTER)
-    || !content.includes(EVENT_CALL_AFTER)) {
+    || !content.includes(EVENT_CALL_AFTER)
+    || countOccurrences(content, NOOP_PROVIDER_CHECK_AFTER) !== 2) {
     throw new Error(`AgentMemory patch verification failed for ${file}`);
   }
 }
 
+function assertOccurrenceCount(file, content, needle, expected, label) {
+  const count = countOccurrences(content, needle);
+  if (count !== expected) {
+    throw new Error(`AgentMemory ${label} layout mismatch in ${file} (expected ${expected} matches, found ${count})`);
+  }
+}
+
 function assertSingleOccurrence(file, content, needle, label) {
-  const first = content.indexOf(needle);
-  const second = first === -1 ? -1 : content.indexOf(needle, first + needle.length);
-  if (first === -1 || second !== -1) {
-    const count = first === -1 ? 0 : 2;
-    throw new Error(`AgentMemory ${label} layout mismatch in ${file} (expected exactly one match, found ${count}${second !== -1 ? "+" : ""})`);
+  assertOccurrenceCount(file, content, needle, 1, label);
+}
+
+function countOccurrences(content, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = content.indexOf(needle, offset);
+    if (index === -1) return count;
+    count += 1;
+    offset = index + needle.length;
   }
 }
 
