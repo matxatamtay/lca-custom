@@ -33,26 +33,58 @@ jobs:
           node -e "const b=require('fs').readFileSync('server.mjs');const n=[...b].filter(x=>x===0).length;if(n)throw new Error('server.mjs contains '+n+' NUL byte(s)')"
           node --check server.mjs
           node --check test-agent.mjs
-          node --check test-security.mjs
+          node --check test-agent-runner.mjs
+          node --check tui.mjs
+          node --check tui/app.mjs
+          node --check tui/client.mjs
+          node --check tui/model.mjs
+          node --check tui/launcher-bridge.mjs
+          node --check test-tui.mjs
+          node --check compact-test-client.mjs
           node --check security-test.mjs
           node --check test-pro.mjs
+          node --check persistent-http-mcp-client.mjs
+          node --check test-persistent-http-mcp-client.mjs
+          node --check figma-desktop.mjs
+          node --check dbeaver-desktop.mjs
+          node --check bruno-desktop.mjs
+          node --check test-figma-desktop.mjs
+          node --check test-dbeaver-desktop.mjs
+          node --check test-bruno-desktop.mjs
+          node --check test-compact-surface.mjs
           node --check test-hardening.mjs
           node --check ../evals/run.mjs
+          node --check ../evals/compact.mjs
           node --check ../scripts/local-coding-agent.mjs
           node --check ../scripts/local-coding-agent.test.mjs
+          node --check ../scripts/managed-runtime.mjs
+          node --check ../scripts/managed-runtime.test.mjs
+          node --check ../scripts/agentmemory-portability.mjs
+          node --check ../scripts/agentmemory-portability.test.mjs
           node --check ../scripts/network-doctor.mjs
           node --test ../scripts/network-doctor.test.mjs
           node --test ../scripts/local-coding-agent.test.mjs
+          node --test ../scripts/managed-runtime.test.mjs
+          node --test ../scripts/agentmemory-portability.test.mjs
           node --check ../scripts/validate-skills.mjs
           node ../scripts/local-coding-agent.mjs --help
           node ../scripts/local-coding-agent.mjs setup --help
           node ../scripts/network-doctor.mjs --help
           node ../scripts/validate-skills.mjs
           node ../scripts/local-coding-agent.mjs skills validate
+          npm run typecheck
+          npm run test:unit
+          npm run test:integration:context
+          npm run test:persistent-http
+          npm run test:tui
+          npm run test:figma
+          npm run test:dbeaver
+          npm run test:bruno
+          npm run test:compact
       - name: Parse Bash launcher
         if: runner.os != 'Windows'
         shell: bash
-        run: bash -n scripts/lca
+        run: bash -n scripts/lca-custom
       - name: Run MCP and runtime-security tests
         working-directory: server
         run: |
@@ -61,9 +93,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $ws | Out-Null
           $env:PORT = "$port"
           $env:AGENT_WORKSPACE = $ws
-          $env:AGENT_MODE = "safe"
-          $env:AGENT_POLICY = "full"
           $env:AGENT_EXTRA_ROOTS_JSON = "[]"
+          $env:AGENTMEMORY_RECORD_SESSIONS = "0"
+          $env:AGENT_AUDIT = "0"
           $env:TEST_ENDPOINT = "http://127.0.0.1:$port/mcp"
           $out = Join-Path $PWD "ci-server.out.log"
           $err = Join-Path $PWD "ci-server.err.log"
@@ -93,8 +125,8 @@ jobs:
             Remove-Item -LiteralPath $ws -Recurse -Force -ErrorAction SilentlyContinue
           }
 
-  security-baseline:
-    name: Security baseline
+  trusted-runtime:
+    name: Trusted runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,19 +137,11 @@ jobs:
           cache-dependency-path: server/package-lock.json
       - run: npm ci
         working-directory: server
-      - name: Run baseline security suite
+      - name: Run trusted runtime suite
         working-directory: server
-        env:
-          PORT: "8799"
-          AGENT_MODE: safe
-          AGENT_POLICY: full
         run: |
-          WORKSPACE="$(mktemp -d)"
-          AGENT_WORKSPACE="$WORKSPACE" node server.mjs > sec.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$WORKSPACE"' EXIT
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/healthz >/dev/null && break; sleep 1; done
-          TEST_ENDPOINT=http://127.0.0.1:8799/mcp AUDIT_LOG=data/audit.log npm run test:security:baseline
+          npm run test:trusted-runtime
+          npm run test:tui:pty
 
   eval:
     name: Eval suite

@@ -15,7 +15,10 @@ tools/
 
 # ---- Node ----
 node_modules/
+.codegraph/
 server/data/
+.agent/state/
+server/dist/
 server/*.log
 tmp-*/
 *-test-workspace/

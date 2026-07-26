@@ -1,4 +1,4 @@
-// Local Coding Agent v4.1 hardening regression suite
+// Operational hardening and trusted-runtime regression suite.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import http from "node:http";
@@ -8,233 +8,182 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { callCompactTool } from "./compact-test-client.mjs";
 
 const SERVER = path.resolve("server.mjs");
 let pass = 0;
 let fail = 0;
-
 function check(name, condition, detail = "") {
   if (condition) {
     pass++;
     console.log(`[PASS] ${name}`);
   } else {
     fail++;
-    console.log(`[FAIL] ${name}${detail ? `\n${detail}` : ""}`);
+    console.error(`[FAIL] ${name}${detail ? `\n${detail}` : ""}`);
   }
 }
 
-async function waitFor(url) {
-  for (let i = 0; i < 50; i++) {
-    try {
-      const r = await fetch(url);
-      if (r.ok) return;
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`Server did not become ready: ${url}`);
+function wait(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      server.close(() => resolve(port));
+    });
+  });
 }
 
-async function startServer(workspace, { port, policy = "strict", auth = "", approvalToken = "", maxBody = "1048576" }) {
+async function startServer(workspace, { auth = "", maxBody = "1048576", audit = "0" } = {}) {
   await mkdir(workspace, { recursive: true });
+  const port = await freePort();
+  let stderr = "";
   const child = spawn(process.execPath, [SERVER], {
     cwd: path.dirname(SERVER),
     env: {
       ...process.env,
       PORT: String(port),
       AGENT_WORKSPACE: workspace,
-      AGENT_MODE: "safe",
-      AGENT_POLICY: policy,
+      AGENTMEMORY_RECORD_SESSIONS: "0",
       AGENT_EXTRA_ROOTS_JSON: "[]",
       MCP_AUTH_TOKEN: auth,
-      AGENT_APPROVAL_TOKEN: approvalToken,
-      AGENT_MAX_BODY_BYTES: maxBody
+      AGENT_MAX_BODY_BYTES: maxBody,
+      AGENT_AUDIT: audit
     },
     windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "ignore", "pipe"]
   });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => (stderr += chunk));
-  await waitFor(`http://127.0.0.1:${port}/healthz`).catch((error) => {
-    throw new Error(`${error.message}\n${stderr}`);
-  });
-  return child;
-}
-
-async function stopServer(child) {
-  if (!child?.pid) return;
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
-  } else {
-    child.kill("SIGTERM");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  for (let i = 0; i < 80; i++) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/healthz`);
+      if (response.ok) return { child, port };
+    } catch {}
+    if (child.exitCode !== null) throw new Error(`Server exited early: ${stderr}`);
+    await wait(100);
   }
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  throw new Error(`Server did not become ready: ${stderr}`);
 }
 
-async function connect(port) {
+async function stopServer(server) {
+  if (!server?.child?.pid) return;
+  if (process.platform === "win32") spawn("taskkill", ["/pid", String(server.child.pid), "/T", "/F"], { windowsHide: true });
+  else server.child.kill("SIGTERM");
+  await wait(400);
+}
+
+async function connect(port, token = "") {
   const client = new Client({ name: "hardening-test", version: "1.0.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
+  const options = token ? { requestInit: { headers: { Authorization: `Bearer ${token}` } } } : undefined;
+  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), options));
   return client;
 }
 
 async function call(client, name, args = {}) {
-  const result = await client.callTool({ name, arguments: args });
-  return { isError: Boolean(result.isError), text: result.content?.[0]?.text || "" };
+  const result = await callCompactTool(client, name, args);
+  return { result, isError: Boolean(result.isError), text: result.content?.[0]?.text || "" };
 }
 
 function chunkedPost(port, body) {
   return new Promise((resolve, reject) => {
-    const req = http.request({
+    const request = http.request({
       host: "127.0.0.1",
       port,
       path: "/mcp",
       method: "POST",
       headers: { "content-type": "application/json", "transfer-encoding": "chunked" }
-    }, (res) => {
-      res.resume();
-      res.on("end", () => resolve(res.statusCode));
+    }, (response) => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
     });
-    req.on("error", reject);
-    req.write(body.slice(0, Math.floor(body.length / 2)));
-    req.end(body.slice(Math.floor(body.length / 2)));
+    request.on("error", reject);
+    request.write(body.slice(0, Math.floor(body.length / 2)));
+    request.end(body.slice(Math.floor(body.length / 2)));
   });
 }
 
 const base = await mkdtemp(path.join(os.tmpdir(), "lca-hardening-"));
 let server;
+let client;
 try {
-  // Strict policy + browser-origin + body limit + removed legacy UI routes.
-  console.log("\n[phase] strict policy, origin, body limit, no legacy UI routes");
-  server = await startServer(path.join(base, "strict"), { port: 19001, policy: "strict", maxBody: "8192" });
-  const evil = await fetch("http://127.0.0.1:19001/mcp", {
+  server = await startServer(path.join(base, "trusted"), { maxBody: "8192", audit: "1" });
+  client = await connect(server.port);
+
+  const health = await (await fetch(`http://127.0.0.1:${server.port}/healthz`)).json();
+  check("health reports trusted compact runtime", health.runtime === "trusted-local" && health.tool_surface === "compact", JSON.stringify(health));
+  check("removed mode and policy fields stay absent", health.mode === undefined && health.policy === undefined && health.allow_dangerous === undefined, JSON.stringify(health));
+
+  const hostileOrigin = await fetch(`http://127.0.0.1:${server.port}/mcp`, {
     method: "OPTIONS",
     headers: { Origin: "https://evil.example", "Access-Control-Request-Method": "POST" }
   });
-  check("browser Origin is denied by default", evil.status === 403, `status=${evil.status}`);
+  check("browser Origin is denied by default", hostileOrigin.status === 403, `status=${hostileOrigin.status}`);
+  check("chunked request bodies remain size-limited", (await chunkedPost(server.port, JSON.stringify({ data: "x".repeat(12000) }))) === 413);
 
-  const client = await connect(19001);
-  check("strict policy blocks write_file", (await call(client, "write_file", { path: "blocked.txt", content: "x" })).isError);
-  check("strict policy blocks run_command", (await call(client, "run_command", { command: "node --version" })).isError);
-  check("strict policy blocks run_commands", (await call(client, "run_commands", { commands: [{ command: "node --version" }] })).isError);
-  await call(client, "workspace_info");
+  for (const route of ["/metrics", "/ui", "/companion"]) {
+    const response = await fetch(`http://127.0.0.1:${server.port}${route}`);
+    check(`${route} legacy HTTP route is absent`, response.status === 404, `status=${response.status}`);
+  }
+
+  const write = await call(client, "write_file", { path: "direct.txt", content: "direct\n" });
+  check("writes execute without approval", !write.isError, write.text);
+  const command = await call(client, "run_command", { command: "node --version" });
+  check("commands execute without policy round-trip", !command.isError && /v\d+/.test(command.text), command.text);
+  const deletion = await call(client, "delete_path", { path: "direct.txt" });
+  check("deletes execute without approval", !deletion.isError, deletion.text);
+
+  const outsideFile = path.join(base, "outside-project.txt");
+  const absoluteWrite = await call(client, "write_file", { path: outsideFile, content: "outside\n" });
+  const absoluteRead = await call(client, "read_file", { path: outsideFile });
+  check("absolute paths outside configured projects execute directly", !absoluteWrite.isError && JSON.parse(absoluteRead.text).content === "outside\n", absoluteRead.text);
+
   await client.close();
-
-  const metricsRoute = await fetch("http://127.0.0.1:19001/metrics");
-  const uiRoute = await fetch("http://127.0.0.1:19001/ui");
-  const companionRoute = await fetch("http://127.0.0.1:19001/companion");
-  const evilCompanion = await fetch("http://127.0.0.1:19001/companion/api/workspace_search", {
-    method: "POST",
-    headers: { Origin: "https://evil.example", "content-type": "application/json" },
-    body: JSON.stringify({ query: "@" })
-  });
-  check("legacy UI metrics route is gone", metricsRoute.status === 404, `status=${metricsRoute.status}`);
-  check("legacy UI ui route is gone", uiRoute.status === 404, `status=${uiRoute.status}`);
-  check("companion standalone HTTP route is gone", companionRoute.status === 404, `status=${companionRoute.status}`);
-  check("hostile browser Origin is rejected", evilCompanion.status === 403, `status=${evilCompanion.status}`);
-  check("chunked payload is size-limited", (await chunkedPost(19001, JSON.stringify({ data: "x".repeat(12000) }))) === 413);
+  client = null;
   await stopServer(server);
   server = null;
 
-  // Balanced policy approvals are decided through the local operator token.
-  console.log("\n[phase] token-only one-time approvals");
-  const balancedSecret = `LCA_BALANCED_APPROVAL_${Date.now()}`;
-  server = await startServer(path.join(base, "balanced"), { port: 19006, policy: "balanced", approvalToken: balancedSecret });
-  const balanced = await connect(19006);
-  await call(balanced, "write_file", { path: "victim.txt", content: "x" });
-  const blockedDelete = await call(balanced, "delete_path", { path: "victim.txt" });
-  check("balanced policy blocks delete before approval", blockedDelete.isError && blockedDelete.text.includes("Approval required"));
-  const blockedRiskyBatch = await call(balanced, "run_commands", {
-    commands: [{ command: "curl -o downloaded.txt https://example.invalid" }]
-  });
-  check("balanced policy does not let run_commands bypass risky-command approval", blockedRiskyBatch.isError && blockedRiskyBatch.text.includes("Approval required"));
-  const request = JSON.parse((await call(balanced, "request_approval", { action: "delete_path:victim.txt", reason: "hardening regression" })).text);
-  check("operator token approves pending action", !(await call(balanced, "approve_request", { id: request.id, approval_token: balancedSecret })).isError);
-  check("approved action executes once", !(await call(balanced, "delete_path", { path: "victim.txt" })).isError);
-  await call(balanced, "write_file", { path: "victim.txt", content: "x" });
-  check("consumed approval cannot be replayed", (await call(balanced, "delete_path", { path: "victim.txt" })).isError);
-
-  await call(balanced, "write_file", { path: "batch-a.txt", content: "a" });
-  await call(balanced, "write_file", { path: "batch-b.txt", content: "b" });
-  const batchRequest = JSON.parse((await call(balanced, "request_approval_batch", {
-    actions: ["delete_path:batch-a.txt", "delete_path:batch-b.txt"],
-    reason: "hardening exact batch regression",
-    expires_in_minutes: 5
-  })).text);
-  check("operator token approves exact action batch", !(await call(balanced, "approve_request", { id: batchRequest.id, approval_token: balancedSecret })).isError);
-  check("batch approval consumes first exact action", !(await call(balanced, "delete_path", { path: "batch-a.txt" })).isError);
-  check("batch approval consumes second exact action", !(await call(balanced, "delete_path", { path: "batch-b.txt" })).isError);
-  check("consumed batch action cannot be replayed", (await call(balanced, "delete_path", { path: "batch-a.txt" })).isError);
-
-  const concurrentAction = "run_command:git fetch --dry-run";
-  const concurrentRequest = JSON.parse((await call(balanced, "request_approval", {
-    action: concurrentAction,
-    reason: "concurrent consume regression"
-  })).text);
-  await call(balanced, "approve_request", { id: concurrentRequest.id, approval_token: balancedSecret });
-  const concurrentResults = await Promise.all([
-    call(balanced, "run_command", { command: "git fetch --dry-run" }),
-    call(balanced, "run_command", { command: "git fetch --dry-run" })
-  ]);
-  check("one-time approval remains one-time under concurrent calls", concurrentResults.filter((result) => result.isError).length === 1);
-  await balanced.close();
-  await stopServer(server);
-  server = null;
-
-  // MCP-token decisions must not revive consumed/denied requests or accept path-like ids.
-  console.log("\n[phase] approval replay and id validation");
-  const approvalSecret = `LCA_APPROVAL_SECRET_${Date.now()}`;
-  server = await startServer(path.join(base, "approval-token"), { port: 19008, policy: "balanced", approvalToken: approvalSecret });
-  const tokenClient = await connect(19008);
-  const tokenRequest = JSON.parse((await call(tokenClient, "request_approval", { action: "delete_path:token.txt", reason: "token replay regression" })).text);
-  check("MCP operator token approves a pending request", !(await call(tokenClient, "approve_request", { id: tokenRequest.id, approval_token: approvalSecret })).isError);
-  check("MCP operator token cannot approve the same request twice", (await call(tokenClient, "approve_request", { id: tokenRequest.id, approval_token: approvalSecret })).isError);
-  check("MCP approval rejects path-like ids", (await call(tokenClient, "approve_request", { id: "../outside", approval_token: approvalSecret })).isError);
-  const denyRequest = JSON.parse((await call(tokenClient, "request_approval", { action: "delete_path:deny.txt", reason: "token deny regression" })).text);
-  check("MCP operator token denies a pending request", !(await call(tokenClient, "deny_request", { id: denyRequest.id, approval_token: approvalSecret })).isError);
-  check("denied request cannot be approved later", (await call(tokenClient, "approve_request", { id: denyRequest.id, approval_token: approvalSecret })).isError);
-  await tokenClient.close();
-  await stopServer(server);
-  server = null;
-  const approvalAudit = await readFile(path.resolve("data", "audit.log"), "utf8").catch(() => "");
-  check("audit log redacts approval_token", !approvalAudit.includes(approvalSecret));
-
-  // Query-string tokens must not authenticate.
-  console.log("\n[phase] header-only bearer authentication");
-  server = await startServer(path.join(base, "auth"), { port: 19003, policy: "full", auth: "operator-secret" });
-  const queryAuth = await fetch("http://127.0.0.1:19003/mcp?token=operator-secret", {
+  const authToken = `operator-${Date.now()}`;
+  server = await startServer(path.join(base, "auth"), { auth: authToken });
+  const queryAuth = await fetch(`http://127.0.0.1:${server.port}/mcp?token=${encodeURIComponent(authToken)}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}"
   });
-  check("query-string bearer token is rejected", queryAuth.status === 401, `status=${queryAuth.status}`);
+  check("query-string bearer tokens are rejected", queryAuth.status === 401, `status=${queryAuth.status}`);
+  client = await connect(server.port, authToken);
+  check("header bearer authentication works", !(await call(client, "workspace_info")).isError);
+  await client.close();
+  client = null;
   await stopServer(server);
   server = null;
 
-  // Undo must cover created files and renamed directories.
   const workspaceA = path.join(base, "workspace-a");
-  console.log("\n[phase] transactional undo coverage");
-  server = await startServer(workspaceA, { port: 19004, policy: "full" });
-  const full = await connect(19004);
-  await call(full, "apply_patch", { operations: [{ op: "create", path: "created.txt", content: "created" }] });
-  await call(full, "undo_last_patch");
-  check("undo removes files created by apply_patch", (await call(full, "stat_path", { path: "created.txt" })).isError);
-  await call(full, "make_dir", { path: "source-dir" });
-  await call(full, "write_file", { path: "source-dir/a.txt", content: "a" });
-  await call(full, "move_path", { from: "source-dir", to: "dest-dir" });
-  await call(full, "undo_last_patch");
-  check("undo restores renamed directory source", !(await call(full, "stat_path", { path: "source-dir/a.txt" })).isError);
-  check("undo removes renamed directory destination", (await call(full, "stat_path", { path: "dest-dir" })).isError);
-  await full.close();
+  server = await startServer(workspaceA);
+  client = await connect(server.port);
+  await call(client, "apply_patch", { operations: [{ op: "create", path: "created.txt", content: "created" }] });
+  await call(client, "undo_last_patch");
+  check("undo removes files created by apply_patch", (await call(client, "stat_path", { path: "created.txt" })).isError);
+  await call(client, "make_dir", { path: "source-dir" });
+  await call(client, "write_file", { path: "source-dir/a.txt", content: "a" });
+  await call(client, "move_path", { from: "source-dir", to: "dest-dir" });
+  await call(client, "undo_last_patch");
+  check("undo restores renamed directory source", !(await call(client, "stat_path", { path: "source-dir/a.txt" })).isError);
+  check("undo removes renamed directory destination", (await call(client, "stat_path", { path: "dest-dir" })).isError);
+  await client.close();
+  client = null;
   await stopServer(server);
   server = null;
 
-  // History is scoped to the workspace and cannot replay into an old root.
-  console.log("\n[phase] workspace-scoped history");
-  server = await startServer(path.join(base, "workspace-b"), { port: 19005, policy: "full" });
-  const other = await connect(19005);
-  check("new workspace cannot undo another workspace history", (await call(other, "undo_last_patch")).isError);
-  await other.close();
+  server = await startServer(path.join(base, "workspace-b"));
+  client = await connect(server.port);
+  check("patch history remains scoped by workspace", (await call(client, "undo_last_patch")).isError);
+
+  const audit = await readFile(path.resolve("data", "audit.log"), "utf8").catch(() => "");
+  check("audit remains available", audit.length > 0);
 } finally {
-  if (server) await stopServer(server);
+  await client?.close().catch(() => {});
+  await stopServer(server);
   await rm(base, { recursive: true, force: true });
 }
 

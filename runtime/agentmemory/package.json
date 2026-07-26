@@ -1,0 +1,9 @@
+{
+  "name": "lca-agentmemory-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned managed AgentMemory runtime for Local Coding Agent.",
+  "dependencies": {
+    "@agentmemory/agentmemory": "0.9.28"
+  }
+}

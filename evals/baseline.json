@@ -1,0 +1,108 @@
+{
+  "generatedAt": "2026-07-22T15:40:59.877Z",
+  "gitHead": "944dcc6a317cd29d842e3253f3e9b0ec53852bb6",
+  "runtime": {
+    "node": "v20.20.2",
+    "platform": "linux",
+    "arch": "x64"
+  },
+  "toolSurface": {
+    "count": 143,
+    "jsonBytes": 91420,
+    "nameChars": 2327,
+    "descriptionChars": 13762,
+    "schemaChars": 49930,
+    "topPrefixes": [
+      [
+        "bruno",
+        40
+      ],
+      [
+        "dbeaver",
+        25
+      ],
+      [
+        "figma",
+        9
+      ],
+      [
+        "run",
+        6
+      ],
+      [
+        "workspace",
+        4
+      ],
+      [
+        "proc",
+        4
+      ],
+      [
+        "list",
+        3
+      ],
+      [
+        "read",
+        3
+      ],
+      [
+        "repo",
+        3
+      ],
+      [
+        "git",
+        3
+      ],
+      [
+        "lca",
+        2
+      ],
+      [
+        "delete",
+        2
+      ],
+      [
+        "task",
+        2
+      ],
+      [
+        "request",
+        2
+      ],
+      [
+        "ping",
+        1
+      ]
+    ]
+  },
+  "instructions": {
+    "chars": 4458,
+    "bytes": 4460,
+    "lines": 22
+  },
+  "latencyMs": {
+    "listTools": {
+      "runs": 8,
+      "min": 12.46,
+      "median": 14.13,
+      "max": 21.49
+    },
+    "workspaceInfo": {
+      "runs": 8,
+      "min": 4.8,
+      "median": 5.95,
+      "max": 8.55
+    },
+    "readFile": {
+      "runs": 8,
+      "min": 4.29,
+      "median": 5.73,
+      "max": 12.5
+    }
+  },
+  "targets": {
+    "toolCountMax": 16,
+    "toolSurfaceBytesMax": 20000,
+    "instructionCharsMax": 1000
+  }
+}

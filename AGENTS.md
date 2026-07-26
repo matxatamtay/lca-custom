@@ -1,26 +1,29 @@
-# AGENTS.md — setup guide for AI coding agents
+# AGENTS.md
 
-Nếu user yêu cầu cài hoặc hướng dẫn repo này, dùng flow TUI mới dưới đây.
+## Product contract
 
-## What This Is
+Local Coding Agent is a trusted local MCP execution engine for ChatGPT. The model-facing surface is always the compact fourteen-tool facade. The complete implementation remains behind an internal in-memory backend and must never be exposed as a second public legacy surface.
 
-Local MCP server (`server/server.mjs`) cho ChatGPT Web connector. CLI quản lý nhiều project roots và chạy như service nền.
+`workspace_context` is the default first call for coding tasks. It must always query filesystem search, CodeGraph, and AgentMemory in parallel, then return a coverage receipt. A provider may return zero hits, but it must not be silently skipped.
+
+Project roots are discovery and relative-path defaults, not authorization boundaries. Absolute paths and direct file, command, process, Git, Bruno, and Figma operations are supported without policy or approval round-trips.
+
+DBeaver is the intentional exception to fully model-triggered execution: SQL is editor-first. After `dbeaver_propose_sql`, stop and let the user press **Run** in the SQL Artifact. Only the widget receives the hidden capability that can call preparation and execution for the exact proposed SQL.
 
 ## Prerequisites
 
-- Node.js >= 18 (`node -v`)
+- Node.js 20 or newer
 - npm
-- Git nếu muốn tự nhận git root
-- OpenAI Tunnel ID và Runtime API key nếu dùng ChatGPT Web tunnel
+- Git
+- Docker for the default managed AgentMemory engine
+- OpenAI tunnel ID and runtime API key for ChatGPT Web
 
-Không commit secret, `.env.local`, `tools/`, generated profiles hoặc logs có secret.
+Never commit secrets, `.env.local`, generated profiles, `tools/`, `.agent/state/`, `server/data/`, `server/dist/`, `node_modules/`, runtime databases, backups, or logs.
 
 ## Setup
 
-Chạy setup wizard trong repo `local-coding-agent`:
-
 ```bash
-# macOS / Linux / WSL
+# macOS, Linux, WSL
 bash scripts/lca-custom setup
 ```
 
@@ -29,58 +32,41 @@ bash scripts/lca-custom setup
 scripts\lca-custom.cmd setup
 ```
 
-Wizard sẽ cho chọn OS, kiểm tra prerequisite, mở trang Tunnel/API key, tạo/cập nhật `.env.local`, cài dependency, auto-download `tunnel-client` khi có thể, ghi config local và cài global command `lca-custom`.
+The installer pins and verifies the core server, CodeGraph, AgentMemory, TypeScript build, tunnel binary, local configuration, and service state. Verify a machine with:
 
-## Daily Use
+```bash
+lca-custom doctor
+lca-custom status
+```
+
+## Daily commands
 
 ```bash
 lca-custom reset /path/to/main-project
 lca-custom add /path/to/another-project
 lca-custom start --background
-```
-
-`lca-custom add`, `lca-custom remove` và `lca-custom reset` tự restart agent đang chạy để áp dụng danh sách project mới.
-
-Lệnh thường dùng:
-
-```bash
 lca-custom stop
-lca-custom status
-lca-custom add [path]
-lca-custom remove [path]
-lca-custom reset [path]
-lca-custom doctor
+lca-custom doctor --fix
+lca-custom memory export
 ```
 
-## ChatGPT Web Connector
+Adding, removing, or resetting projects restarts the managed server when necessary. The configured roots help context discovery across projects; they do not limit absolute tool paths.
 
-- ChatGPT Web -> Settings -> Connectors -> Developer mode -> Add custom MCP connector.
-- Chọn tunnel đã tạo.
-- Auth: `No auth`.
-- Không dùng OAuth.
-- Không nhập Runtime API key vào connector auth; key này nằm trong `.env.local` cho local tunnel-client.
-- Verify bằng cách hỏi ChatGPT gọi `workspace_info`.
+## ChatGPT custom app
 
-Chi tiết: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WEB_CONNECTOR.md).
+Create a custom MCP app in Developer mode, select the private tunnel, and use `No auth` unless local bearer authentication is intentionally configured. Refresh the app after changing the public tool schema.
 
-## URLs
+Local endpoints:
 
-- MCP local: `http://127.0.0.1:8790/mcp`
+- MCP: `http://127.0.0.1:8790/mcp`
 - Health: `http://127.0.0.1:8790/healthz`
 
-## Safety
+## Validation
 
-- Setup wizard mặc định `mode=full`, `policy=full`.
-- Đây không phải OS sandbox.
-- Chỉ connect workspace tin tưởng.
-- Không expose server public nếu chưa hiểu rủi ro.
-- DBeaver SQL là editor-first: sau `dbeaver_propose_sql` phải dừng và chờ user bấm **Run** trong SQL Artifact. Không được tự gọi `dbeaver_prepare_sql_execution` trong cùng lượt. Backend dùng capability ẩn để cưỡng chế invariant này.
-
-## Low-Level CLI
-
-CLI gốc vẫn dùng được để debug:
+Run the complete release gate from `server/`:
 
 ```bash
-node scripts/local-coding-agent.mjs status
-node scripts/local-coding-agent.mjs logs
+npm run test:all
 ```
+
+The gate covers TypeScript, mandatory dual-source context, persistent MCP clients, all three desktop bridges, compact surface and schema budgets, Pro behavior, trusted-runtime semantics, transport hardening, and end-to-end evals.

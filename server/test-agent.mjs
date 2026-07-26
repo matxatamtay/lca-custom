@@ -4,6 +4,9 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import os from "node:os";
+import path from "node:path";
+import { callCompactTool } from "./compact-test-client.mjs";
 
 const ENDPOINT = process.env.TEST_ENDPOINT || "http://127.0.0.1:8790/mcp";
 const client = new Client({ name: "agent-test-client", version: "1.0.0" });
@@ -17,7 +20,7 @@ let pass = 0;
 let fail = 0;
 
 async function call(name, args, { expectError = false } = {}) {
-  const result = await client.callTool({ name, arguments: args });
+  const result = await callCompactTool(client, name, args);
   const text = result.content?.[0]?.text ?? "";
   const isError = Boolean(result.isError);
   const ok = expectError ? isError : !isError;
@@ -84,8 +87,11 @@ await call("proc_stop", { id });
 // git (exercise; --version always works)
 await call("git", { args: ["--version"] });
 
-// safety: a path escaping the roots must error
-await call("read_file", { path: "../../../etc/passwd" }, { expectError: true });
+// Trusted runtime: absolute paths outside configured projects are supported.
+const absoluteFile = path.join(os.tmpdir(), `lca-absolute-${process.pid}.txt`);
+await call("write_file", { path: absoluteFile, content: "absolute path works\n" });
+await call("read_file", { path: absoluteFile });
+await call("delete_path", { path: absoluteFile });
 
 // cleanup
 await call("delete_path", { path: "demo/renamed", recursive: true });

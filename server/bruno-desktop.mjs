@@ -1,9 +1,13 @@
 // Local Coding Agent — Bruno Desktop MCP bridge
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { pathToFileURL } from "node:url";
+import {
+  PersistentHttpMcpClient,
+  PersistentHttpMcpClientRegistry,
+  normalizeTimeout,
+  persistentHttpClientKey
+} from "./persistent-http-mcp-client.mjs";
 
 export const DEFAULT_BRUNO_DESKTOP_MCP_URL = "http://127.0.0.1:3847/mcp";
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -26,19 +30,7 @@ export function normalizeBrunoDesktopEndpoint(value = process.env.BRUNO_DESKTOP_
   return url.toString();
 }
 
-function timeoutMs(value) {
-  const parsed = Number(value ?? process.env.BRUNO_DESKTOP_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
-  if (!Number.isFinite(parsed)) return DEFAULT_TIMEOUT_MS;
-  return Math.min(300_000, Math.max(1_000, Math.trunc(parsed)));
-}
-
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms.`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
+const brunoClients = new PersistentHttpMcpClientRegistry();
 
 export function friendlyBrunoDesktopError(error, endpoint = normalizeBrunoDesktopEndpoint()) {
   const message = String(error?.cause?.message || error?.message || error || "Unknown error");
@@ -53,39 +45,43 @@ export function friendlyBrunoDesktopError(error, endpoint = normalizeBrunoDeskto
   return new Error(`Bruno Desktop MCP error: ${message}`);
 }
 
-export async function withBrunoDesktopClient(callback, options = {}) {
+function getBrunoDesktopClient(options = {}) {
   const endpoint = normalizeBrunoDesktopEndpoint(options.endpoint);
-  const ms = timeoutMs(options.timeoutMs);
+  const ms = normalizeTimeout(options.timeoutMs ?? process.env.BRUNO_DESKTOP_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
   const authToken = String(options.authToken ?? process.env.BRUNO_DESKTOP_AUTH_TOKEN ?? "").trim();
-  const client = new Client({ name: options.clientName || "local-coding-agent-bruno-bridge", version: "2.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(endpoint), {
-    requestInit: authToken ? { headers: { Authorization: `Bearer ${authToken}` } } : undefined
-  });
-  try {
-    await withTimeout(client.connect(transport), ms, "Connecting to Bruno Desktop MCP");
-    return await withTimeout(Promise.resolve(callback(client)), ms, "Bruno Desktop MCP request");
-  } catch (error) {
-    throw friendlyBrunoDesktopError(error, endpoint);
-  } finally {
-    await client.close().catch(() => {});
-  }
+  const clientName = options.clientName || "local-coding-agent-bruno-bridge";
+  const key = `${persistentHttpClientKey({ endpoint, authToken, clientName })}|timeout=${ms}`;
+  return brunoClients.get(key, () => new PersistentHttpMcpClient({
+    endpoint,
+    clientName,
+    clientVersion: "2.0.0",
+    timeoutMs: ms,
+    ...(authToken ? { requestInit: { headers: { Authorization: `Bearer ${authToken}` } } } : {}),
+    mapError: (error) => friendlyBrunoDesktopError(error, endpoint)
+  }));
+}
+
+export async function withBrunoDesktopClient(callback, options = {}) {
+  return callback(getBrunoDesktopClient(options));
+}
+
+export async function closeBrunoDesktopClients() {
+  await brunoClients.closeAll();
 }
 
 export async function listBrunoDesktopTools(options = {}) {
-  return withBrunoDesktopClient((client) => client.listTools(), options);
+  return getBrunoDesktopClient(options).listTools({ refresh: options.refresh === true });
 }
 
 export async function callBrunoDesktopTool(name, args = {}, options = {}) {
   const toolName = String(name || "").trim();
   if (!toolName) throw new Error("Bruno tool name is required.");
-  return withBrunoDesktopClient(async (client) => {
-    const listed = await client.listTools();
-    const tool = listed.tools.find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      throw new Error(`Bruno Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
-    }
-    return client.callTool({ name: toolName, arguments: args || {} });
-  }, options);
+  const client = getBrunoDesktopClient(options);
+  const { listed, tool } = await client.findTool(toolName);
+  if (!tool) {
+    throw new Error(`Bruno Desktop does not expose tool "${toolName}". Available: ${listed.tools.map((item) => item.name).join(", ") || "none"}`);
+  }
+  return client.callTool({ name: toolName, arguments: args || {} });
 }
 
 export async function brunoDesktopStatus(options = {}) {

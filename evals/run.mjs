@@ -17,6 +17,7 @@ const sdkClientPath = path.join(serverDir, "node_modules", "@modelcontextprotoco
 const sdkHttpPath = path.join(serverDir, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm", "client", "streamableHttp.js");
 const { Client } = await import(pathToFileURL(sdkClientPath).href);
 const { StreamableHTTPClientTransport } = await import(pathToFileURL(sdkHttpPath).href);
+const { callCompactTool } = await import(pathToFileURL(path.join(serverDir, "compact-test-client.mjs")).href);
 
 import { spawn } from "node:child_process";
 import { mkdir, writeFile, rm, readFile } from "node:fs/promises";
@@ -59,8 +60,7 @@ async function startServer(workspace) {
           ...process.env,
           PORT: String(EVAL_PORT),
           AGENT_WORKSPACE: workspace,
-          AGENT_MODE: "safe",
-          AGENT_POLICY: "full"
+          AGENTMEMORY_RECORD_SESSIONS: "0"
         },
         windowsHide: true
       }
@@ -100,7 +100,7 @@ async function connectClient() {
 
 async function call(client, name, args) {
   try {
-    const r = await client.callTool({ name, arguments: args });
+    const r = await callCompactTool(client, name, args);
     return {
       text: r.content?.[0]?.text ?? "",
       isError: Boolean(r.isError)
@@ -198,11 +198,15 @@ async function runEvals(workspace) {
       check("run_tests: failing test detected (exit_code != 0)", d && d.exit_code !== 0 && d.ok === false);
     }
 
-    // ---- eval 6: prevent path escape ----
-    console.log("EVAL: path escape blocked");
+    // ---- eval 6: trusted absolute paths ----
+    console.log("EVAL: trusted absolute paths");
     {
-      const r = await call(client, "read_file", { path: "../../../../etc/passwd" });
-      check("path-escape: read outside root blocked", r.isError && r.text.includes("outside the allowed roots"));
+      const absolutePath = path.join(os.tmpdir(), `lca-eval-absolute-${process.pid}.txt`);
+      const write = await call(client, "write_file", { path: absolutePath, content: "absolute eval\n" });
+      const read = await call(client, "read_file", { path: absolutePath });
+      const data = await parseJSON(read.text);
+      check("absolute-path: write and read outside configured roots", !write.isError && data?.content === "absolute eval\n");
+      await call(client, "delete_path", { path: absolutePath });
     }
 
     // ---- eval 7: prevent secret in audit ----
@@ -222,14 +226,12 @@ async function runEvals(workspace) {
       }
     }
 
-    // ---- eval 8: git safety (flag blocked) ----
-    console.log("EVAL: git safety");
+    // ---- eval 8: trusted Git execution ----
+    console.log("EVAL: trusted Git execution");
     {
-      const r = await call(client, "git", { args: ["diff", "--output=../escape.txt"] });
-      check("git-safety: --output flag blocked", r.isError);
-
-      const r2 = await call(client, "git", { args: ["-c", "core.pager=calc", "log"] });
-      check("git-safety: -c flag blocked", r2.isError);
+      const init = await call(client, "git", { args: ["init"] });
+      const configured = await call(client, "git", { args: ["-c", "color.ui=false", "status", "--short"] });
+      check("git-trusted: mutations and global flags execute directly", !init.isError && !configured.isError);
     }
 
     // ---- eval 9: repo_map on sample project ----
@@ -266,12 +268,12 @@ async function runEvals(workspace) {
       check("task_state: step marked done", sd && sd.steps && sd.steps[0].done === true);
     }
 
-    // ---- eval 12: policy_status ----
-    console.log("EVAL: policy_status");
+    // ---- eval 12: trusted runtime status ----
+    console.log("EVAL: trusted runtime status");
     {
-      const r = await call(client, "policy_status", {});
+      const r = await call(client, "workspace_info", {});
       const d = await parseJSON(r.text);
-      check("policy_status: returns policy info", d && typeof d.policy === "string" && ["strict", "balanced", "full"].includes(d.policy));
+      check("runtime-status: trusted compact runtime without policy fields", d?.runtime === "trusted-local" && d?.tool_surface === "compact" && d?.policy === undefined && d?.mode === undefined);
     }
 
     // ---- eval 13: preview_patch dry-run ----
