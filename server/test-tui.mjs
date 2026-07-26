@@ -3,6 +3,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -21,6 +23,14 @@ import {
 import { LcaTuiApp } from "./tui/app.mjs";
 import { LcaTuiClient } from "./tui/client.mjs";
 import { launcherInvocation } from "./tui/launcher-bridge.mjs";
+import { directoryPickerRows, nextPickerDirectory } from "./tui/folder-picker.mjs";
+import {
+  defaultTuiStatePath,
+  loadTuiState,
+  normalizeViewOrder,
+  reorderItems,
+  saveTuiState
+} from "./tui/state.mjs";
 import { parseArgs, promoteProjectRoot } from "../scripts/local-coding-agent.mjs";
 
 test("TUI ships every planned feature screen with unique shortcuts", () => {
@@ -34,6 +44,114 @@ test("TUI ships every planned feature screen with unique shortcuts", () => {
   assert.ok(TUI_SHORTCUTS.some(([key]) => key === "Mouse"));
   assert.equal(viewByShortcut("g")?.id, "git");
   assert.equal(viewByShortcut("", "?")?.id, "help");
+});
+
+test("tab order can be normalized, reordered, and persisted", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "lca-tui-state-"));
+  const project = path.join(root, "project");
+  mkdirSync(project);
+  const configPath = path.join(root, "config", "cli-config.json");
+  mkdirSync(path.dirname(configPath), { recursive: true });
+  const statePath = defaultTuiStatePath(configPath);
+  try {
+    assert.deepEqual(normalizeViewOrder(["dashboard", "projects", "files"], ["files", "files", "unknown"]), [
+      "files", "dashboard", "projects"
+    ]);
+    assert.deepEqual(reorderItems(["dashboard", "projects", "files"], 0, 2), ["projects", "files", "dashboard"]);
+    saveTuiState(statePath, {
+      active_view: "files",
+      view_order: ["files", "dashboard", "projects"],
+      recent_directories: [project],
+      last_directory: project
+    });
+    const loaded = loadTuiState(statePath, {
+      allViewIds: ["dashboard", "projects", "files"],
+      recentDirectories: [root]
+    });
+    assert.equal(loaded.active_view, "files");
+    assert.deepEqual(loaded.view_order, ["files", "dashboard", "projects"]);
+    assert.equal(loaded.last_directory, project);
+    assert.deepEqual(loaded.recent_directories.slice(0, 2), [project, root]);
+    assert.equal(JSON.parse(readFileSync(statePath, "utf8")).schema, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("folder picker lists only directories with parent, recent, and select actions", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "lca-folder-picker-"));
+  const alpha = path.join(root, "alpha");
+  const beta = path.join(root, "beta2");
+  const recent = path.join(root, "recent");
+  mkdirSync(alpha);
+  mkdirSync(beta);
+  mkdirSync(recent);
+  writeFileSync(path.join(root, "file.txt"), "not a directory");
+  try {
+    const rows = await directoryPickerRows(root, { recentDirectories: [recent] });
+    assert.equal(rows[0].kind, "select");
+    assert.equal(rows[0].path, root);
+    assert.ok(rows.some((row) => row.kind === "parent"));
+    assert.ok(rows.some((row) => row.kind === "recent" && row.path === recent));
+    assert.deepEqual(rows.filter((row) => row.kind === "directory").map((row) => row.name), ["alpha", "beta2", "recent"]);
+    assert.equal(rows.some((row) => row.label.includes("file.txt")), false);
+    assert.equal(nextPickerDirectory(rows.find((row) => row.name === "alpha"), root), alpha);
+    assert.equal(nextPickerDirectory(rows[0], root), root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("mouse drag state reorders tabs live and persists the new order", () => {
+  const app = Object.create(LcaTuiApp.prototype);
+  app.views = [
+    { id: "dashboard" },
+    { id: "projects" },
+    { id: "files" }
+  ];
+  app.navDrag = { source: 1, current: 1, target: 1, moved: false, viewId: "projects" };
+  let rendered = 0;
+  let persisted = 0;
+  app.renderNavTabs = () => { rendered += 1; };
+  app.persistUiState = () => { persisted += 1; };
+
+  app.updateNavDrag(2);
+
+  assert.deepEqual(app.views.map((view) => view.id), ["dashboard", "files", "projects"]);
+  assert.equal(app.navDrag.current, 2);
+  assert.equal(app.navDrag.moved, true);
+  assert.equal(rendered, 1);
+  assert.equal(persisted, 1);
+});
+
+test("project add flow uses the folder picker instead of a typed path", async () => {
+  const picked = path.resolve("/tmp/lca-picked-project");
+  const calls = [];
+  const app = Object.create(LcaTuiApp.prototype);
+  app.primaryRoot = path.resolve("/tmp/current-project");
+  app.pickDirectory = async (title, initial) => {
+    calls.push({ type: "pick", title, initial });
+    return picked;
+  };
+  app.rememberDirectory = (directory) => calls.push({ type: "remember", directory });
+  app.launcher = {
+    async addProject(project) {
+      calls.push({ type: "add", project });
+      return { code: 0, stdout: "ok", stderr: "" };
+    }
+  };
+  app.client = { async close() { calls.push({ type: "close" }); } };
+  app.refreshProjects = async () => { calls.push({ type: "refresh" }); };
+
+  await app.addProject();
+
+  assert.deepEqual(calls, [
+    { type: "pick", title: "Add project", initial: app.primaryRoot },
+    { type: "remember", directory: picked },
+    { type: "add", project: picked },
+    { type: "close" },
+    { type: "refresh" }
+  ]);
 });
 
 test("compact facade calls preserve the 14-tool public contract", () => {

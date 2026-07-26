@@ -2,9 +2,19 @@
 // Copyright (c) 2026 Lương Duy
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import os from "node:os";
 import path from "node:path";
 
 import blessed from "neo-blessed";
+
+import { directoryPickerRows, nextPickerDirectory } from "./folder-picker.mjs";
+import {
+  defaultTuiStatePath,
+  loadTuiState,
+  normalizeViewOrder,
+  reorderItems,
+  saveTuiState
+} from "./state.mjs";
 
 import {
   TUI_SHORTCUTS,
@@ -47,15 +57,25 @@ export class LcaTuiApp {
     this.version = options.version || "4.4.0-pro";
     this.repoRoot = path.resolve(options.repoRoot);
     this.configPath = path.resolve(options.configPath);
+    this.statePath = path.resolve(options.statePath || defaultTuiStatePath(this.configPath));
     this.logPaths = options.logPaths || {};
-    this.activeView = "dashboard";
+    const storedState = loadTuiState(this.statePath, {
+      allViewIds: TUI_VIEWS.map((view) => view.id),
+      recentDirectories: [options.workspace, this.repoRoot, process.cwd()].filter(Boolean)
+    });
+    this.views = storedState.view_order
+      .map((id) => TUI_VIEWS.find((view) => view.id === id))
+      .filter(Boolean);
+    this.recentDirectories = storedState.recent_directories;
+    this.activeView = this.views.some((view) => view.id === storedState.active_view) ? storedState.active_view : "dashboard";
     this.primaryRoot = path.resolve(options.workspace || this.repoRoot);
-    this.currentPath = this.primaryRoot;
+    this.currentPath = path.resolve(storedState.last_directory || this.primaryRoot);
     this.searchRoot = this.primaryRoot;
     this.gitRoot = this.primaryRoot;
     this.rows = [];
     this.rowHandler = null;
     this.actionButtons = [];
+    this.actionShortcuts = new Map();
     this.commandHistory = [];
     this.lastSearch = "";
     this.searchRegex = false;
@@ -70,6 +90,9 @@ export class LcaTuiApp {
     this.refreshTimer = null;
     this.focusIndex = 0;
     this.ignoreNextListSelect = false;
+    this.navDrag = null;
+    this.navClickGuardUntil = 0;
+    this.suppressNextNavSelect = false;
 
     this.screen = blessed.screen({
       smartCSR: true,
@@ -86,11 +109,11 @@ export class LcaTuiApp {
   }
 
   async run() {
-    this.nav.select(0);
+    this.nav.select(Math.max(0, this.views.findIndex((view) => view.id === this.activeView)));
     this.nav.focus();
     this.updateHeader({ status: "connecting" });
     this.screen.render();
-    await this.switchView("dashboard");
+    await this.switchView(this.activeView);
     this.refreshTimer = setInterval(() => void this.refreshHeader(), 10_000);
     this.refreshTimer.unref?.();
     await new Promise((resolve) => { this.resolveClose = resolve; });
@@ -115,7 +138,7 @@ export class LcaTuiApp {
       left: 0,
       width: 24,
       bottom: 2,
-      label: " Views ",
+      label: " Tabs · drag to reorder ",
       border: { type: "line" },
       tags: true,
       keys: true,
@@ -123,7 +146,7 @@ export class LcaTuiApp {
       mouse: true,
       scrollable: true,
       alwaysScroll: true,
-      items: TUI_VIEWS.map((view) => `${view.icon}  ${view.label}  {gray-fg}${view.key}{/gray-fg}`),
+      items: this.views.map((view) => `${view.icon}  ${view.label}  {gray-fg}${view.key}{/gray-fg}`),
       scrollbar: { ch: "▐", track: { bg: THEME.panel }, style: { bg: THEME.accent } },
       style: {
         bg: THEME.panel,
@@ -213,21 +236,18 @@ export class LcaTuiApp {
       tags: true,
       padding: { left: 1, right: 1 },
       style: { bg: THEME.panelAlt, fg: THEME.muted },
-      content: " q quit   r refresh   Ctrl+P palette   ? help   mouse enabled"
+      content: " q quit   r refresh   Ctrl+P palette   Ctrl+B folders   drag tabs   ? help"
     });
 
     this.nav.on("select", (_item, index) => {
-      if (this.ignoreNextListSelect) {
-        this.ignoreNextListSelect = false;
+      if (this.suppressNextNavSelect) {
+        this.suppressNextNavSelect = false;
         return;
       }
-      const view = TUI_VIEWS[index];
+      const view = this.views[index];
       if (view) void this.switchView(view.id);
     });
-    this.attachSingleClickHandlers(this.nav, (index) => {
-      const view = TUI_VIEWS[index];
-      if (view) return this.switchView(view.id);
-    });
+    this.bindNavTabHandlers();
     this.list.on("select", (_item, index) => {
       if (this.ignoreNextListSelect) {
         this.ignoreNextListSelect = false;
@@ -237,6 +257,21 @@ export class LcaTuiApp {
     });
     this.list.on("select item", (_item, index) => this.updateSelectedRow(index));
     this.list.on("keypress", () => this.updateSelectedRow(this.list.selected));
+    this.screen.on("mousemove", (data) => {
+      const index = this.navIndexFromMouse(data);
+      if (index >= 0) this.updateNavDrag(index);
+    });
+    this.screen.on("mouseup", (data) => {
+      if (!this.navDrag) return;
+      const index = this.navIndexFromMouse(data);
+      this.finishNavDrag(index >= 0 ? index : this.navDrag.target);
+    });
+    this.screen.program.on("mouse", (data) => {
+      if (!this.navDrag) return;
+      const index = this.navIndexFromMouse(data);
+      if (data.action === "mousemove" && index >= 0) this.updateNavDrag(index);
+      if (data.action === "mouseup") this.finishNavDrag(index >= 0 ? index : this.navDrag.target);
+    });
   }
 
   bindGlobalKeys() {
@@ -258,6 +293,26 @@ export class LcaTuiApp {
     });
     this.screen.key(["S-tab"], () => {
       if (!this.modalOpen) this.cycleFocus(-1);
+    });
+    this.screen.key(["M-up"], () => {
+      if (!this.modalOpen) this.moveActiveTab(-1);
+    });
+    this.screen.key(["M-down"], () => {
+      if (!this.modalOpen) this.moveActiveTab(1);
+    });
+    this.screen.key(["C-b"], () => {
+      if (!this.modalOpen) void this.browseFolder();
+    });
+    this.screen.on("keypress", (character, key = {}) => {
+      if (this.modalOpen) return;
+      const candidates = [character, key.full, key.sequence, key.name]
+        .filter((value) => typeof value === "string" && value.length > 0);
+      for (const candidate of candidates) {
+        const action = this.actionShortcuts.get(candidate);
+        if (!action) continue;
+        void this.runBusy(action.label, action.handler);
+        break;
+      }
     });
     for (const view of TUI_VIEWS) {
       if (view.key === "/") continue;
@@ -281,12 +336,16 @@ export class LcaTuiApp {
   }
 
   async switchView(id) {
-    const index = TUI_VIEWS.findIndex((view) => view.id === id);
+    const index = this.views.findIndex((view) => view.id === id);
     if (index < 0) return;
+    const view = this.views[index];
     this.activeView = id;
+    this.persistUiState();
+    this.suppressNextNavSelect = true;
     this.nav.select(index);
-    this.footer.setContent(` {bold}${TUI_VIEWS[index].label}{/bold}   q quit   r refresh   Ctrl+P palette   Tab focus   mouse enabled`);
-    this.setStatus(`Loading ${TUI_VIEWS[index].label}…`);
+    setImmediate(() => { this.suppressNextNavSelect = false; });
+    this.footer.setContent(` {bold}${view.label}{/bold}   q quit   r refresh   Ctrl+P palette   Ctrl+B browse   Alt+↑/↓ move tab`);
+    this.setStatus(`Loading ${view.label}…`);
     await this.refreshActiveView();
   }
 
@@ -357,13 +416,14 @@ export class LcaTuiApp {
 
   setStatus(message, error = false) {
     const color = error ? "red-fg" : "gray-fg";
-    this.footer.setContent(` {${color}}${escapeTags(message)}{/${color}}   q quit   r refresh   Ctrl+P palette   ? help`);
+    this.footer.setContent(` {${color}}${escapeTags(message)}{/${color}}   q quit   r refresh   Ctrl+P palette   Ctrl+B folders   ? help`);
     this.screen.render();
   }
 
   setActions(actions) {
     for (const button of this.actionButtons) button.destroy();
     this.actionButtons = [];
+    this.actionShortcuts.clear();
     let left = 1;
     for (const action of actions) {
       const label = action.key ? `${action.label} [${action.key}]` : action.label;
@@ -386,7 +446,7 @@ export class LcaTuiApp {
         }
       });
       button.on("press", () => void this.runBusy(action.label, action.handler));
-      if (action.key) button.key([action.key], () => void this.runBusy(action.label, action.handler));
+      if (action.key) this.actionShortcuts.set(action.key, action);
       this.actionButtons.push(button);
       left += width + 1;
       if (left > (this.screen.width || 120) - 30) break;
@@ -432,6 +492,129 @@ export class LcaTuiApp {
         });
       });
     }
+  }
+
+  navIndexFromMouse(data) {
+    const position = this.nav.lpos;
+    if (!position || !Number.isFinite(data?.x) || !Number.isFinite(data?.y)) return -1;
+    if (data.x <= position.xi || data.x >= position.xl || data.y <= position.yi || data.y >= position.yl) return -1;
+    const row = data.y - position.yi - 1 + (this.nav.childBase || 0);
+    return row >= 0 && row < this.views.length ? row : -1;
+  }
+
+  bindNavTabHandlers() {
+    for (const [index, item] of (this.nav.items || []).entries()) {
+      item.on("mousedown", () => {
+        if (this.navDrag && this.navDrag.current !== index) {
+          this.updateNavDrag(index);
+          return;
+        }
+        this.navDrag = { source: index, current: index, target: index, moved: false, viewId: this.views[index]?.id };
+        this.suppressNextNavSelect = true;
+        this.nav.select(index);
+        this.nav.focus();
+        this.nav.setLabel(" Tabs · release to drop ");
+        const view = this.views[index];
+        if (view && view.id !== this.activeView) void this.switchView(view.id);
+        this.screen.render();
+      });
+      item.on("mouseover", () => this.updateNavDrag(index));
+      item.on("mousemove", () => this.updateNavDrag(index));
+      item.on("click", () => {
+        if (Date.now() < this.navClickGuardUntil) return;
+        if (this.navDrag) {
+          this.finishNavDrag(this.navDrag.target);
+          return;
+        }
+        const view = this.views[index];
+        if (view) void this.switchView(view.id);
+      });
+    }
+  }
+
+  updateNavDrag(targetIndex) {
+    if (!this.navDrag || targetIndex < 0 || targetIndex >= this.views.length) return;
+    const currentIndex = this.navDrag.current;
+    this.navDrag.target = targetIndex;
+    if (currentIndex !== targetIndex) {
+      this.views = reorderItems(this.views, currentIndex, targetIndex);
+      this.navDrag.current = targetIndex;
+      this.navDrag.moved = true;
+      this.renderNavTabs();
+      this.persistUiState();
+    } else {
+      this.suppressNextNavSelect = true;
+      this.nav.select(targetIndex);
+      this.screen.render();
+    }
+  }
+
+  finishNavDrag() {
+    if (!this.navDrag) return;
+    const drag = this.navDrag;
+    this.navDrag = null;
+    this.navClickGuardUntil = Date.now() + 120;
+    this.nav.setLabel(" Tabs · drag to reorder ");
+    if (drag.moved) {
+      this.persistUiState();
+      this.setStatus(`Moved tab to position ${Math.max(1, drag.current + 1)}`);
+    } else if (drag.viewId) {
+      void this.switchView(drag.viewId);
+    }
+    setImmediate(() => { this.suppressNextNavSelect = false; });
+  }
+
+  reorderViewTabs(sourceIndex, targetIndex) {
+    this.views = reorderItems(this.views, sourceIndex, targetIndex);
+    this.renderNavTabs();
+    this.persistUiState();
+    this.setStatus(`Moved tab to position ${Math.max(1, targetIndex + 1)}`);
+  }
+
+  moveActiveTab(direction) {
+    const source = this.views.findIndex((view) => view.id === this.activeView);
+    if (source < 0) return;
+    const target = Math.max(0, Math.min(this.views.length - 1, source + direction));
+    if (source === target) return;
+    this.reorderViewTabs(source, target);
+    this.nav.focus();
+  }
+
+  resetTabOrder() {
+    const order = normalizeViewOrder(TUI_VIEWS.map((view) => view.id));
+    this.views = order.map((id) => TUI_VIEWS.find((view) => view.id === id)).filter(Boolean);
+    this.renderNavTabs();
+    this.persistUiState();
+    this.setStatus("Tab order reset");
+  }
+
+  renderNavTabs() {
+    this.nav.setItems(this.views.map((view) => `${view.icon}  ${view.label}  {gray-fg}${view.key}{/gray-fg}`));
+    this.bindNavTabHandlers();
+    const selected = Math.max(0, this.views.findIndex((view) => view.id === this.activeView));
+    this.suppressNextNavSelect = true;
+    this.nav.select(selected);
+    this.screen.render();
+    setImmediate(() => { this.suppressNextNavSelect = false; });
+  }
+
+  persistUiState() {
+    try {
+      saveTuiState(this.statePath, {
+        active_view: this.activeView,
+        view_order: this.views.map((view) => view.id),
+        recent_directories: this.recentDirectories,
+        last_directory: this.currentPath || this.primaryRoot
+      });
+    } catch {
+      // UI preferences are best-effort and must never make the TUI unusable.
+    }
+  }
+
+  rememberDirectory(directory) {
+    const resolved = path.resolve(directory);
+    this.recentDirectories = [resolved, ...this.recentDirectories.filter((item) => item !== resolved)].slice(0, 12);
+    this.persistUiState();
   }
 
   async handleRow(index) {
@@ -513,7 +696,7 @@ export class LcaTuiApp {
 
   async refreshProjects() {
     this.setActions([
-      { label: "Add", handler: () => this.addProject() },
+      { label: "Add Folder", key: "A", handler: () => this.addProject() },
       { label: "Set Primary", handler: () => this.setPrimaryProject() },
       { label: "Remove", handler: () => this.removeProject() },
       { label: "Open Files", handler: () => this.openSelectedProject() },
@@ -534,8 +717,9 @@ export class LcaTuiApp {
   }
 
   async addProject() {
-    const project = await this.prompt("Add project", "Absolute or relative directory", process.cwd());
+    const project = await this.pickDirectory("Add project", this.primaryRoot || process.cwd());
     if (!project) return;
+    this.rememberDirectory(project);
     const result = await this.launcher.addProject(project);
     if (result.code !== 0) throw new Error(result.stderr || result.stdout);
     await this.client.close();
@@ -566,6 +750,7 @@ export class LcaTuiApp {
     const row = this.selected();
     if (!row?.path) return;
     this.currentPath = path.resolve(row.path);
+    this.rememberDirectory(this.currentPath);
     await this.switchView("files");
   }
 
@@ -574,6 +759,7 @@ export class LcaTuiApp {
     this.setActions([
       { label: "Up", handler: () => this.goUpDirectory() },
       { label: "Primary", handler: () => { this.currentPath = this.primaryRoot; return this.refreshFiles(); } },
+      { label: "Browse Folder", key: "B", handler: () => this.browseFolder() },
       { label: "Open Path", handler: () => this.openPathPrompt() },
       { label: "Search Here", handler: () => { this.searchRoot = this.currentPath; return this.switchView("search").then(() => this.askSearch()); } },
       { label: "Refresh", handler: () => this.refreshFiles() }
@@ -588,6 +774,7 @@ export class LcaTuiApp {
     const target = resolveBackendPath(this.primaryRoot, row.path);
     if (row.type === "directory") {
       this.currentPath = target;
+      this.rememberDirectory(this.currentPath);
       await this.refreshFiles();
       return;
     }
@@ -602,6 +789,7 @@ export class LcaTuiApp {
     const stat = await this.client.data("workspace_read", "stat", { path: target });
     if (stat.type === "directory") {
       this.currentPath = target;
+      this.rememberDirectory(this.currentPath);
       await this.refreshFiles();
     } else {
       const file = await this.client.readFile(target);
@@ -611,7 +799,17 @@ export class LcaTuiApp {
 
   async goUpDirectory() {
     this.currentPath = path.dirname(this.currentPath);
+    this.rememberDirectory(this.currentPath);
     await this.refreshFiles();
+  }
+
+  async browseFolder(initial = this.currentPath || this.primaryRoot) {
+    const directory = await this.pickDirectory("Browse folders", initial);
+    if (!directory) return;
+    this.currentPath = path.resolve(directory);
+    this.rememberDirectory(this.currentPath);
+    if (this.activeView === "files") await this.refreshFiles();
+    else await this.switchView("files");
   }
 
   async refreshSearch() {
@@ -726,9 +924,10 @@ export class LcaTuiApp {
   }
 
   async changeGitRoot() {
-    const value = await this.prompt("Git repository", "Path", this.gitRoot);
+    const value = await this.pickDirectory("Git repository", this.gitRoot);
     if (!value) return;
     this.gitRoot = path.resolve(value);
+    this.rememberDirectory(this.gitRoot);
     await this.refreshGit();
   }
 
@@ -770,8 +969,11 @@ export class LcaTuiApp {
   }
 
   async changeCommandCwd() {
-    const value = await this.prompt("Command working directory", "Path", this.currentPath || this.primaryRoot);
-    if (value) this.currentPath = path.resolve(value);
+    const value = await this.pickDirectory("Command working directory", this.currentPath || this.primaryRoot);
+    if (value) {
+      this.currentPath = path.resolve(value);
+      this.rememberDirectory(this.currentPath);
+    }
     await this.refreshCommands();
   }
 
@@ -1075,8 +1277,12 @@ export class LcaTuiApp {
 
   async refreshHelp() {
     this.showDetailOnly();
-    this.setActions([{ label: "Dashboard", handler: () => this.switchView("dashboard") }]);
-    const featureLines = TUI_VIEWS.filter((view) => view.id !== "help").map((view) => `${view.icon} ${view.label.padEnd(16)} shortcut ${view.key}`);
+    this.setActions([
+      { label: "Dashboard", handler: () => this.switchView("dashboard") },
+      { label: "Browse Folder", handler: () => this.browseFolder() },
+      { label: "Reset Tabs", handler: () => this.resetTabOrder() }
+    ]);
+    const featureLines = this.views.filter((view) => view.id !== "help").map((view) => `${view.icon} ${view.label.padEnd(16)} shortcut ${view.key}`);
     const shortcutLines = TUI_SHORTCUTS.map(([key, description]) => `${key.padEnd(24)} ${description}`);
     this.setDetail("LCA TUI help", [
       "{bold}Feature screens{/bold}",
@@ -1089,6 +1295,8 @@ export class LcaTuiApp {
       "The TUI is a real compact MCP client. It auto-reconnects after project changes or server restarts.",
       "Closing the TUI does not stop the managed LCA server or tunnel.",
       "Project roots guide discovery and relative paths; absolute paths remain available.",
+      "Folder pickers browse the local machine directly, keep recent folders, and avoid typing long paths.",
+      "Sidebar tabs can be dragged or moved with Alt+Up/Down; their order persists in tui-state.json.",
       "The Tool Console exposes action discovery and raw JSON calls for the complete compact surface."
     ].join("\n"), { allowTags: true });
   }
@@ -1096,7 +1304,9 @@ export class LcaTuiApp {
   async showPalette() {
     this.modalOpen = true;
     const items = [
-      ...TUI_VIEWS.map((view) => ({ label: `${view.icon} ${view.label}`, run: () => this.switchView(view.id) })),
+      ...this.views.map((view) => ({ label: `${view.icon} ${view.label}`, run: () => this.switchView(view.id) })),
+      { label: "▣ Browse local folder", run: () => this.browseFolder() },
+      { label: "↕ Reset tab order", run: () => this.resetTabOrder() },
       { label: "↻ Refresh active screen", run: () => this.refreshActiveView() },
       { label: "▶ Start managed runtime", run: () => this.startRuntime() },
       { label: "■ Stop managed runtime", run: () => this.stopRuntime() },
@@ -1135,6 +1345,153 @@ export class LcaTuiApp {
     overlay.key(["escape", "q"], () => void finish());
     overlay.focus();
     this.screen.render();
+  }
+
+  pickDirectory(title, initial = this.primaryRoot) {
+    return new Promise((resolve) => {
+      this.modalOpen = true;
+      let current = path.resolve(initial || this.primaryRoot || process.cwd());
+      let rows = [];
+      let done = false;
+      let loading = false;
+      let ignoreNextSelect = false;
+      const box = blessed.box({
+        parent: this.screen,
+        top: "center",
+        left: "center",
+        width: "82%",
+        height: "82%",
+        label: ` ${title} `,
+        border: { type: "line" },
+        keys: true,
+        mouse: true,
+        style: { bg: THEME.panel, fg: THEME.text, border: { fg: THEME.accent }, label: { fg: THEME.accent2 } }
+      });
+      blessed.text({
+        parent: box,
+        top: 0,
+        left: 2,
+        right: 2,
+        height: 1,
+        content: "Navigate with mouse/Enter · Backspace goes up · Space selects current folder",
+        style: { fg: THEME.muted }
+      });
+      const pathInput = blessed.textbox({
+        parent: box,
+        top: 2,
+        left: 2,
+        right: 2,
+        height: 3,
+        border: { type: "line" },
+        value: current,
+        keys: true,
+        mouse: true,
+        inputOnFocus: true,
+        style: { bg: THEME.bg, fg: THEME.text, border: { fg: THEME.border }, focus: { border: { fg: THEME.accent } } }
+      });
+      const list = blessed.list({
+        parent: box,
+        top: 5,
+        left: 2,
+        right: 2,
+        bottom: 3,
+        label: " Folders ",
+        border: { type: "line" },
+        keys: true,
+        vi: true,
+        mouse: true,
+        scrollable: true,
+        alwaysScroll: true,
+        scrollbar: { ch: "▐", style: { bg: THEME.accent } },
+        style: {
+          bg: THEME.bg,
+          fg: THEME.text,
+          border: { fg: THEME.border },
+          selected: { bg: THEME.accent, fg: "black", bold: true },
+          item: { hover: { bg: THEME.panelAlt, fg: THEME.accent } },
+          label: { fg: THEME.accent2 }
+        }
+      });
+      const status = blessed.text({
+        parent: box,
+        bottom: 2,
+        left: 2,
+        right: 36,
+        height: 1,
+        content: "",
+        style: { fg: THEME.muted }
+      });
+      const select = modalButton(box, "Select", "center", -20, THEME.accent);
+      const home = modalButton(box, "Home", "center", -4, THEME.border);
+      const cancel = modalButton(box, "Cancel", "center", 10, THEME.border);
+
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        pathInput.cancel?.();
+        box.destroy();
+        this.modalOpen = false;
+        this.screen.render();
+        resolve(value);
+      };
+      const openRow = async (row) => {
+        if (!row || loading) return;
+        if (row.kind === "select") return finish(current);
+        await refresh(nextPickerDirectory(row, current));
+      };
+      const bindRows = () => {
+        for (const [index, item] of (list.items || []).entries()) {
+          item.on("mousedown", () => {
+            ignoreNextSelect = true;
+            list.select(index);
+            list.focus();
+            this.screen.render();
+            void Promise.resolve(openRow(rows[index])).finally(() => {
+              setImmediate(() => { ignoreNextSelect = false; });
+            });
+          });
+        }
+      };
+      const refresh = async (directory) => {
+        if (loading || done) return;
+        loading = true;
+        status.setContent("Loading folders…");
+        this.screen.render();
+        try {
+          const next = path.resolve(directory);
+          const nextRows = await directoryPickerRows(next, { recentDirectories: this.recentDirectories });
+          current = next;
+          rows = nextRows;
+          pathInput.setValue(current);
+          list.setItems(rows.map((row) => escapeTags(row.label)));
+          bindRows();
+          if (rows.length) list.select(0);
+          status.setContent(`${rows.filter((row) => row.kind === "directory").length} subfolders`);
+          list.focus();
+        } catch (error) {
+          status.setContent(`Unable to open: ${escapeTags(error.message)}`);
+        } finally {
+          loading = false;
+          this.screen.render();
+        }
+      };
+
+      list.on("select", (_item, index) => {
+        if (ignoreNextSelect) return;
+        void openRow(rows[index]);
+      });
+      list.key(["backspace", "left"], () => void refresh(path.dirname(current)));
+      list.key(["space", "s"], () => finish(current));
+      list.key(["escape", "q"], () => finish(null));
+      pathInput.on("submit", (value) => void refresh(value || current));
+      pathInput.key(["escape"], () => { pathInput.cancel?.(); list.focus(); this.screen.render(); });
+      select.on("press", () => finish(current));
+      home.on("press", () => void refresh(os.homedir()));
+      cancel.on("press", () => finish(null));
+      box.key(["escape"], () => finish(null));
+      box.key(["C-l"], () => pathInput.focus());
+      void refresh(current);
+    });
   }
 
   prompt(title, label, initial = "") {
