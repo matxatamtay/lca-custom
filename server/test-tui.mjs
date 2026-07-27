@@ -24,9 +24,22 @@ import { LcaTuiApp } from "./tui/app.mjs";
 import { LcaTuiClient } from "./tui/client.mjs";
 import { launcherInvocation } from "./tui/launcher-bridge.mjs";
 import { directoryPickerRows, nextPickerDirectory } from "./tui/folder-picker.mjs";
+import { fuzzyFilter, fuzzyScore } from "./tui/palette.mjs";
 import {
+  closeResourceTab,
+  createResourceTab,
+  nextResourceTabId,
+  normalizeResourceTabs,
+  toggleResourceTabPinned,
+  updateWorkspaceTabLocation,
+  upsertResourceTab
+} from "./tui/resource-tabs.mjs";
+import {
+  appendCommandHistory,
+  commandHistoryScope,
   defaultTuiStatePath,
   loadTuiState,
+  normalizePaneSplitPercent,
   normalizeViewOrder,
   reorderItems,
   saveTuiState
@@ -62,17 +75,96 @@ test("tab order can be normalized, reordered, and persisted", () => {
       active_view: "files",
       view_order: ["files", "dashboard", "projects"],
       recent_directories: [project],
-      last_directory: project
+      last_directory: project,
+      pane_split_percent: 57,
+      resource_tabs: [createResourceTab("workspace", project, { pinned: true })],
+      active_resource_tab: `workspace:${project}`,
+      command_histories: {
+        [project]: [{ command: "git status", cwd: project, ok: true, output: "clean", created_at: "2026-07-27T00:00:00.000Z" }]
+      }
     });
     const loaded = loadTuiState(statePath, {
       allViewIds: ["dashboard", "projects", "files"],
+      fallbackWorkspace: project,
       recentDirectories: [root]
     });
     assert.equal(loaded.active_view, "files");
     assert.deepEqual(loaded.view_order, ["files", "dashboard", "projects"]);
     assert.equal(loaded.last_directory, project);
     assert.deepEqual(loaded.recent_directories.slice(0, 2), [project, root]);
-    assert.equal(JSON.parse(readFileSync(statePath, "utf8")).schema, 1);
+    assert.equal(loaded.pane_split_percent, 57);
+    assert.equal(loaded.resource_tabs[0].pinned, true);
+    assert.equal(loaded.command_histories[project][0].command, "git status");
+    assert.equal(JSON.parse(readFileSync(statePath, "utf8")).schema, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace and file tabs support pin, close, switching, and directory state", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "lca-resource-tabs-"));
+  const nested = path.join(root, "nested");
+  const file = path.join(nested, "index.mjs");
+  mkdirSync(nested);
+  writeFileSync(file, "export default true;\n");
+  try {
+    const workspace = createResourceTab("workspace", root, { current_path: nested });
+    const sourceFile = createResourceTab("file", file);
+    let tabs = normalizeResourceTabs([workspace, sourceFile], root);
+    assert.equal(tabs.length, 2);
+    assert.equal(tabs[0].current_path, nested);
+    tabs = upsertResourceTab(tabs, { ...sourceFile, pinned: true });
+    assert.equal(tabs[0].id, sourceFile.id);
+    assert.equal(tabs[0].pinned, true);
+    assert.equal(closeResourceTab(tabs, sourceFile.id, root).reason, "pinned");
+    tabs = toggleResourceTabPinned(tabs, sourceFile.id);
+    assert.equal(tabs.find((tab) => tab.id === sourceFile.id).pinned, false);
+    tabs = updateWorkspaceTabLocation(tabs, workspace.id, root);
+    assert.equal(tabs.find((tab) => tab.id === workspace.id).current_path, root);
+    assert.equal(nextResourceTabId(tabs, workspace.id, 1), sourceFile.id);
+    const closed = closeResourceTab(tabs, sourceFile.id, root);
+    assert.equal(closed.closed, true);
+    assert.equal(closed.tabs.some((tab) => tab.kind === "workspace"), true);
+
+    const extraFiles = ["one.js", "two.js", "three.js"].map((name) => path.join(nested, name));
+    for (const extra of extraFiles) writeFileSync(extra, "// tab\n");
+    let bounded = [createResourceTab("workspace", root, { pinned: true })];
+    for (const extra of extraFiles) bounded = upsertResourceTab(bounded, createResourceTab("file", extra), 3);
+    assert.equal(bounded.length, 3);
+    assert.equal(bounded.some((tab) => tab.kind === "workspace" && tab.pinned), true);
+    assert.equal(bounded.some((tab) => tab.path === extraFiles.at(-1)), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fuzzy command palette ranks direct and boundary matches", () => {
+  const items = [
+    { label: "Start managed runtime", searchText: "start managed runtime server" },
+    { label: "Browse local folder", searchText: "browse local folder directory" },
+    { label: "Build mandatory context", searchText: "build mandatory context codegraph" }
+  ];
+  assert.ok(fuzzyScore("browse local folder", "brlf") > fuzzyScore("build mandatory context", "brlf"));
+  assert.deepEqual(fuzzyFilter(items, "folder").map((item) => item.label), ["Browse local folder"]);
+  assert.equal(fuzzyFilter(items, "bmc")[0].label, "Build mandatory context");
+});
+
+test("pane split and command history stay bounded per project", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "lca-command-history-"));
+  const projectA = path.join(root, "a");
+  const projectB = path.join(root, "b");
+  mkdirSync(projectA);
+  mkdirSync(projectB);
+  try {
+    assert.equal(normalizePaneSplitPercent(5), 22);
+    assert.equal(normalizePaneSplitPercent(99), 76);
+    assert.equal(commandHistoryScope(projectA), projectA);
+    let histories = appendCommandHistory({}, projectA, { command: "npm test", cwd: projectA, ok: true, output: "pass" }, { maxEntries: 2 });
+    histories = appendCommandHistory(histories, projectA, { command: "npm run build", cwd: projectA, ok: true, output: "built" }, { maxEntries: 2 });
+    histories = appendCommandHistory(histories, projectA, { command: "git status", cwd: projectA, ok: true, output: "clean" }, { maxEntries: 2 });
+    histories = appendCommandHistory(histories, projectB, { command: "cargo test", cwd: projectB, ok: false, output: "failed" }, { maxEntries: 2 });
+    assert.deepEqual(histories[projectA].map((item) => item.command), ["npm run build", "git status"]);
+    assert.deepEqual(histories[projectB].map((item) => item.command), ["cargo test"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -194,9 +286,10 @@ test("backend paths resolve from the primary workspace without duplicating the c
   assert.equal(resolveBackendPath(root, "/tmp/external.txt"), path.resolve("/tmp/external.txt"));
 });
 
-test("file and search row handlers round-trip backend paths from the primary workspace", async () => {
+test("file and search row handlers open resource tabs with primary-root paths", async () => {
   const root = path.resolve("/tmp/lca-root");
   const reads = [];
+  const opened = [];
   const app = Object.create(LcaTuiApp.prototype);
   app.primaryRoot = root;
   app.currentPath = path.join(root, "evals");
@@ -207,14 +300,16 @@ test("file and search row handlers round-trip backend paths from the primary wor
       return { content: "ok" };
     }
   };
+  app.openFileTab = (file) => { opened.push(file); };
+  app.refreshFiles = async () => {};
   app.setDetail = () => {};
 
   await app.openFileRow({ path: "evals/run.mjs", type: "file" });
   await app.openSearchMatch({ path: "evals/run.mjs", line: 12 });
 
+  assert.deepEqual(opened, [path.join(root, "evals", "run.mjs"), path.join(root, "evals", "run.mjs")]);
   assert.equal(reads[0].file, path.join(root, "evals", "run.mjs"));
-  assert.equal(reads[1].file, path.join(root, "evals", "run.mjs"));
-  assert.deepEqual(reads[1].options, { startLine: 1, lineCount: 80 });
+  assert.deepEqual(reads[0].options, { startLine: 1, lineCount: 80 });
 });
 
 test("TUI client routes all operations through compact facades", async () => {

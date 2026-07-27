@@ -119,8 +119,12 @@ def main():
         picker_clicked = False
         picker_closed = False
         reordered = False
+        files_opened = False
+        pane_resized = False
+        palette_opened = False
+        palette_closed = False
         quit_sent = False
-        while time.time() - started < 18:
+        while time.time() - started < 26:
             readable, _, _ = select.select([master], [], [], 0.15)
             if readable:
                 try:
@@ -146,7 +150,21 @@ def main():
                 # Alt+Down is the deterministic fallback for terminals without drag motion.
                 os.write(master, b"\x1b[1;3B")
                 reordered = True
-            if elapsed > 14 and not quit_sent:
+            if elapsed > 13 and reordered and not files_opened:
+                os.write(master, b"f")
+                files_opened = True
+            if elapsed > 16 and files_opened and not pane_resized:
+                os.write(master, b"\x1b[1;3C")
+                pane_resized = True
+            if elapsed > 18 and pane_resized and not palette_opened:
+                os.write(master, b"\x10")
+                palette_opened = True
+            if elapsed > 20 and palette_opened and not palette_closed:
+                os.write(master, b"folder")
+                time.sleep(0.25)
+                os.write(master, b"\x1b")
+                palette_closed = True
+            if elapsed > 23 and not quit_sent:
                 os.write(master, b"q")
                 quit_sent = True
             if tui.poll() is not None:
@@ -171,7 +189,10 @@ def main():
             "projects_click": "Set Primary" in plain and ("OpenFiles" in plain or "Open Files" in plain) and "Refreshing projects" in plain,
             "folder_picker": "Select this folder" in plain and "Navigate with mouse/Enter" in plain,
             "tab_reorder": state.get("view_order", [])[:3] == ["dashboard", "files", "projects"],
-            "state_saved": state.get("active_view") in {"projects", "files"},
+            "resource_tabs": "Workspaces / Files" in plain and len(state.get("resource_tabs", [])) >= 1,
+            "pane_resize": state.get("pane_split_percent", 40) > 40,
+            "fuzzy_palette": ("Command palette" in plain or "Commandpalette" in plain) and ("fuzzy search" in plain or "fuzzysearch" in plain) and "Results" in plain,
+            "state_saved": state.get("active_view") == "files" and state.get("schema") == 2,
             "workspace": str(workspace) in plain,
             "error": "ERROR:" in plain,
             "rendered_bytes": len(buffer)
@@ -183,6 +204,9 @@ def main():
             receipt["projects_click"],
             receipt["folder_picker"],
             receipt["tab_reorder"],
+            receipt["resource_tabs"],
+            receipt["pane_resize"],
+            receipt["fuzzy_palette"],
             receipt["state_saved"],
             receipt["workspace"],
             not receipt["error"]
