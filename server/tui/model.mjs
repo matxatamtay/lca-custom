@@ -24,10 +24,15 @@ export const TUI_VIEWS = Object.freeze([
 ]);
 
 export const TUI_SHORTCUTS = Object.freeze([
-  ["Mouse", "click navigation, rows, buttons, and scrollbars"],
+  ["Mouse", "click rows/buttons; drag sidebar tabs to reorder them"],
   ["↑/↓ or j/k", "move in the focused list"],
   ["Enter", "open the selected row"],
   ["Tab / Shift+Tab", "cycle focus"],
+  ["Alt+↑ / Alt+↓", "move the active sidebar tab"],
+  ["Ctrl+PageUp/PageDown", "switch workspace/file tabs"],
+  ["Ctrl+W", "close the active unpinned workspace/file tab"],
+  ["Alt+← / Alt+→", "resize list and detail panes"],
+  ["Ctrl+B", "open the local folder picker"],
   ["r", "refresh the active screen"],
   ["Ctrl+P", "open the command palette"],
   ["/", "open Search"],

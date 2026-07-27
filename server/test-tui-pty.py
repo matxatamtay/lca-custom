@@ -116,8 +116,15 @@ def main():
         buffer = bytearray()
         started = time.time()
         clicked = False
+        picker_clicked = False
+        picker_closed = False
+        reordered = False
+        files_opened = False
+        pane_resized = False
+        palette_opened = False
+        palette_closed = False
         quit_sent = False
-        while time.time() - started < 14:
+        while time.time() - started < 26:
             readable, _, _ = select.select([master], [], [], 0.15)
             if readable:
                 try:
@@ -129,10 +136,35 @@ def main():
                 buffer.extend(chunk)
             elapsed = time.time() - started
             if elapsed > 4 and not clicked:
-                # One SGR left click on the Projects row in the navigation list.
+                # One SGR left click on the Projects tab in the navigation list.
                 os.write(master, b"\x1b[<0;6;6M\x1b[<0;6;6m")
                 clicked = True
-            if elapsed > 8 and not quit_sent:
+            if elapsed > 6 and clicked and not picker_clicked:
+                # Use the action shortcut after reaching Projects; the tab itself was mouse-clicked.
+                os.write(master, b"A")
+                picker_clicked = True
+            if elapsed > 9 and picker_clicked and not picker_closed:
+                os.write(master, b"\x1b")
+                picker_closed = True
+            if elapsed > 11 and picker_closed and not reordered:
+                # Alt+Down is the deterministic fallback for terminals without drag motion.
+                os.write(master, b"\x1b[1;3B")
+                reordered = True
+            if elapsed > 13 and reordered and not files_opened:
+                os.write(master, b"f")
+                files_opened = True
+            if elapsed > 16 and files_opened and not pane_resized:
+                os.write(master, b"\x1b[1;3C")
+                pane_resized = True
+            if elapsed > 18 and pane_resized and not palette_opened:
+                os.write(master, b"\x10")
+                palette_opened = True
+            if elapsed > 20 and palette_opened and not palette_closed:
+                os.write(master, b"folder")
+                time.sleep(0.25)
+                os.write(master, b"\x1b")
+                palette_closed = True
+            if elapsed > 23 and not quit_sent:
                 os.write(master, b"q")
                 quit_sent = True
             if tui.poll() is not None:
@@ -148,26 +180,47 @@ def main():
 
         raw = bytes(buffer).decode("utf-8", "replace")
         plain = strip_terminal(raw)
+        state_path = config_dir / "tui-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
         receipt = {
             "exit_code": tui.returncode,
             "mouse_protocol": any(sequence in raw for sequence in ("\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h")),
             "dashboard": "Dashboard" in plain,
-            "projects_click": "Set Primary" in plain and "OpenFiles" in plain and "Refreshing projects" in plain,
+            "projects_click": "Set Primary" in plain and ("OpenFiles" in plain or "Open Files" in plain) and "Refreshing projects" in plain,
+            "folder_picker": "Select this folder" in plain and "Navigate with mouse/Enter" in plain,
+            "tab_reorder": state.get("view_order", [])[:3] == ["dashboard", "files", "projects"],
+            "resource_tabs": "Workspaces / Files" in plain and len(state.get("resource_tabs", [])) >= 1,
+            "pane_resize": state.get("pane_split_percent", 40) > 40,
+            "fuzzy_palette": ("Command palette" in plain or "Commandpalette" in plain) and ("fuzzy search" in plain or "fuzzysearch" in plain) and "Results" in plain,
+            "state_saved": state.get("active_view") == "files" and state.get("schema") == 2,
             "workspace": str(workspace) in plain,
             "error": "ERROR:" in plain,
             "rendered_bytes": len(buffer)
         }
-        print(json.dumps(receipt, indent=2))
-        if not all([
+        ok = all([
             receipt["exit_code"] == 0,
             receipt["mouse_protocol"],
             receipt["dashboard"],
             receipt["projects_click"],
+            receipt["folder_picker"],
+            receipt["tab_reorder"],
+            receipt["resource_tabs"],
+            receipt["pane_resize"],
+            receipt["fuzzy_palette"],
+            receipt["state_saved"],
             receipt["workspace"],
             not receipt["error"]
-        ]):
-            return 1
-        return 0
+        ])
+        if not ok:
+            receipt["debug_state"] = state
+            receipt["debug_markers"] = {
+                "projects": "Projects" in plain,
+                "add_folder": "Add Folder" in plain or "AddFolder" in plain,
+                "refreshing_projects": "Refreshing projects" in plain,
+                "select_folder": "Select this folder" in plain
+            }
+        print(json.dumps(receipt, indent=2))
+        return 0 if ok else 1
     finally:
         if master is not None:
             try:
