@@ -5,7 +5,7 @@
 The refactor is complete against the agreed product contract:
 
 - Node.js remains the runtime.
-- ChatGPT sees exactly fourteen compact tools.
+- ChatGPT sees exactly fifteen compact tools.
 - There is no model-facing legacy surface.
 - There are no mode, policy, approval, command-denylist, or root-authorization layers.
 - Tool actions execute directly as the local user.

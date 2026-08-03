@@ -201,7 +201,7 @@ try {
   const workspaceContextTool = tools.tools?.find((t) => t.name === "workspace_context");
   const workspaceStatusTool = tools.tools?.find((t) => t.name === "workspace_status");
   const lcaInfo = await callJson(client, "lca", {});
-  check("model-facing surface stays at fourteen tools", toolNames.length === 14, JSON.stringify(toolNames));
+  check("model-facing surface stays at fifteen tools", toolNames.length === 15, JSON.stringify(toolNames));
   check("workspace_status facade is listed", Boolean(workspaceStatusTool), JSON.stringify(toolNames));
   check("legacy lca alias is hidden from the model", !toolNames.includes("lca"), JSON.stringify(toolNames));
   check("workspace_context tool is listed", Boolean(workspaceContextTool), JSON.stringify(toolNames));

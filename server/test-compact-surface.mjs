@@ -130,7 +130,7 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 136, `expected complete internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 148, `expected complete internal backend coverage, received ${assigned.size} actions`);
   for (const directName of DIRECT_NAMES) assert.ok(compactNames.includes(directName), `${directName} must remain direct`);
 
   const writeResult = await client.callTool({
@@ -144,6 +144,12 @@ try {
     arguments: { action: "one", arguments: { path: "compact.txt" } }
   });
   assert.equal(parseJsonResult(readResult).content, "compact facade works\n");
+
+  const memoryStatus = parseJsonResult(await client.callTool({
+    name: "workspace_read",
+    arguments: { action: "memory" }
+  }));
+  assert.equal(memoryStatus.obsidian_compatible, true, "persistent memory must be reachable through workspace_read");
 
   const blocked = await client.callTool({
     name: "workspace_read",

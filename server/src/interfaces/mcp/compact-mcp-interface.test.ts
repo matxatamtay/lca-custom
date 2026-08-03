@@ -39,6 +39,15 @@ test("every alias resolves to a tool allowed by its facade", () => {
   }
 });
 
+
+test("persistent task protocol actions are reachable through compact facades", () => {
+  assert.equal(resolveCompactAction("workspace_read", "memory", backendTools), "memory_status");
+  assert.equal(resolveCompactAction("workspace_read", "handoff", backendTools), "handoff_packet");
+  assert.equal(resolveCompactAction("workspace_edit", "pin_context", backendTools), "context_pin");
+  assert.equal(resolveCompactAction("workspace_edit", "scope", backendTools), "scope_guard");
+  assert.equal(resolveCompactAction("workspace_exec", "parallel", backendTools), "parallel_tasks");
+});
+
 test("unknown and cross-facade actions are rejected", () => {
   assert.throws(
     () => resolveCompactAction("workspace_read", "run_command", backendTools),

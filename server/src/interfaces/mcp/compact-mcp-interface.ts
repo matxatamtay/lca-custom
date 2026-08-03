@@ -50,8 +50,24 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   },
   workspace_read: {
     defaultAction: "read_many",
-    aliases: { one: "read_file", many: "read_many", stat: "stat_path", list: "list_files", notes: "list_notes", resume: "resume" },
-    exact: new Set(["read_file", "read_many", "stat_path", "list_files", "list_notes", "resume"])
+    aliases: {
+      one: "read_file",
+      many: "read_many",
+      stat: "stat_path",
+      list: "list_files",
+      notes: "list_notes",
+      resume: "resume",
+      memory: "memory_status",
+      contexts: "context_list",
+      context: "context_explain",
+      brief: "task_brief_get",
+      intent: "intent_check",
+      handoff: "handoff_packet"
+    },
+    exact: new Set([
+      "read_file", "read_many", "stat_path", "list_files", "list_notes", "resume",
+      "memory_status", "context_list", "context_explain", "task_brief_get", "intent_check", "handoff_packet"
+    ])
   },
   workspace_edit: {
     defaultAction: "apply_patch",
@@ -69,14 +85,23 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       checkpoint: "checkpoint",
       decision: "decision_log",
       plan: "task_plan",
-      state: "task_state"
+      state: "task_state",
+      pin_context: "context_pin",
+      remove_context: "context_remove",
+      brief: "task_brief",
+      scope: "scope_guard",
+      knowledge: "knowledge_state"
     },
-    exact: new Set(["apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file", "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state"])
+    exact: new Set([
+      "apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file",
+      "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state",
+      "context_pin", "context_remove", "task_brief", "scope_guard", "knowledge_state"
+    ])
   },
   workspace_exec: {
     defaultAction: "run_commands",
-    aliases: { one: "run_command", many: "run_commands" },
-    exact: new Set(["run_command", "run_commands"])
+    aliases: { one: "run_command", many: "run_commands", parallel: "parallel_tasks" },
+    exact: new Set(["run_command", "run_commands", "parallel_tasks"])
   },
   workspace_process: {
     defaultAction: "proc_list",
@@ -146,9 +171,9 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
 
 export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, string>> = Object.freeze({
   workspace_search: "Search files, text, symbols, repository maps, graph-oriented indexes, and TODOs. Common actions: search, text, files, symbols, map, todos.",
-  workspace_read: "Read one or many files, stat paths, list files or notes, and resume checkpoints. Common actions: one, many, stat, list, notes, resume.",
-  workspace_edit: "Apply, preview, validate, and undo patches; write, replace, move, or delete paths; maintain notes and task state.",
-  workspace_exec: "Run bounded foreground commands. Common actions: one or many.",
+  workspace_read: "Read files, notes, persistent context, task briefs, intent checks, handoff packets, and checkpoints.",
+  workspace_edit: "Edit files and maintain notes, persistent context, task briefs, scope guards, and typed task knowledge.",
+  workspace_exec: "Run bounded foreground commands or dependency-aware parallel task lanes.",
   workspace_process: "Start, list, inspect output from, and stop managed background processes.",
   workspace_git: "Run Git commands and return compact status or diffs.",
   workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, and session-report gates.",

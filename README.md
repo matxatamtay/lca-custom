@@ -12,7 +12,7 @@ Trusted local MCP execution engine for ChatGPT with mandatory CodeGraph and Agen
 
 ## What ships
 
-ChatGPT sees exactly fourteen tools:
+ChatGPT sees exactly fifteen tools:
 
 ```text
 workspace_context  workspace_search  workspace_read   workspace_edit
@@ -102,6 +102,12 @@ Figma, DBeaver, Bruno, and the remote Coolify MCP share persistent Streamable HT
 
 More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITECTURE.md).
 
+## Persistent memory and task protocol
+
+LCA includes an Obsidian-compatible Markdown vault for durable project context and structured task handoffs. Backend actions include `context_pin`, `context_list`, `context_explain`, `context_remove`, `task_brief`, `intent_check`, `scope_guard`, `knowledge_state`, `parallel_tasks`, `handoff_packet`, `checkpoint`, and `resume`.
+
+`parallel_tasks` runs bounded dependency-aware command lanes; it coordinates shell work and does not spawn additional model agents. Scope guards are opt-in per task, and command/write results include compact result digests. See [Persistent Memory and Shared Task Protocol](docs/PERSISTENT_MEMORY_AND_TASK_PROTOCOL.md).
+
 ## Desktop integrations
 
 ### Figma
@@ -151,7 +157,7 @@ Historical baseline versus the compact runtime:
 
 | Metric | Before | Current target |
 |---|---:|---:|
-| Model-facing tools | 143 | 14 |
+| Model-facing tools | 143 | 15 |
 | `tools/list` bytes | 91,420 | under 20,000 |
 | Server instruction chars | 4,458 | under 1,000 |
 

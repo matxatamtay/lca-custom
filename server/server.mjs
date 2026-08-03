@@ -29,6 +29,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { summarizeArgs } from "./core/redaction.mjs";
 import {
+  WorkspaceProtocol,
+  buildResultDigest,
+  defaultMemoryVault,
+  validateTaskDag
+} from "./core/workspace-protocol.mjs";
+import {
   DEFAULT_FIGMA_DESKTOP_MCP_URL,
   callFigmaDesktopTool,
   closeFigmaDesktopClients,
@@ -204,6 +210,13 @@ const BACKUPS_DIR = path.resolve(WORKSPACE_DATA_DIR, "backups");
 const AGENT_STATE_DIR = path.join(PRIMARY_ROOT, ".agent", "state");
 const TASK_PLAN_PATH = path.join(AGENT_STATE_DIR, "current-task.json");
 const DECISIONS_PATH = path.join(AGENT_STATE_DIR, "decisions.md");
+const MEMORY_VAULT_PATH = defaultMemoryVault();
+const WORKSPACE_PROTOCOL = new WorkspaceProtocol({
+  primaryRoot: PRIMARY_ROOT,
+  projectId: WORKSPACE_ID,
+  stateDir: AGENT_STATE_DIR,
+  vaultDir: MEMORY_VAULT_PATH
+});
 
 // v2.8 Profile
 let WORKSPACE_PROFILE = STARTUP_PROFILE;
@@ -226,6 +239,12 @@ const MAX_COMMAND_OUTPUT = Number(process.env.AGENT_MAX_COMMAND_OUTPUT || 200_00
 const MAX_BATCH_READ_CHARS = boundedNumber(process.env.AGENT_MAX_BATCH_READ_CHARS, 500_000, 10_000, 2_000_000);
 const MAX_BODY_BYTES = Number(process.env.AGENT_MAX_BODY_BYTES || 16 * 1024 * 1024);
 const DEFAULT_CMD_TIMEOUT = 60_000;
+const MAX_PARALLEL_TASKS = 8;
+const MAX_TASK_STEPS = 8;
+const MAX_PARALLEL_STEPS = 32;
+const MAX_TASK_CONCURRENCY = 4;
+const TASK_ID_SCHEMA = z.string().min(1).max(80).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).optional();
+const TOUCHES_SCHEMA = z.array(z.string().min(1).max(1000)).max(200).optional();
 const MAX_PROCS = 24;
 const PROC_BUFFER = 200_000;
 
@@ -257,6 +276,7 @@ await mkdir(WORKSPACE_DATA_DIR, { recursive: true });
 await mkdir(PRIMARY_ROOT, { recursive: true });
 await mkdir(BACKUPS_DIR, { recursive: true });
 await mkdir(AGENT_STATE_DIR, { recursive: true });
+await WORKSPACE_PROTOCOL.init();
 if (AUDIT_ENABLED) {
   auditStream = createWriteStream(AUDIT_PATH, { flags: "a" });
   auditStream.on("error", () => {});
@@ -471,6 +491,7 @@ function createMcpServer() {
 
 function registerBackendTools(mcp) {
   registerBasicTools(mcp);
+  registerSharedWorkspaceTools(mcp);
   registerFigmaDesktopTools(mcp);
   registerDBeaverDesktopTools(mcp);
   registerBrunoDesktopTools(mcp);
@@ -2171,9 +2192,14 @@ function workspaceInfoPayload() {
       max_read_chars: MAX_READ_CHARS,
       max_batch_read_chars: MAX_BATCH_READ_CHARS,
       max_command_output: MAX_COMMAND_OUTPUT,
+      max_parallel_tasks: MAX_PARALLEL_TASKS,
+      max_task_steps: MAX_TASK_STEPS,
+      max_parallel_steps: MAX_PARALLEL_STEPS,
+      max_task_concurrency: MAX_TASK_CONCURRENCY,
       max_procs: MAX_PROCS
     },
     running_processes: [...processes.values()].filter((p) => p.status === "running").length,
+    memory: WORKSPACE_PROTOCOL.memoryStatus(),
     execution_model: [
       "Trusted local engine: tool actions execute directly without policy or approval round-trips.",
       "Configured project roots are discovery and relative-path defaults, not authorization boundaries.",
@@ -2256,12 +2282,18 @@ function registerBasicTools(mcp) {
       title: "Save a progress checkpoint",
       description: "Save a COMPACT summary of progress so the user can start a fresh, fast chat and you can continue. Call this when the conversation gets long/slow, then tell the user to open a new chat and you will call resume().",
       inputSchema: {
+        task_id: TASK_ID_SCHEMA,
         summary: z.string().min(1).describe("What has been done so far, the goal, and current state — concise."),
-        next_steps: z.array(z.string()).optional().describe("Ordered remaining steps."),
-        files_touched: z.array(z.string()).optional().describe("Key files involved.")
+        completed: z.array(z.string()).optional(),
+        in_progress: z.array(z.string()).optional(),
+        next_actions: z.array(z.string()).optional(),
+        next_steps: z.array(z.string()).optional().describe("Legacy alias for next_actions."),
+        files_changed: TOUCHES_SCHEMA,
+        files_touched: TOUCHES_SCHEMA.describe("Legacy alias for files_changed."),
+        tests: z.array(z.object({ name: z.string().min(1), status: z.enum(["passed", "failed", "skipped", "not_run"]), detail: z.string().optional() })).max(200).optional()
       }
     },
-    async ({ summary, next_steps = [], files_touched = [] }) => {
+    async ({ task_id, summary, completed = [], in_progress = [], next_actions = [], next_steps = [], files_changed = [], files_touched = [], tests = [] }) => {
       // v2.5: snapshot current-task.json into checkpoints dir
       try {
         const cpStateDir = path.join(AGENT_STATE_DIR, "checkpoints");
@@ -2271,10 +2303,23 @@ function registerBasicTools(mcp) {
           await writeFile(path.join(cpStateDir, `task-${Date.now()}.json`), taskPlan, "utf8");
         }
       } catch { /* best-effort */ }
-      const cp = { saved_at: isoNow(), summary, next_steps, files_touched };
+      const cp = await buildHandoffPacket({
+        task_id,
+        summary,
+        completed,
+        in_progress,
+        next_actions: next_actions.length ? next_actions : next_steps,
+        files_changed: dedupe([...files_changed, ...files_touched]),
+        tests
+      });
       await mkdir(path.dirname(CHECKPOINT_PATH), { recursive: true });
       await writeFile(CHECKPOINT_PATH, `${JSON.stringify(cp, null, 2)}\n`, "utf8");
-      return textResult("Checkpoint saved. Tell the user to open a NEW chat (resets the heavy context), then call resume() to continue.");
+      return jsonResult({
+        ok: true,
+        checkpoint_path: CHECKPOINT_PATH,
+        handoff: cp,
+        result_digest: buildResultDigest({ ok: true, taskId: cp.task_id, changedFiles: cp.files_changed, summary: "Saved structured handoff checkpoint." })
+      });
     }
   );
 
@@ -2295,6 +2340,237 @@ function registerBasicTools(mcp) {
       }
     }
   );
+}
+
+// ----------------------------------------------------------------------------
+// Shared workspace protocol: task briefs, persistent memory, scope, handoff
+// ----------------------------------------------------------------------------
+function registerSharedWorkspaceTools(mcp) {
+  const taskId = TASK_ID_SCHEMA;
+  const pathList = TOUCHES_SCHEMA;
+
+  reg(
+    mcp,
+    "memory_status",
+    {
+      title: "Persistent memory status",
+      description: "Return the Obsidian-compatible persistent memory vault path and folder layout.",
+      inputSchema: {}
+    },
+    async () => jsonResult(WORKSPACE_PROTOCOL.memoryStatus())
+  );
+
+  reg(
+    mcp,
+    "context_pin",
+    {
+      title: "Pin persistent context",
+      description: "Write or update a permanent Markdown memory with provenance in the Obsidian-compatible vault.",
+      inputSchema: {
+        key: z.string().min(1).max(300),
+        value: z.string().min(1).max(100_000),
+        scope: z.enum(["global", "project"]).optional(),
+        source: z.enum(["user", "repo", "assistant", "system", "tool"]).optional(),
+        tags: z.array(z.string().min(1).max(100)).max(50).optional(),
+        links: z.array(z.string().min(1).max(300)).max(50).optional(),
+        replace: z.boolean().optional()
+      }
+    },
+    async (args) => {
+      const result = await WORKSPACE_PROTOCOL.pinContext(args);
+      return jsonResult({
+        ...result,
+        result_digest: buildResultDigest({ ok: true, summary: `Pinned persistent context ${result.key}.`, changedFiles: [result.path] })
+      });
+    }
+  );
+
+  reg(
+    mcp,
+    "context_list",
+    {
+      title: "List persistent context",
+      description: "List or search global/project memories stored as Markdown in the persistent vault.",
+      inputSchema: {
+        scope: z.enum(["all", "global", "project"]).optional(),
+        query: z.string().max(1000).optional(),
+        limit: z.number().int().min(1).max(200).optional()
+      }
+    },
+    async (args) => jsonResult(await WORKSPACE_PROTOCOL.listContext(args))
+  );
+
+  reg(
+    mcp,
+    "context_explain",
+    {
+      title: "Explain persistent context",
+      description: "Read one memory with its value, source, timestamps, tags, links, and vault path.",
+      inputSchema: {
+        key: z.string().min(1).max(300),
+        scope: z.enum(["global", "project"]).optional()
+      }
+    },
+    async (args) => jsonResult(await WORKSPACE_PROTOCOL.explainContext(args))
+  );
+
+  reg(
+    mcp,
+    "context_remove",
+    {
+      title: "Remove persistent context",
+      description: "Delete one named memory from the persistent vault.",
+      inputSchema: {
+        key: z.string().min(1).max(300),
+        scope: z.enum(["global", "project"]).optional()
+      }
+    },
+    async (args) => {
+      const result = await WORKSPACE_PROTOCOL.removeContext(args);
+      return jsonResult({
+        ...result,
+        result_digest: buildResultDigest({ ok: true, summary: `Removed persistent context ${result.key}.`, changedFiles: [result.removed] })
+      });
+    }
+  );
+
+  reg(
+    mcp,
+    "task_brief",
+    {
+      title: "Create structured task brief",
+      description: "Create or replace a task contract with goal, scope, exclusions, constraints, definition of done, policies, and optional path guard. Returns a task_id used by later tools.",
+      inputSchema: {
+        task_id: taskId,
+        goal: z.string().min(1).max(5000),
+        scope: z.array(z.string().min(1).max(1000)).max(200).optional(),
+        out_of_scope: z.array(z.string().min(1).max(1000)).max(200).optional(),
+        constraints: z.array(z.string().min(1).max(2000)).max(200).optional(),
+        definition_of_done: z.array(z.string().min(1).max(2000)).max(200).optional(),
+        test_policy: z.enum(["none", "changed_tests", "targeted", "full_gate"]).optional(),
+        commit_policy: z.enum(["do_not_commit", "commit_when_green", "commit_and_push", "ask_before_commit"]).optional(),
+        confirmation: z.enum(["never", "risky_only", "always"]).optional(),
+        status: z.string().min(1).max(100).optional(),
+        scope_guard: z.object({ allowed_paths: pathList, denied_paths: pathList }).optional(),
+        replace: z.boolean().optional()
+      }
+    },
+    async (args) => {
+      const task = await WORKSPACE_PROTOCOL.createTaskBrief(args);
+      return jsonResult({
+        ok: true,
+        ...task,
+        vault_note: path.join(WORKSPACE_PROTOCOL.memoryStatus().folders.tasks, `${task.task_id}.md`),
+        result_digest: buildResultDigest({ ok: true, taskId: task.task_id, summary: `Task brief ${task.task_id} status is ${task.status}.` })
+      });
+    }
+  );
+
+  reg(
+    mcp,
+    "task_brief_get",
+    {
+      title: "Read task brief",
+      description: "Read a structured task brief by task_id, or the current active brief when omitted.",
+      inputSchema: { task_id: taskId }
+    },
+    async ({ task_id }) => jsonResult(await WORKSPACE_PROTOCOL.getTask(task_id))
+  );
+
+  reg(
+    mcp,
+    "intent_check",
+    {
+      title: "Intent checksum",
+      description: "Return a compact interpretation of the task, exclusions, assumptions, expected files, proposed actions, and whether confirmation is required.",
+      inputSchema: {
+        task_id: taskId,
+        expected_files: pathList,
+        assumptions: z.array(z.string().min(1).max(2000)).max(100).optional(),
+        proposed_actions: z.array(z.string().min(1).max(2000)).max(100).optional(),
+        risk: z.enum(["low", "medium", "high"]).optional()
+      }
+    },
+    async (args) => jsonResult(await WORKSPACE_PROTOCOL.intentCheck(args))
+  );
+
+  reg(
+    mcp,
+    "scope_guard",
+    {
+      title: "Task scope guard",
+      description: "Get, set, or clear task path allow/deny patterns. Deny rules win; write tools enforce the active guard.",
+      inputSchema: {
+        action: z.enum(["get", "set", "clear"]).optional(),
+        task_id: taskId,
+        allowed_paths: pathList,
+        denied_paths: pathList
+      }
+    },
+    async (args) => jsonResult(await WORKSPACE_PROTOCOL.scopeGuard(args))
+  );
+
+  reg(
+    mcp,
+    "knowledge_state",
+    {
+      title: "Typed task knowledge",
+      description: "List, add, resolve, or remove explicitly typed facts, assumptions, decisions, and open questions with provenance.",
+      inputSchema: {
+        action: z.enum(["list", "add", "resolve", "remove"]).optional(),
+        task_id: taskId,
+        type: z.enum(["fact", "assumption", "decision", "open_question"]).optional(),
+        text: z.string().max(10_000).optional(),
+        source: z.enum(["user", "repo", "assistant", "system", "tool"]).optional(),
+        why: z.string().max(10_000).optional(),
+        id: z.string().min(1).max(200).optional()
+      }
+    },
+    async (args) => jsonResult(await WORKSPACE_PROTOCOL.knowledgeState(args))
+  );
+
+  reg(
+    mcp,
+    "handoff_packet",
+    {
+      title: "Build structured handoff packet",
+      description: "Build a structured continuation packet containing task contract, knowledge, scope, progress, tests, files, git state, and persistent-memory location without saving a checkpoint.",
+      inputSchema: {
+        task_id: taskId,
+        summary: z.string().max(20_000).optional(),
+        completed: z.array(z.string().min(1).max(2000)).max(200).optional(),
+        in_progress: z.array(z.string().min(1).max(2000)).max(200).optional(),
+        next_actions: z.array(z.string().min(1).max(2000)).max(200).optional(),
+        files_changed: pathList,
+        tests: z.array(z.object({ name: z.string().min(1).max(500), status: z.enum(["passed", "failed", "skipped", "not_run"]), detail: z.string().max(5000).optional() })).max(200).optional()
+      }
+    },
+    async (args) => jsonResult(await buildHandoffPacket(args))
+  );
+}
+
+async function buildHandoffPacket({ task_id, summary = "", completed = [], in_progress = [], next_actions = [], files_changed = [], tests = [] } = {}) {
+  const base = await WORKSPACE_PROTOCOL.handoffBase(task_id);
+  const statusRes = await spawnCapture("git", ["status", "--porcelain"], PRIMARY_ROOT, DEFAULT_CMD_TIMEOUT);
+  const branchRes = await spawnCapture("git", ["rev-parse", "--abbrev-ref", "HEAD"], PRIMARY_ROOT, DEFAULT_CMD_TIMEOUT);
+  const gitFiles = statusRes.exit_code === 0 ? parsePorcelain(statusRes.stdout || "") : [];
+  return {
+    kind: "handoff_packet",
+    saved_at: isoNow(),
+    ...base,
+    summary,
+    completed,
+    in_progress,
+    next_actions,
+    files_changed: dedupe([...files_changed, ...gitFiles.map((item) => item.path)]),
+    tests,
+    git: {
+      is_git_repo: statusRes.exit_code === 0,
+      branch: (branchRes.stdout || "").trim() || null,
+      dirty: gitFiles.length > 0,
+      files: gitFiles
+    }
+  };
 }
 
 // ----------------------------------------------------------------------------
@@ -2657,14 +2933,22 @@ function registerFsWriteTools(mcp) {
     {
       title: "Write file",
       description: "Create or overwrite a UTF-8 text file.",
-      inputSchema: { path: z.string().min(1), content: z.string() }
+      inputSchema: { path: z.string().min(1), content: z.string(), task_id: TASK_ID_SCHEMA }
     },
-    async ({ path: rel, content }) => {
+    async ({ path: rel, content, task_id }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, [rel]);
       const filePath = resolvePath(rel);
       await createBackupBatch("write_file", [filePath]);
       await mkdir(path.dirname(filePath), { recursive: true });
       await writeFile(filePath, content, "utf8");
-      return jsonResult({ ok: true, path: toRel(filePath), bytes: Buffer.byteLength(content) });
+      const changedPath = toRel(filePath);
+      return jsonResult({
+        ok: true,
+        path: changedPath,
+        bytes: Buffer.byteLength(content),
+        scope,
+        result_digest: buildResultDigest({ ok: true, taskId: scope.task_id, summary: `Wrote ${changedPath}.`, changedFiles: [changedPath] })
+      });
     }
   );
 
@@ -2678,17 +2962,27 @@ function registerFsWriteTools(mcp) {
         path: z.string().min(1),
         old_text: z.string().min(1),
         new_text: z.string(),
-        replace_all: z.boolean().optional()
+        replace_all: z.boolean().optional(),
+        task_id: TASK_ID_SCHEMA
       }
     },
-    async ({ path: rel, old_text, new_text, replace_all = false }) => {
+    async ({ path: rel, old_text, new_text, replace_all = false, task_id }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, [rel]);
       const filePath = resolvePath(rel);
       await createBackupBatch("replace_in_file", [filePath]);
       const content = await readFile(filePath, "utf8");
       if (!content.includes(old_text)) throw new Error(`old_text not found in ${filePath}`);
       const next = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
       await writeFile(filePath, next, "utf8");
-      return jsonResult({ ok: true, path: toRel(filePath), replacements: replace_all ? content.split(old_text).length - 1 : 1 });
+      const changedPath = toRel(filePath);
+      const replacements = replace_all ? content.split(old_text).length - 1 : 1;
+      return jsonResult({
+        ok: true,
+        path: changedPath,
+        replacements,
+        scope,
+        result_digest: buildResultDigest({ ok: true, taskId: scope.task_id, summary: `Updated ${changedPath} (${replacements} replacement${replacements === 1 ? "" : "s"}).`, changedFiles: [changedPath] })
+      });
     }
   );
 
@@ -2714,10 +3008,11 @@ function registerFsWriteTools(mcp) {
                 .describe("For update: ordered text replacements.")
             })
           )
-          .optional()
+          .optional(),
+        task_id: TASK_ID_SCHEMA
       }
     },
-    async ({ diff, operations }) => {
+    async ({ diff, operations, task_id }) => {
       if (diff && diff.trim()) {
         // Collect affected file paths for backup
         const affectedPaths = new Set();
@@ -2729,15 +3024,26 @@ function registerFsWriteTools(mcp) {
             }
           }
         }
+        const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, [...affectedPaths]);
         if (affectedPaths.size > 0) await createBackupBatch("apply_patch_diff", [...affectedPaths]);
         const results = await applyUnifiedDiff(diff);
         const ok = results.every((r) => r.ok);
-        return jsonResult({ ok, mode: "diff", applied: results.filter((r) => r.ok).length, results });
+        const changedFiles = results.filter((r) => r.ok).map((r) => r.path);
+        return jsonResult({
+          ok,
+          mode: "diff",
+          applied: results.filter((r) => r.ok).length,
+          results,
+          scope,
+          result_digest: buildResultDigest({ ok, taskId: scope.task_id, summary: ok ? `Applied patch to ${changedFiles.length} file${changedFiles.length === 1 ? "" : "s"}.` : "Patch application failed.", changedFiles })
+        });
       }
       if (!operations || !operations.length) {
         throw new Error("Provide either `diff` or a non-empty `operations` array.");
       }
       // Backup existing files that will be modified/deleted
+      const operationPaths = operations.flatMap((op) => [op.path, ...(op.op === "rename" && op.rename_to ? [op.rename_to] : [])]);
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, operationPaths);
       const pathsToBackup = operations
         .flatMap((op) => [op.path, ...(op.op === "rename" && op.rename_to ? [op.rename_to] : [])])
         .map((p) => { try { return resolvePath(p); } catch { return null; } })
@@ -2753,7 +3059,15 @@ function registerFsWriteTools(mcp) {
         }
       }
       const ok = results.every((r) => r.ok);
-      return jsonResult({ ok, mode: "operations", applied: results.filter((r) => r.ok).length, results });
+      const changedFiles = results.filter((r) => r.ok).flatMap((r) => [r.path, r.to].filter(Boolean));
+      return jsonResult({
+        ok,
+        mode: "operations",
+        applied: results.filter((r) => r.ok).length,
+        results,
+        scope,
+        result_digest: buildResultDigest({ ok, taskId: scope.task_id, summary: ok ? `Applied ${results.length} structured operation${results.length === 1 ? "" : "s"}.` : "Structured patch stopped on an error.", changedFiles })
+      });
     }
   );
 
@@ -2763,12 +3077,14 @@ function registerFsWriteTools(mcp) {
     {
       title: "Make directory",
       description: "Create a directory (recursive).",
-      inputSchema: { path: z.string().min(1) }
+      inputSchema: { path: z.string().min(1), task_id: TASK_ID_SCHEMA }
     },
-    async ({ path: rel }) => {
+    async ({ path: rel, task_id }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, [rel]);
       const dir = resolvePath(rel);
       await mkdir(dir, { recursive: true });
-      return jsonResult({ ok: true, path: toRel(dir) });
+      const changedPath = toRel(dir);
+      return jsonResult({ ok: true, path: changedPath, scope, result_digest: buildResultDigest({ ok: true, taskId: scope.task_id, summary: `Created directory ${changedPath}.`, changedFiles: [changedPath] }) });
     }
   );
 
@@ -2778,15 +3094,18 @@ function registerFsWriteTools(mcp) {
     {
       title: "Move / rename",
       description: "Move or rename a file or directory. Both ends must be inside the roots.",
-      inputSchema: { from: z.string().min(1), to: z.string().min(1) }
+      inputSchema: { from: z.string().min(1), to: z.string().min(1), task_id: TASK_ID_SCHEMA }
     },
-    async ({ from, to }) => {
+    async ({ from, to, task_id }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, [from, to]);
       const src = resolvePath(from);
       const dst = resolvePath(to);
       await createBackupBatch("move_path", [src, dst]);
       await mkdir(path.dirname(dst), { recursive: true });
       await rename(src, dst);
-      return jsonResult({ ok: true, from: toRel(src), to: toRel(dst) });
+      const fromPath = toRel(src);
+      const toPath = toRel(dst);
+      return jsonResult({ ok: true, from: fromPath, to: toPath, scope, result_digest: buildResultDigest({ ok: true, taskId: scope.task_id, summary: `Moved ${fromPath} to ${toPath}.`, changedFiles: [fromPath, toPath] }) });
     }
   );
 
@@ -2796,15 +3115,17 @@ function registerFsWriteTools(mcp) {
     {
       title: "Delete path",
       description: "Delete a file or directory inside the roots. Directories require recursive=true.",
-      inputSchema: { path: z.string().min(1), recursive: z.boolean().optional() }
+      inputSchema: { path: z.string().min(1), recursive: z.boolean().optional(), task_id: TASK_ID_SCHEMA }
     },
-    async ({ path: rel, recursive = false }) => {
+    async ({ path: rel, recursive = false, task_id }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, [rel]);
       const target = resolvePath(rel);
       const info = await stat(target);
       if (info.isDirectory() && !recursive) throw new Error("Path is a directory; pass recursive=true to delete it.");
       if (info.isFile()) await createBackupBatch("delete_path", [target]);
       await rm(target, { recursive, force: false });
-      return jsonResult({ ok: true, deleted: toRel(target) });
+      const deleted = toRel(target);
+      return jsonResult({ ok: true, deleted, scope, result_digest: buildResultDigest({ ok: true, taskId: scope.task_id, summary: `Deleted ${deleted}.`, changedFiles: [deleted] }) });
     }
   );
 }
@@ -2951,10 +3272,13 @@ function registerExecTools(mcp) {
         timeout_ms: z.number().int().min(1000).max(600000).optional(),
         tail_lines: z.number().int().min(1).max(5000).optional().describe("Return only the last N lines of output."),
         head_lines: z.number().int().min(1).max(5000).optional().describe("Return only the first N lines of output."),
-        max_output_chars: z.number().int().min(500).max(MAX_COMMAND_OUTPUT).optional().describe(`Cap stdout/stderr chars (default ${CMD_OUTPUT_DEFAULT}).`)
+        max_output_chars: z.number().int().min(500).max(MAX_COMMAND_OUTPUT).optional().describe(`Cap stdout/stderr chars (default ${CMD_OUTPUT_DEFAULT}).`),
+        task_id: TASK_ID_SCHEMA,
+        touches: TOUCHES_SCHEMA.describe("Paths this command is expected to modify; checked against the task scope guard.")
       }
     },
-    async ({ command, cwd = ".", shell, timeout_ms = DEFAULT_CMD_TIMEOUT, tail_lines, head_lines, max_output_chars = CMD_OUTPUT_DEFAULT }) => {
+    async ({ command, cwd = ".", shell, timeout_ms = DEFAULT_CMD_TIMEOUT, tail_lines, head_lines, max_output_chars = CMD_OUTPUT_DEFAULT, task_id, touches = [] }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, touches);
       const workdir = resolvePath(cwd);
       const result = await runShellCommand(command, workdir, shell, timeout_ms);
       const trim = (s) => trimOutput(s, { tail_lines, head_lines, max_chars: max_output_chars });
@@ -2969,7 +3293,17 @@ function registerExecTools(mcp) {
         stdout_truncated: stdout.length < result.stdout.length,
         stderr_truncated: stderr.length < result.stderr.length,
         stdout,
-        stderr
+        stderr,
+        scope,
+        result_digest: buildResultDigest({
+          ok: result.exit_code === 0 && !result.timed_out,
+          exitCode: result.exit_code,
+          timedOut: result.timed_out,
+          stdout,
+          stderr,
+          taskId: scope.task_id,
+          changedFiles: touches
+        })
       });
     }
   );
@@ -2986,14 +3320,18 @@ function registerExecTools(mcp) {
           cwd: z.string().optional(),
           shell: z.enum(["cmd", "powershell", "bash", "sh", "zsh"]).optional(),
           timeout_ms: z.number().int().min(1000).max(600000).optional(),
-          max_output_chars: z.number().int().min(500).max(50_000).optional()
+          max_output_chars: z.number().int().min(500).max(50_000).optional(),
+          touches: TOUCHES_SCHEMA
         })).min(1).max(12),
         parallel: z.boolean().optional().describe("Run independent commands concurrently (default false)."),
         max_concurrency: z.number().int().min(1).max(4).optional(),
-        stop_on_failure: z.boolean().optional().describe("Sequential mode only; default true.")
+        stop_on_failure: z.boolean().optional().describe("Sequential mode only; default true."),
+        task_id: TASK_ID_SCHEMA
       }
     },
-    async ({ commands, parallel = false, max_concurrency = 4, stop_on_failure = true }) => {
+    async ({ commands, parallel = false, max_concurrency = 4, stop_on_failure = true, task_id }) => {
+      const touches = commands.flatMap((item) => item.touches || []);
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, touches);
       const results = new Array(commands.length);
       const runOne = async (item, index) => {
         const workdir = resolvePath(item.cwd || ".");
@@ -3011,7 +3349,16 @@ function registerExecTools(mcp) {
           stdout_truncated: stdout.length < result.stdout.length,
           stderr_truncated: stderr.length < result.stderr.length,
           stdout,
-          stderr
+          stderr,
+          result_digest: buildResultDigest({
+            ok: result.exit_code === 0 && !result.timed_out,
+            exitCode: result.exit_code,
+            timedOut: result.timed_out,
+            stdout,
+            stderr,
+            taskId: scope.task_id,
+            changedFiles: item.touches || []
+          })
         };
       };
 
@@ -3033,16 +3380,329 @@ function registerExecTools(mcp) {
       }
 
       const completed = results.filter(Boolean);
+      const ok = completed.length === commands.length && completed.every((result) => result.exit_code === 0 && !result.timed_out);
       return jsonResult({
-        ok: completed.length === commands.length && completed.every((result) => result.exit_code === 0),
+        ok,
         parallel,
         requested: commands.length,
         completed: completed.length,
         stopped_early: completed.length < commands.length,
-        results: completed
+        scope,
+        results: completed,
+        result_digest: buildResultDigest({
+          ok,
+          exitCode: completed.find((result) => result.exit_code !== 0)?.exit_code ?? (ok ? 0 : null),
+          timedOut: completed.some((result) => result.timed_out),
+          stdout: completed.map((result) => result.stdout).join("\n"),
+          stderr: completed.map((result) => result.stderr).join("\n"),
+          taskId: scope.task_id,
+          changedFiles: touches,
+          summary: ok ? `Completed ${completed.length} command${completed.length === 1 ? "" : "s"}.` : `Command batch stopped with ${completed.filter((result) => result.exit_code !== 0 || result.timed_out).length} failure${completed.filter((result) => result.exit_code !== 0 || result.timed_out).length === 1 ? "" : "s"}.`
+        })
       });
     }
   );
+
+  reg(
+    mcp,
+    "parallel_tasks",
+    {
+      title: "Run parallel task lanes",
+      description: "Run up to 8 independent command pipelines in one MCP call. Steps inside each task run sequentially; tasks run concurrently with bounded fan-out. This coordinates shell work only and does not spawn model agents.",
+      inputSchema: {
+        tasks: z.array(z.object({
+          id: z.string().min(1).max(80).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).describe("Stable task identifier used to correlate results."),
+          title: z.string().min(1).max(200).optional(),
+          cwd: z.string().optional().describe("Default working directory for every step in this task."),
+          depends_on: z.array(z.string().min(1).max(80)).max(MAX_PARALLEL_TASKS).optional(),
+          always_run: z.boolean().optional().describe("Run after dependencies finish even when one failed; useful for cleanup/reporting."),
+          allow_failure: z.boolean().optional().describe("Record a failed task without failing dependent tasks or the overall DAG."),
+          consumes: z.array(z.string().min(1).max(500)).max(100).optional(),
+          produces: z.object({
+            summary: z.string().max(5000).optional(),
+            changed_files: TOUCHES_SCHEMA,
+            artifacts: z.array(z.string().min(1).max(1000)).max(100).optional()
+          }).optional(),
+          touches: TOUCHES_SCHEMA,
+          steps: z.array(z.object({
+            name: z.string().min(1).max(120).optional(),
+            command: z.string().min(1),
+            cwd: z.string().optional().describe("Optional per-step working directory override."),
+            shell: z.enum(["cmd", "powershell", "bash", "sh", "zsh"]).optional(),
+            timeout_ms: z.number().int().min(1000).max(600000).optional(),
+            max_output_chars: z.number().int().min(500).max(50_000).optional(),
+            touches: TOUCHES_SCHEMA
+          })).min(1).max(MAX_TASK_STEPS)
+        })).min(1).max(MAX_PARALLEL_TASKS),
+        max_concurrency: z.number().int().min(1).max(MAX_TASK_CONCURRENCY).optional(),
+        fail_fast: z.boolean().optional().describe("Stop scheduling new non-cleanup tasks after the first non-allowed failure."),
+        task_id: TASK_ID_SCHEMA
+      }
+    },
+    async ({ tasks, max_concurrency = MAX_TASK_CONCURRENCY, fail_fast = false, task_id }) => {
+      validateTaskDag(tasks);
+      const totalSteps = tasks.reduce((sum, task) => sum + task.steps.length, 0);
+      if (totalSteps > MAX_PARALLEL_STEPS) {
+        throw new Error(`Too many parallel task steps (${totalSteps}); maximum is ${MAX_PARALLEL_STEPS}.`);
+      }
+      const allTouches = tasks.flatMap((task) => [
+        ...(task.touches || []),
+        ...(task.produces?.changed_files || []),
+        ...task.steps.flatMap((step) => step.touches || [])
+      ]);
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, allTouches);
+      const run = await runParallelTaskDag(tasks, {
+        maxConcurrency: max_concurrency,
+        failFast: fail_fast,
+        taskId: scope.task_id
+      });
+      return jsonResult({
+        ...run,
+        scope,
+        result_digest: buildResultDigest({
+          ok: run.ok,
+          exitCode: run.tasks.find((task) => task.status === "failed")?.steps?.find((step) => !step.ok)?.exit_code ?? (run.ok ? 0 : null),
+          timedOut: run.tasks.some((task) => task.steps?.some((step) => step.timed_out)),
+          stdout: run.tasks.flatMap((task) => task.steps || []).map((step) => step.stdout || "").join("\n"),
+          stderr: run.tasks.flatMap((task) => task.steps || []).map((step) => step.stderr || step.error || "").join("\n"),
+          taskId: scope.task_id,
+          changedFiles: allTouches,
+          summary: run.ok ? `Completed DAG with ${run.completed_tasks} task${run.completed_tasks === 1 ? "" : "s"}.` : `DAG completed with ${run.failed_tasks + run.blocked_tasks + run.skipped_tasks} non-success task${run.failed_tasks + run.blocked_tasks + run.skipped_tasks === 1 ? "" : "s"}.`
+        })
+      });
+    }
+  );
+}
+
+async function runParallelTaskDag(tasks, { maxConcurrency, failFast, taskId }) {
+  const runId = randomUUID();
+  const results = new Array(tasks.length);
+  const byId = new Map(tasks.map((task, index) => [task.id, { task, index }]));
+  const states = new Map(tasks.map((task) => [task.id, "pending"]));
+  let failureTriggered = false;
+
+  const setPassive = (task, status, reason) => {
+    const index = byId.get(task.id).index;
+    states.set(task.id, status);
+    results[index] = passiveParallelTaskResult(task, index, status, reason, taskId, states);
+  };
+
+  while ([...states.values()].some((state) => state === "pending")) {
+    let progressed = false;
+
+    if (failureTriggered && failFast) {
+      for (const task of tasks) {
+        if (states.get(task.id) === "pending" && !task.always_run) {
+          setPassive(task, "skipped", "Skipped because fail_fast was triggered by an earlier task failure.");
+          progressed = true;
+        }
+      }
+    }
+
+    for (const task of tasks) {
+      if (states.get(task.id) !== "pending" || task.always_run) continue;
+      const dependencyStates = (task.depends_on || []).map((id) => states.get(id));
+      if (dependencyStates.length && dependencyStates.every(isTerminalTaskState) && dependencyStates.some((state) => !isSuccessfulTaskState(state))) {
+        setPassive(task, "blocked", "Blocked because one or more dependencies did not succeed.");
+        progressed = true;
+      }
+    }
+
+    const ready = tasks.filter((task) => {
+      if (states.get(task.id) !== "pending") return false;
+      const dependencyStates = (task.depends_on || []).map((id) => states.get(id));
+      if (!dependencyStates.every(isTerminalTaskState)) return false;
+      return task.always_run || dependencyStates.every(isSuccessfulTaskState);
+    });
+
+    if (ready.length) {
+      const batch = ready.slice(0, Math.min(maxConcurrency, ready.length));
+      for (const task of batch) states.set(task.id, "running");
+      const batchResults = await Promise.all(batch.map((task) => runParallelTask(task, byId.get(task.id).index, taskId)));
+      for (const result of batchResults) {
+        const task = byId.get(result.id).task;
+        if (result.ok) {
+          result.status = "success";
+          states.set(result.id, "success");
+        } else if (task.allow_failure) {
+          result.status = "allowed_failure";
+          result.allowed_failure = true;
+          states.set(result.id, "allowed_failure");
+        } else {
+          result.status = "failed";
+          states.set(result.id, "failed");
+          failureTriggered = true;
+        }
+        results[result.index] = result;
+      }
+      progressed = true;
+    }
+
+    if (!progressed) {
+      const pending = tasks.filter((task) => states.get(task.id) === "pending").map((task) => task.id);
+      throw new Error(`parallel_tasks scheduler could not make progress: ${pending.join(", ")}`);
+    }
+  }
+
+  const completed = results.filter((task) => ["success", "allowed_failure", "failed"].includes(task.status));
+  const failedTasks = results.filter((task) => task.status === "failed").length;
+  const blockedTasks = results.filter((task) => task.status === "blocked").length;
+  const skippedTasks = results.filter((task) => task.status === "skipped").length;
+  return {
+    ok: results.every((task) => isSuccessfulTaskState(task.status)),
+    run_id: runId,
+    requested_tasks: tasks.length,
+    completed_tasks: completed.length,
+    successful_tasks: results.filter((task) => task.status === "success").length,
+    allowed_failure_tasks: results.filter((task) => task.status === "allowed_failure").length,
+    failed_tasks: failedTasks,
+    blocked_tasks: blockedTasks,
+    skipped_tasks: skippedTasks,
+    requested_steps: tasks.reduce((sum, task) => sum + task.steps.length, 0),
+    completed_steps: completed.reduce((sum, task) => sum + task.completed_steps, 0),
+    max_concurrency: maxConcurrency,
+    fail_fast: failFast,
+    stopped_early: blockedTasks + skippedTasks > 0,
+    tasks: results
+  };
+}
+
+function isTerminalTaskState(state) {
+  return ["success", "allowed_failure", "failed", "blocked", "skipped"].includes(state);
+}
+
+function isSuccessfulTaskState(state) {
+  return state === "success" || state === "allowed_failure";
+}
+
+function passiveParallelTaskResult(task, index, status, reason, taskId, states) {
+  const dependencyStatus = Object.fromEntries((task.depends_on || []).map((id) => [id, states.get(id)]));
+  return {
+    index,
+    id: task.id,
+    title: task.title || null,
+    status,
+    ok: false,
+    allow_failure: Boolean(task.allow_failure),
+    always_run: Boolean(task.always_run),
+    depends_on: task.depends_on || [],
+    dependency_status: dependencyStatus,
+    consumes: task.consumes || [],
+    produces: task.produces || null,
+    started_at: null,
+    duration_ms: 0,
+    requested_steps: task.steps.length,
+    completed_steps: 0,
+    stopped_early: true,
+    error: reason,
+    steps: [],
+    result_digest: buildResultDigest({ ok: false, taskId, stderr: reason, changedFiles: task.produces?.changed_files || task.touches || [], summary: `${task.id} was ${status}: ${reason}` })
+  };
+}
+
+async function runParallelTask(task, index, taskId) {
+  const startedAt = isoNow();
+  const startedMs = performance.now();
+  const steps = [];
+  let taskError = null;
+
+  for (let stepIndex = 0; stepIndex < task.steps.length; stepIndex++) {
+    const step = task.steps[stepIndex];
+    const stepStartedMs = performance.now();
+    try {
+      const workdir = resolvePath(step.cwd || task.cwd || ".");
+      const result = await runShellCommand(
+        step.command,
+        workdir,
+        step.shell,
+        step.timeout_ms || DEFAULT_CMD_TIMEOUT
+      );
+      const maxChars = step.max_output_chars || 10_000;
+      const stdout = trimOutput(result.stdout, { max_chars: maxChars });
+      const stderr = trimOutput(result.stderr, { max_chars: maxChars });
+      const ok = result.exit_code === 0 && !result.timed_out;
+      steps.push({
+        index: stepIndex,
+        name: step.name || null,
+        cwd: workdir,
+        command: step.command,
+        shell: step.shell || defaultShell(),
+        ok,
+        exit_code: result.exit_code,
+        timed_out: result.timed_out,
+        duration_ms: Math.max(0, Math.round((performance.now() - stepStartedMs) * 10) / 10),
+        stdout_truncated: stdout.length < result.stdout.length,
+        stderr_truncated: stderr.length < result.stderr.length,
+        stdout,
+        stderr,
+        touches: step.touches || [],
+        result_digest: buildResultDigest({
+          ok,
+          exitCode: result.exit_code,
+          timedOut: result.timed_out,
+          stdout,
+          stderr,
+          taskId,
+          changedFiles: step.touches || [],
+          summary: ok ? `${task.id}/${step.name || stepIndex} completed.` : `${task.id}/${step.name || stepIndex} failed.`
+        })
+      });
+      if (!ok) break;
+    } catch (error) {
+      taskError = String(error?.message || error);
+      steps.push({
+        index: stepIndex,
+        name: step.name || null,
+        command: step.command,
+        ok: false,
+        exit_code: null,
+        timed_out: false,
+        duration_ms: Math.max(0, Math.round((performance.now() - stepStartedMs) * 10) / 10),
+        error: taskError,
+        stdout: "",
+        stderr: "",
+        touches: step.touches || [],
+        result_digest: buildResultDigest({ ok: false, taskId, stderr: taskError, changedFiles: step.touches || [], summary: `${task.id}/${step.name || stepIndex} raised an execution error.` })
+      });
+      break;
+    }
+  }
+
+  const ok = steps.length === task.steps.length && steps.every((step) => step.ok);
+  const changedFiles = dedupe([
+    ...(task.touches || []),
+    ...(task.produces?.changed_files || []),
+    ...task.steps.flatMap((step) => step.touches || [])
+  ]);
+  return {
+    index,
+    id: task.id,
+    title: task.title || null,
+    status: ok ? "success" : "failed",
+    ok,
+    allow_failure: Boolean(task.allow_failure),
+    always_run: Boolean(task.always_run),
+    depends_on: task.depends_on || [],
+    consumes: task.consumes || [],
+    produces: task.produces || null,
+    started_at: startedAt,
+    duration_ms: Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10),
+    requested_steps: task.steps.length,
+    completed_steps: steps.length,
+    stopped_early: steps.length < task.steps.length,
+    error: taskError,
+    steps,
+    result_digest: buildResultDigest({
+      ok,
+      exitCode: steps.find((step) => !step.ok)?.exit_code ?? (ok ? 0 : null),
+      timedOut: steps.some((step) => step.timed_out),
+      stdout: steps.map((step) => step.stdout || "").join("\n"),
+      stderr: steps.map((step) => step.stderr || step.error || "").join("\n"),
+      taskId,
+      changedFiles,
+      summary: task.produces?.summary || (ok ? `${task.id} completed all ${steps.length} step${steps.length === 1 ? "" : "s"}.` : `${task.id} stopped after ${steps.length} of ${task.steps.length} steps.`)
+    })
+  };
 }
 
 function registerProcessTools(mcp) {
@@ -3056,15 +3716,27 @@ function registerProcessTools(mcp) {
         command: z.string().min(1),
         cwd: z.string().optional(),
         shell: z.enum(["cmd", "powershell", "bash", "sh", "zsh"]).optional(),
-        name: z.string().optional()
+        name: z.string().optional(),
+        task_id: TASK_ID_SCHEMA,
+        touches: TOUCHES_SCHEMA
       }
     },
-    async ({ command, cwd = ".", shell, name }) => {
+    async ({ command, cwd = ".", shell, name, task_id, touches = [] }) => {
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(task_id, touches);
       const running = [...processes.values()].filter((p) => p.status === "running").length;
       if (running >= MAX_PROCS) throw new Error(`Too many running processes (max ${MAX_PROCS}). Stop some first.`);
       const workdir = resolvePath(cwd);
       const proc = startBackground(command, workdir, shell, name);
-      return jsonResult({ ok: true, id: proc.id, name: proc.name, command, cwd: workdir, pid: proc.child.pid });
+      return jsonResult({
+        ok: true,
+        id: proc.id,
+        name: proc.name,
+        command,
+        cwd: workdir,
+        pid: proc.child.pid,
+        scope,
+        result_digest: buildResultDigest({ ok: true, taskId: scope.task_id, changedFiles: touches, summary: `Started background process ${proc.name}.` })
+      });
     }
   );
 
@@ -5737,7 +6409,11 @@ function registerPlannerTools(mcp) {
       await mkdir(AGENT_STATE_DIR, { recursive: true });
       const entry = `\n## ${isoNow()}\n\n**Decision:** ${decision}\n\n**Why:** ${why}\n`;
       await appendFile(DECISIONS_PATH, entry, "utf8");
-      return jsonResult({ ok: true, appended_to: DECISIONS_PATH });
+      let typed_knowledge = null;
+      try {
+        typed_knowledge = await WORKSPACE_PROTOCOL.knowledgeState({ action: "add", type: "decision", text: decision, why, source: "assistant" });
+      } catch { /* no active structured brief; legacy decision log still succeeds */ }
+      return jsonResult({ ok: true, appended_to: DECISIONS_PATH, typed_knowledge });
     }
   );
 }

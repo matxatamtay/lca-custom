@@ -1,6 +1,6 @@
 # Local Coding Agent MCP server
 
-Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees fourteen compact tools while an internal in-memory backend retains the richer implementation details.
+Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees fifteen compact tools while an internal in-memory backend retains the richer implementation details.
 
 ## Public MCP tools
 
@@ -31,7 +31,7 @@ Actions execute directly without mode, policy, or approval turns. Project roots 
 lca-custom tui
 ```
 
-The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fourteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
+The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fifteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
 
 ## Run
 
@@ -94,6 +94,7 @@ Direct model-style preparation or execution without the widget capability is rej
 | `AGENT_READ_DEFAULT` | `30000` | Default per-file response budget. |
 | `AGENT_MAX_BATCH_READ_CHARS` | `500000` | Combined `read_many` budget. |
 | `AGENT_CMD_OUTPUT_DEFAULT` | `20000` | Default foreground command output budget. |
+| `AGENT_MEMORY_VAULT` | platform data directory | Obsidian-compatible persistent vault containing global, project, and task notes. |
 | `AGENTMEMORY_URL` | `http://127.0.0.1:3111` | Managed AgentMemory endpoint. |
 | `AGENTMEMORY_RECORD_SESSIONS` | `1` | Set `0` for isolated tests or stateless runs. |
 | `FIGMA_DESKTOP_MCP_URL` | `http://127.0.0.1:3845/mcp` | Figma Desktop MCP. |
@@ -106,4 +107,4 @@ Direct model-style preparation or execution without the widget capability is rej
 npm run test:all
 ```
 
-Focused gates include `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
+Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.

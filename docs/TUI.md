@@ -1,6 +1,6 @@
 # Local Coding Agent TUI
 
-`lca-custom tui` opens a full-screen terminal interface backed by the same fourteen compact MCP tools used by ChatGPT. It supports keyboard navigation and terminal mouse events. Closing the TUI leaves the managed LCA server and tunnel running.
+`lca-custom tui` opens a full-screen terminal interface backed by the same fifteen compact MCP tools used by ChatGPT. It supports keyboard navigation and terminal mouse events. Closing the TUI leaves the managed LCA server and tunnel running.
 
 ## Start
 
