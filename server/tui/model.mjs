@@ -17,6 +17,7 @@ export const TUI_VIEWS = Object.freeze([
   { id: "tasks", label: "Tasks & Notes", key: "t", icon: "☷" },
   { id: "skills", label: "Skills", key: "k", icon: "✦" },
   { id: "integrations", label: "Integrations", key: "i", icon: "⌁" },
+  { id: "config", label: "Config", key: "e", icon: "⚙" },
   { id: "memory", label: "Memory", key: "m", icon: "∞" },
   { id: "tools", label: "Tool Console", key: "a", icon: "⌘" },
   { id: "logs", label: "Logs", key: "l", icon: "≋" },
@@ -36,7 +37,7 @@ export const TUI_SHORTCUTS = Object.freeze([
   ["r", "refresh the active screen"],
   ["Ctrl+P", "open the command palette"],
   ["/", "open Search"],
-  ["d p f x g c o v t k i m a l h", "jump directly to a screen"],
+  ["d p f x g c o v t k i e m a l h", "jump directly to a screen"],
   ["?", "show Help"],
   ["q or Ctrl+C", "quit the TUI, leaving the managed LCA daemon running"]
 ]);

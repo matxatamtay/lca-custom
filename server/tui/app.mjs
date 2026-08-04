@@ -8,6 +8,14 @@ import path from "node:path";
 import blessed from "neo-blessed";
 
 import { directoryPickerRows, nextPickerDirectory } from "./folder-picker.mjs";
+import {
+  isSecretEnvKey,
+  isValidEnvKey,
+  maskedEnvValue,
+  readEnvConfig,
+  removeEnvKeys,
+  updateEnvConfig
+} from "./env-config.mjs";
 import { fuzzyFilter } from "./palette.mjs";
 import {
   closeResourceTab,
@@ -69,6 +77,7 @@ export class LcaTuiApp {
     this.version = options.version || "4.4.0-pro";
     this.repoRoot = path.resolve(options.repoRoot);
     this.configPath = path.resolve(options.configPath);
+    this.envPath = path.resolve(options.envPath || path.join(this.repoRoot, ".env.local"));
     this.statePath = path.resolve(options.statePath || defaultTuiStatePath(this.configPath));
     this.logPaths = options.logPaths || {};
     this.primaryRoot = path.resolve(options.workspace || this.repoRoot);
@@ -429,6 +438,7 @@ export class LcaTuiApp {
       tasks: () => this.refreshTasks(),
       skills: () => this.refreshSkills(),
       integrations: () => this.refreshIntegrations(),
+      config: () => this.refreshConfig(),
       memory: () => this.refreshMemory(),
       tools: () => this.refreshTools(),
       logs: () => this.refreshLogs(),
@@ -910,7 +920,8 @@ export class LcaTuiApp {
       { label: "Refresh", key: "R", handler: () => this.refreshDashboard() },
       { label: "Doctor", handler: () => this.showDoctor() },
       { label: "Start", handler: () => this.startRuntime() },
-      { label: "Stop", handler: () => this.stopRuntime() }
+      { label: "Stop", handler: () => this.stopRuntime() },
+      { label: "Restart", handler: () => this.restartRuntime() }
     ]);
     const settled = await Promise.allSettled([
       this.client.health(),
@@ -919,6 +930,8 @@ export class LcaTuiApp {
       this.client.integration("figma", "status"),
       this.client.integration("dbeaver", "status"),
       this.client.integration("bruno", "status"),
+      this.client.integration("penpot", "status"),
+      this.client.integration("coolify", "status"),
       this.client.memoryHealth(),
       this.launcher.status()
     ]);
@@ -929,10 +942,12 @@ export class LcaTuiApp {
     const integrations = [
       integrationSummary("Figma", settled[3]),
       integrationSummary("DBeaver", settled[4]),
-      integrationSummary("Bruno", settled[5])
+      integrationSummary("Bruno", settled[5]),
+      integrationSummary("Penpot", settled[6]),
+      integrationSummary("Coolify", settled[7])
     ];
-    const memory = value(6, { status: "offline" });
-    const launcher = value(7, {});
+    const memory = value(8, { status: "offline" });
+    const launcher = value(9, {});
     this.primaryRoot = path.resolve(info.primary_root || info.workspace || health.workspace || this.primaryRoot);
     this.currentPath ||= this.primaryRoot;
     this.gitRoot ||= this.primaryRoot;
@@ -950,7 +965,9 @@ export class LcaTuiApp {
     if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Unable to start LCA");
     await this.client.close();
     this.setDetail("Start", result.stdout || "LCA started.", { raw: true });
-    await this.refreshDashboard();
+    await this.refreshHeader();
+    if (this.activeView === "dashboard") await this.refreshDashboard();
+    if (this.activeView === "config") await this.refreshConfig();
   }
 
   async stopRuntime() {
@@ -960,6 +977,17 @@ export class LcaTuiApp {
     await this.client.close();
     this.setDetail("Stop", result.stdout || "LCA stopped.", { raw: true });
     this.updateHeader({ status: "offline" });
+    if (this.activeView === "config") await this.refreshConfig();
+  }
+
+  async restartRuntime() {
+    const result = await this.launcher.restart();
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Unable to restart LCA");
+    await this.client.close();
+    this.setDetail("Restart", result.stdout || "LCA restarted with the latest .env.local values.", { raw: true });
+    await this.refreshHeader();
+    if (this.activeView === "dashboard") await this.refreshDashboard();
+    if (this.activeView === "config") await this.refreshConfig();
   }
 
   async refreshProjects() {
@@ -1453,7 +1481,7 @@ export class LcaTuiApp {
       { label: "Refresh", handler: () => this.refreshIntegrations() },
       { label: "Discover", handler: () => this.discoverIntegration() }
     ]);
-    const names = ["figma", "dbeaver", "bruno", "coolify"];
+    const names = ["figma", "dbeaver", "bruno", "penpot", "coolify"];
     const settled = await Promise.allSettled(names.map((name) => this.client.integration(name, "status")));
     const rows = names.map((name, index) => {
       const result = settled[index];
@@ -1466,7 +1494,7 @@ export class LcaTuiApp {
       };
     });
     this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), "MCP integrations");
-    this.setDetail("Integrations", "Figma, DBeaver, Bruno, and Coolify use persistent Streamable HTTP clients. Coolify reads COOLIFY_MCP_AUTH_TOKEN from .env.local. Select one and click Discover to inspect its live upstream actions.", { raw: true });
+    this.setDetail("Integrations", "Figma, DBeaver, Bruno, and Penpot use persistent local MCP clients. Penpot reads PENPOT_MCP_URL plus the masked PENPOT_USER_TOKEN from .env.local and provides page/selection inspection, API lookup, export, drawing, and guarded destructive actions. Coolify runs the pinned @masonator/coolify-mcp package over local stdio. Select one and click Discover to inspect its live actions.", { raw: true });
   }
 
   async discoverIntegration() {
@@ -1474,6 +1502,87 @@ export class LcaTuiApp {
     if (!row?.name) return;
     const value = await this.client.integration(row.name, "discover");
     this.setDetail(`${row.name} actions`, JSON.stringify(value, null, 2), { raw: true });
+  }
+
+  async refreshConfig() {
+    this.showSplit(".env.local variables");
+    this.setActions([
+      { label: "Edit", key: "E", handler: () => this.editSelectedConfig() },
+      { label: "Add", handler: () => this.addConfigVariable() },
+      { label: "Clear", handler: () => this.clearSelectedConfig() },
+      { label: "Delete", handler: () => this.deleteSelectedConfig() },
+      { label: "Restart", handler: () => this.restartRuntime() },
+      { label: "Start", handler: () => this.startRuntime() },
+      { label: "Stop", handler: () => this.stopRuntime() }
+    ]);
+    const config = await readEnvConfig(this.envPath);
+    const rows = config.entries.map((entry) => ({
+      ...entry,
+      label: `${entry.secret ? "◆" : "◇"} ${entry.key}=${maskedEnvValue(entry.key, entry.value)}`,
+      preview: [
+        `Key: ${entry.key}`,
+        `Value: ${maskedEnvValue(entry.key, entry.value)}`,
+        `Secret: ${entry.secret ? "yes — value is never shown" : "no"}`,
+        `Source: ${config.path}:${entry.line}`,
+        "",
+        entry.secret
+          ? "Edit opens an empty censored field. Submit a new value to replace it; blank keeps the current secret."
+          : "Edit loads the current value. Restart LCA after changing a value used by the running daemon."
+      ].join("\n")
+    }));
+    this.setRows(rows, async (row) => this.setDetail(row.key, row.preview, { raw: true }), ".env.local variables");
+    this.setDetail("Runtime configuration", [
+      `File: ${config.path}`,
+      `Exists: ${config.exists ? "yes" : "no — it will be created on first save"}`,
+      `Variables: ${rows.length}`,
+      "",
+      "Secret values are masked and never copied into list/detail output. Files are written atomically with mode 600 where supported.",
+      "The launcher reloads this file before every Start/Stop/Restart, so new Bruno/Coolify tokens take effect after Restart."
+    ].join("\n"), { raw: true });
+  }
+
+  async editSelectedConfig() {
+    const row = this.selected();
+    if (!row?.key) return;
+    const secret = isSecretEnvKey(row.key);
+    const value = await this.prompt(
+      `Edit ${row.key}`,
+      secret ? "New secret (blank keeps current value)" : "Value",
+      secret ? "" : row.value,
+      { secret }
+    );
+    if (value === null || (secret && value === "")) return;
+    await updateEnvConfig(this.envPath, { [row.key]: value });
+    await this.refreshConfig();
+  }
+
+  async addConfigVariable() {
+    const key = String(await this.prompt("Add variable", "Environment variable name", "") || "").trim();
+    if (!key) return;
+    if (!isValidEnvKey(key)) {
+      throw new Error("Environment variable names must use letters, numbers, and underscores and cannot start with a number.");
+    }
+    const secret = isSecretEnvKey(key);
+    const value = await this.prompt(`Set ${key}`, secret ? "Secret value" : "Value", "", { secret });
+    if (value === null) return;
+    await updateEnvConfig(this.envPath, { [key]: value });
+    await this.refreshConfig();
+  }
+
+  async clearSelectedConfig() {
+    const row = this.selected();
+    if (!row?.key) return;
+    if (!await this.confirm("Clear variable", `Set ${row.key} to an empty value?`)) return;
+    await updateEnvConfig(this.envPath, { [row.key]: "" });
+    await this.refreshConfig();
+  }
+
+  async deleteSelectedConfig() {
+    const row = this.selected();
+    if (!row?.key) return;
+    if (!await this.confirm("Delete variable", `Remove ${row.key} from .env.local?`)) return;
+    await removeEnvKeys(this.envPath, [row.key]);
+    await this.refreshConfig();
   }
 
   async refreshMemory() {
@@ -1530,7 +1639,7 @@ export class LcaTuiApp {
       preview: JSON.stringify(tool, null, 2)
     }));
     this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), `${rows.length} compact tools`);
-    this.setDetail("Tool console", "This is the escape hatch to every compact façade and all 136 hidden backend actions.\n\nSelect a façade, click Discover, then Call with a JSON input object.", { raw: true });
+    this.setDetail("Tool console", "This is the escape hatch to every compact façade and all 155 hidden backend actions.\n\nSelect a façade, click Discover, then Call with a JSON input object.", { raw: true });
   }
 
   async discoverTool() {
@@ -1609,6 +1718,7 @@ export class LcaTuiApp {
       "Files and workspaces open in a second tab strip. Pin protects a tab from close; Ctrl+W closes the active unpinned tab.",
       "Drag the list/detail divider or use Alt+Left/Right. Ctrl+P supports fuzzy action search.",
       "Command history is bounded and persisted separately for each registered workspace.",
+      "The Config screen edits .env.local locally, masks secrets, and can start/stop/restart the daemon so new integration tokens take effect.",
       "The Tool Console exposes action discovery and raw JSON calls for the complete compact surface."
     ].join("\n"), { allowTags: true });
   }
@@ -1630,8 +1740,10 @@ export class LcaTuiApp {
       { label: "⇤ Narrow list pane", searchText: "resize split pane list detail left narrower", run: () => this.adjustPaneSplit(-6) },
       { label: "⇥ Widen list pane", searchText: "resize split pane list detail right wider", run: () => this.adjustPaneSplit(6) },
       { label: "↻ Refresh active screen", searchText: "refresh reload current", run: () => this.refreshActiveView() },
+      { label: "⚙ Edit .env.local configuration", searchText: "config environment env token secret bruno coolify", run: () => this.switchView("config") },
       { label: "▶ Start managed runtime", searchText: "start runtime server daemon", run: () => this.startRuntime() },
       { label: "■ Stop managed runtime", searchText: "stop runtime server daemon", run: () => this.stopRuntime() },
+      { label: "↻ Restart managed runtime", searchText: "restart reload env runtime server daemon", run: () => this.restartRuntime() },
       { label: "⌘ Run command", searchText: "execute shell command terminal", run: () => this.switchView("commands").then(() => this.runCommandPrompt()) },
       { label: "◈ Build mandatory context", searchText: "build task context codegraph agentmemory filesystem", run: () => this.switchView("context").then(() => this.buildContext()) }
     ];
@@ -1867,7 +1979,7 @@ export class LcaTuiApp {
     });
   }
 
-  prompt(title, label, initial = "") {
+  prompt(title, label, initial = "", options = {}) {
     return new Promise((resolve) => {
       this.modalOpen = true;
       const form = blessed.form({
@@ -1891,6 +2003,7 @@ export class LcaTuiApp {
         height: 3,
         border: { type: "line" },
         value: String(initial ?? ""),
+        censor: options.secret === true,
         keys: true,
         mouse: true,
         inputOnFocus: true,

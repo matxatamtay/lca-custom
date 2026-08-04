@@ -26,7 +26,9 @@ const FACADE_NAMES = [
   "workspace_skill",
   "figma",
   "dbeaver",
-  "bruno"
+  "bruno",
+  "penpot",
+  "coolify"
 ];
 const DIRECT_NAMES = new Set(["workspace_context", "lca_input"]);
 
@@ -130,7 +132,7 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 148, `expected complete internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 167, `expected complete internal backend coverage, received ${assigned.size} actions`);
   for (const directName of DIRECT_NAMES) assert.ok(compactNames.includes(directName), `${directName} must remain direct`);
 
   const writeResult = await client.callTool({
@@ -162,7 +164,7 @@ try {
   assert.equal(status.tool_surface, "compact");
 
   const lcaInput = compactTools.find((tool) => tool.name === "lca_input");
-  assert.equal(lcaInput?._meta?.["openai/outputTemplate"], "ui://widget/lca-compact-input-v2.html");
+  assert.match(lcaInput?._meta?.["openai/outputTemplate"] || "", /^ui:\/\/widget\/lca-compact-input-v2-[a-f0-9]{12}\.html$/);
 
   process.stdout.write(`${JSON.stringify({
     ok: true,

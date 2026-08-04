@@ -1,6 +1,6 @@
 # Local Coding Agent MCP server
 
-Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees fifteen compact tools while an internal in-memory backend retains the richer implementation details.
+Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees sixteen compact tools while an internal in-memory backend retains the richer implementation details.
 
 ## Public MCP tools
 
@@ -18,6 +18,8 @@ workspace_skill
 figma
 dbeaver
 bruno
+penpot
+coolify
 lca_input
 ```
 
@@ -25,13 +27,16 @@ Use `workspace_context` first for coding tasks. It always fans out to current fi
 
 Actions execute directly without mode, policy, or approval turns. Project roots support discovery and relative paths; absolute paths are accepted. LCA is not an OS sandbox.
 
+
+`lca_input` can select a conversation-scoped primary project. The widget persists that selection for its rendered chat UI, and compact tools accept a top-level `project` envelope field. Scoped calls resolve relative paths and default discovery from that folder while explicit absolute paths can still reach another configured project. Omitting `project` preserves the existing multi-root behavior and never changes the daemon/TUI global primary root.
+
 ## Terminal UI
 
 ```bash
 lca-custom tui
 ```
 
-The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fifteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
+The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public sixteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
 
 ## Run
 
@@ -64,7 +69,7 @@ Neither dependency is exposed as a separate ChatGPT tool surface. The applicatio
 
 ## MCP integrations
 
-Figma, DBeaver, Bruno, and the remote Coolify MCP use persistent Streamable HTTP clients. Connections and `tools/list` responses are reused, concurrent connects are deduplicated, retryable transport failures reconnect once, and all clients close during graceful server exit. Coolify transport credentials come only from `COOLIFY_MCP_AUTH_TOKEN` and are never returned in status results.
+Figma, DBeaver, Bruno, and Penpot use persistent local MCP clients. Coolify runs the pinned `@masonator/coolify-mcp` package as a persistent local stdio child process. Connections and `tools/list` responses are reused, retryable transport failures reconnect once, and all clients close during graceful server exit. Penpot and Coolify credentials are fingerprinted only for process configuration identity and are never returned in status results. Both integrations separate read, ordinary mutation, and destructive calls; destructive calls require an explicit-confirmation argument.
 
 ### DBeaver SQL flow
 
@@ -100,6 +105,9 @@ Direct model-style preparation or execution without the widget capability is rej
 | `FIGMA_DESKTOP_MCP_URL` | `http://127.0.0.1:3845/mcp` | Figma Desktop MCP. |
 | `DBEAVER_DESKTOP_MCP_URL` | `http://127.0.0.1:3846/mcp` | DBeaver Desktop MCP. |
 | `BRUNO_DESKTOP_MCP_URL` | `http://127.0.0.1:3847/mcp` | Bruno Desktop MCP. |
+| `PENPOT_MCP_URL` | `http://127.0.0.1:9001/mcp/stream` | Local Penpot MCP endpoint without credentials. |
+| `PENPOT_USER_TOKEN` | empty | Generated Penpot MCP user token; store only in `.env.local`. |
+| `PENPOT_MCP_TIMEOUT_MS` | `120000` | Penpot tool timeout. |
 
 ## Tests
 
@@ -107,4 +115,4 @@ Direct model-style preparation or execution without the widget capability is rej
 npm run test:all
 ```
 
-Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
+Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:penpot`, `test:coolify`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.

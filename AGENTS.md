@@ -2,7 +2,7 @@
 
 ## Product contract
 
-Local Coding Agent is a trusted local MCP execution engine for ChatGPT. The model-facing surface is always the compact fourteen-tool facade. The complete implementation remains behind an internal in-memory backend and must never be exposed as a second public legacy surface.
+Local Coding Agent is a trusted local MCP execution engine for ChatGPT. The model-facing surface is always the compact sixteen-tool facade. The complete implementation remains behind an internal in-memory backend and must never be exposed as a second public legacy surface.
 
 `workspace_context` is the default first call for coding tasks. It must always query filesystem search, CodeGraph, and AgentMemory in parallel, then return a coverage receipt. A provider may return zero hits, but it must not be silently skipped.
 

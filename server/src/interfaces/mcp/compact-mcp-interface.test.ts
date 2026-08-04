@@ -8,6 +8,7 @@ import {
   compactDefinitionContains,
   describeCompactActions,
   facadeNames,
+  registerCompactMcpTools,
   resolveCompactAction
 } from "./compact-mcp-interface.js";
 
@@ -67,4 +68,43 @@ test("action discovery returns bounded schemas and aliases", () => {
 test("compact instructions use the real discovery action", () => {
   assert.match(COMPACT_SERVER_INSTRUCTIONS, /action=discover/);
   assert.doesNotMatch(COMPACT_SERVER_INSTRUCTIONS, /action=actions only when you need discovery/);
+});
+
+
+test("conversation project stays in the compact envelope and is not forwarded as backend input", async () => {
+  const registrations = new Map<string, {
+    definition: Record<string, unknown>;
+    handler: (args: Record<string, unknown>) => unknown | Promise<unknown>;
+  }>();
+  const calls: Array<{ name: string; args: Record<string, unknown>; project?: string }> = [];
+
+  registerCompactMcpTools({} as never, {
+    registerTool(_mcp, name, definition, handler) {
+      registrations.set(name, { definition, handler });
+    },
+    async callBackendTool(name, args = {}, project) {
+      calls.push({ name, args, ...(project ? { project } : {}) });
+      return {};
+    },
+    async listBackendTools() {
+      return backendTools;
+    },
+    registerLcaInputTool() {},
+    structuredJsonResult(value) {
+      return value;
+    }
+  });
+
+  const project = "/tmp/project-two";
+  const context = registrations.get("workspace_context");
+  const contextSchema = context?.definition.inputSchema as Record<string, unknown> | undefined;
+  assert.ok(contextSchema?.project, "workspace_context must expose a top-level project field");
+  await context?.handler({ task: "inspect", project });
+  assert.deepEqual(calls.at(-1), { name: "workspace_context", args: { task: "inspect" }, project });
+
+  const read = registrations.get("workspace_read");
+  const readSchema = read?.definition.inputSchema as Record<string, unknown> | undefined;
+  assert.ok(readSchema?.project, "facades must expose a top-level project field");
+  await read?.handler({ action: "one", project, arguments: { path: "README.md" } });
+  assert.deepEqual(calls.at(-1), { name: "read_file", args: { path: "README.md" }, project });
 });

@@ -310,7 +310,7 @@ try {
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  check("DBeaver is exposed through one compact facade", names.has("dbeaver") && !names.has("dbeaver_execute_sql") && tools.tools.length === 14, JSON.stringify([...names]));
+  check("DBeaver is exposed through one compact facade", names.has("dbeaver") && !names.has("dbeaver_execute_sql") && tools.tools.length === 16, JSON.stringify([...names]));
   const resources = await client.listResources();
   const fingerprintedArtifact = resources.resources?.find((resource) => /^ui:\/\/widget\/dbeaver-sql-artifact-[0-9a-f]{12}\.html$/.test(resource.uri));
   check("fingerprinted SQL artifact resource is listed", Boolean(fingerprintedArtifact), JSON.stringify(resources.resources));

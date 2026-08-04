@@ -4,13 +4,13 @@
 
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Script } from "node:vm";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { callCompactTool } from "./compact-test-client.mjs";
+import { callCompactTool, compactCallInput } from "./compact-test-client.mjs";
 
 const SERVER = path.resolve("server.mjs");
 let pass = 0;
@@ -112,6 +112,15 @@ async function callJson(client, name, args = {}) {
   return JSON.parse(text);
 }
 
+async function callScopedJson(client, name, args, project) {
+  const input = compactCallInput(name, args);
+  input.arguments = { ...(input.arguments || {}), project };
+  const result = await client.callTool(input);
+  const text = result.content?.[0]?.text ?? "";
+  if (result.isError) throw new Error(`${name} failed: ${text}`);
+  return JSON.parse(text);
+}
+
 const tempRoot = await mkdtemp(path.join(os.tmpdir(), "lca-pro-"));
 const base = path.join(tempRoot, "primary-project");
 const extraRoot = path.join(tempRoot, "secondary-project");
@@ -172,6 +181,23 @@ try {
   const projectRoots = await callJson(client, "workspace_search", { query: "@", include: ["folder"], limit: 20 });
   check("workspace_search exposes every project root", projectRoots.results?.some((r) => r.project === "primary-project" && r.path === ".") && projectRoots.results?.some((r) => r.project === "secondary-project" && r.path === extraRoot), JSON.stringify(projectRoots.results));
 
+  await callScopedJson(client, "write_file", { path: "conversation.txt", content: "secondary scope\n" }, extraRoot);
+  const scopedRead = await callScopedJson(client, "read_file", { path: "conversation.txt" }, extraRoot);
+  check("conversation project resolves relative writes and reads inside that project", scopedRead.content === "secondary scope\n" && scopedRead.path === "conversation.txt", JSON.stringify(scopedRead));
+  const scopedInfo = await callScopedJson(client, "workspace_info", {}, extraRoot);
+  check("conversation project changes only the effective primary root", scopedInfo.primary_root === base && scopedInfo.conversation_primary_root === extraRoot && scopedInfo.effective_primary_root === extraRoot && scopedInfo.discovery_roots?.length === 1 && scopedInfo.discovery_roots[0] === extraRoot, JSON.stringify(scopedInfo));
+  const scopedSearch = await callScopedJson(client, "workspace_search", { query: "@deep", include: ["file", "symbol"], limit: 20 }, extraRoot);
+  check("conversation project limits default discovery to one project", !scopedSearch.results?.some((r) => String(r.path).includes("feature.js")), JSON.stringify(scopedSearch.results));
+  const explicitCrossProjectRead = await callScopedJson(client, "read_file", { path: path.join(base, "README.md") }, extraRoot);
+  check("conversation project still permits explicit absolute paths to another project", explicitCrossProjectRead.content === "# Pro workspace\n", JSON.stringify(explicitCrossProjectRead));
+  const scopedPlan = await callScopedJson(client, "task_plan", { goal: "Scoped plan", steps: ["one"] }, extraRoot);
+  check("conversation task state is stored under the scoped project", scopedPlan.path === path.join(extraRoot, ".agent", "state", "current-task.json"), JSON.stringify(scopedPlan));
+  const scopedUndo = await callScopedJson(client, "undo_last_patch", {}, extraRoot);
+  let scopedFileExists = true;
+  try { await access(path.join(extraRoot, "conversation.txt")); } catch { scopedFileExists = false; }
+  const primaryFeature = await callJson(client, "read_file", { path: "src/deep/a/b/c/feature.js" });
+  check("conversation undo uses an isolated patch history", scopedUndo.ok === true && !scopedFileExists && /deepFeature/.test(primaryFeature.content), JSON.stringify(scopedUndo));
+
   const slash = await callJson(client, "slash_commands", { query: "/", limit: 20 });
   check("slash_commands omits /plan autocomplete", !slash.commands?.some((c) => c.command === "/plan"), JSON.stringify(slash.commands));
   check("slash_commands shows workflows on empty slash", slash.commands?.some((c) => c.command === "/debug" || c.command === "/implement"), JSON.stringify(slash.commands));
@@ -201,7 +227,7 @@ try {
   const workspaceContextTool = tools.tools?.find((t) => t.name === "workspace_context");
   const workspaceStatusTool = tools.tools?.find((t) => t.name === "workspace_status");
   const lcaInfo = await callJson(client, "lca", {});
-  check("model-facing surface stays at fifteen tools", toolNames.length === 15, JSON.stringify(toolNames));
+  check("model-facing surface stays at sixteen tools", toolNames.length === 16, JSON.stringify(toolNames));
   check("workspace_status facade is listed", Boolean(workspaceStatusTool), JSON.stringify(toolNames));
   check("legacy lca alias is hidden from the model", !toolNames.includes("lca"), JSON.stringify(toolNames));
   check("workspace_context tool is listed", Boolean(workspaceContextTool), JSON.stringify(toolNames));
@@ -211,12 +237,15 @@ try {
   const lcaInputTool = tools.tools?.find((t) => t.name === "lca_input");
   check("Apps SDK lca_input tool is listed", Boolean(lcaInputTool), JSON.stringify(tools.tools?.map((t) => t.name)));
   check("open_companion tool is removed", !openCompanionTool, JSON.stringify(tools.tools?.map((t) => t.name)));
-  check("Apps SDK render tool has output template", lcaInputTool?._meta?.["openai/outputTemplate"] === "ui://widget/lca-compact-input-v2.html", JSON.stringify({ lcaInput: lcaInputTool?._meta }));
+  const lcaInputTemplateUri = lcaInputTool?._meta?.["openai/outputTemplate"];
+  check("Apps SDK render tool has content-addressed output template", /^ui:\/\/widget\/lca-compact-input-v2-[a-f0-9]{12}\.html$/.test(lcaInputTemplateUri || ""), JSON.stringify({ lcaInput: lcaInputTool?._meta }));
   const resources = await client.listResources();
-  check("Apps SDK companion widget resource is listed", resources.resources?.some((r) => r.uri === "ui://widget/lca-compact-input-v2.html"), JSON.stringify(resources.resources));
-  const widgetResource = await client.readResource({ uri: "ui://widget/lca-compact-input-v2.html" });
+  check("Apps SDK companion widget resource is listed", resources.resources?.some((r) => r.uri === lcaInputTemplateUri), JSON.stringify(resources.resources));
+  check("Apps SDK companion widget keeps the legacy URI readable", resources.resources?.some((r) => r.uri === "ui://widget/lca-compact-input-v2.html"), JSON.stringify(resources.resources));
+  const widgetResource = await client.readResource({ uri: lcaInputTemplateUri });
   const widgetHtml = widgetResource.contents?.[0]?.text || "";
-  check("Apps SDK companion widget resource is html", widgetResource.contents?.[0]?.mimeType === "text/html;profile=mcp-app" && widgetHtml.includes("sendFollowUpMessage") && widgetHtml.includes("slash_commands") && widgetHtml.includes("item.mention") && widgetHtml.includes("suggestions.scrollTop = 0") && !widgetHtml.includes("Prompt output"), JSON.stringify(widgetResource.contents?.[0]));
+  check("Apps SDK companion widget resource is html", widgetResource.contents?.[0]?.mimeType === "text/html;profile=mcp-app" && widgetHtml.includes("sendFollowUpMessage") && widgetHtml.includes("project-select") && widgetHtml.includes("workspace_skill") && widgetHtml.includes("item.mention") && widgetHtml.includes("suggestions.scrollTop = 0") && !widgetHtml.includes("Prompt output"), JSON.stringify(widgetResource.contents?.[0]));
+  check("Apps SDK companion widget persists conversation project scope", widgetHtml.includes("setWidgetState") && widgetHtml.includes("ui/update-model-context") && widgetHtml.includes("lcaConversationProject"), "widget state or model-context synchronization missing");
   const widgetScript = widgetHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1] || "";
   let widgetScriptError = "";
   try {
@@ -227,7 +256,10 @@ try {
   check("Apps SDK companion widget script compiles", Boolean(widgetScript) && !widgetScriptError, widgetScriptError || "inline script missing");
   check("Apps SDK companion widget requests PiP from a user action", /id\s*=\s*(['\"])pip\1/.test(widgetHtml) && /pipButton\.addEventListener\(\s*(['\"])click\1\s*,\s*requestPipMode\s*\)/.test(widgetScript) && /requestDisplayMode\(\{\s*mode:\s*(['\"])pip\1\s*\}\)/.test(widgetScript), "PiP button, click handler, or requestDisplayMode({ mode: 'pip' }) missing");
   const lcaInput = await client.callTool({ name: "lca_input", arguments: { initial_input: "fix @deepFeature" } });
-  check("lca_input returns structured widget payload", lcaInput.structuredContent?.initial_input === "fix @deepFeature" && lcaInput.structuredContent?.projects?.length === 2 && lcaInput.structuredContent?.shortcuts?.length === 1 && lcaInput.structuredContent.shortcuts[0]?.name === "plan" && /LCA input is ready/.test(lcaInput.content?.[0]?.text || ""), JSON.stringify(lcaInput));
+  check("lca_input returns unscoped widget payload by default", lcaInput.structuredContent?.initial_input === "fix @deepFeature" && lcaInput.structuredContent?.projects?.length === 2 && lcaInput.structuredContent?.primary_project === null && lcaInput.structuredContent?.scope_mode === "all-projects" && lcaInput.structuredContent?.shortcuts?.length === 1 && lcaInput.structuredContent.shortcuts[0]?.name === "plan" && /LCA input is ready/.test(lcaInput.content?.[0]?.text || ""), JSON.stringify(lcaInput));
+  check("lca_input repeats the current template pointer in result metadata", lcaInput._meta?.["openai/outputTemplate"] === lcaInputTemplateUri && lcaInput._meta?.ui?.resourceUri === lcaInputTemplateUri, JSON.stringify(lcaInput._meta));
+  const scopedLcaInput = await client.callTool({ name: "lca_input", arguments: { primary_project: extraRoot } });
+  check("lca_input preselects a conversation project without changing global primary", scopedLcaInput.structuredContent?.primary_project === extraRoot && scopedLcaInput.structuredContent?.global_primary === base && scopedLcaInput.structuredContent?.scope_mode === "conversation-project", JSON.stringify(scopedLcaInput));
 
   const doctor = await callJson(client, "workspace_doctor", {});
   check("doctor returns score", Number.isInteger(doctor.score) && doctor.score >= 0 && doctor.score <= 100);

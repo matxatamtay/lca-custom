@@ -90,6 +90,17 @@ call lca_input
 
 Widget sẽ xuất hiện inline trước. Bấm **PiP** và kiểm tra mode được ChatGPT cấp. Khi host hỗ trợ, composer sẽ thành cửa sổ nổi; trên mobile, ChatGPT có thể mở fullscreen thay thế.
 
+### Primary project theo từng cuộc trò chuyện
+
+`lca_input` có selector **All projects / <project>**:
+
+- Chọn một project để đặt primary folder chỉ cho cuộc trò chuyện hiện tại. Relative path, cwd, search mặc định, CodeGraph, AgentMemory, task plan, checkpoint và patch undo của các LCA call trong chat đó dùng project đã chọn.
+- Global primary của daemon/TUI không bị đổi. Một chat khác có thể chọn project khác cùng lúc.
+- Các project khác vẫn truy cập được bằng absolute path hoặc context được chỉ định rõ.
+- Giữ **All projects** để không tạo conversation scope và tiếp tục surf toàn bộ project roots như trước.
+
+Widget lưu lựa chọn trong widget state của chính UI instance và cập nhật model context cho các turn tiếp theo. Không có state server-global theo conversation.
+
 ## 5. Đổi Repo
 
 ```bash

@@ -562,7 +562,10 @@ function configId(opts) {
   const figmaBridgePath = join(SERVER_DIR, "figma-desktop.mjs");
   const dbeaverBridgePath = join(SERVER_DIR, "dbeaver-desktop.mjs");
   const brunoBridgePath = join(SERVER_DIR, "bruno-desktop.mjs");
+  const penpotBridgePath = join(SERVER_DIR, "penpot-desktop.mjs");
   const coolifyBridgePath = join(SERVER_DIR, "coolify-mcp.mjs");
+  const coolifyClientPath = join(SERVER_DIR, "coolify-mcp-client.mjs");
+  const coolifyPolicyPath = join(SERVER_DIR, "coolify-mcp-policy.mjs");
   const persistentHttpBridgePath = join(SERVER_DIR, "persistent-http-mcp-client.mjs");
   const nextRuntimePath = join(SERVER_DIR, "dist");
   const material = JSON.stringify({
@@ -576,14 +579,22 @@ function configId(opts) {
     figmaBridgeHash: existsSync(figmaBridgePath) ? sha256(readFileSync(figmaBridgePath)).slice(0, 16) : "missing",
     dbeaverBridgeHash: existsSync(dbeaverBridgePath) ? sha256(readFileSync(dbeaverBridgePath)).slice(0, 16) : "missing",
     brunoBridgeHash: existsSync(brunoBridgePath) ? sha256(readFileSync(brunoBridgePath)).slice(0, 16) : "missing",
+    penpotBridgeHash: existsSync(penpotBridgePath) ? sha256(readFileSync(penpotBridgePath)).slice(0, 16) : "missing",
     coolifyBridgeHash: existsSync(coolifyBridgePath) ? sha256(readFileSync(coolifyBridgePath)).slice(0, 16) : "missing",
+    coolifyClientHash: existsSync(coolifyClientPath) ? sha256(readFileSync(coolifyClientPath)).slice(0, 16) : "missing",
+    coolifyPolicyHash: existsSync(coolifyPolicyPath) ? sha256(readFileSync(coolifyPolicyPath)).slice(0, 16) : "missing",
     persistentHttpBridgeHash: existsSync(persistentHttpBridgePath) ? sha256(readFileSync(persistentHttpBridgePath)).slice(0, 16) : "missing",
     figmaDesktopMcpUrl: figmaDesktopEndpoint(),
     figmaDesktopTimeoutMs: process.env.FIGMA_DESKTOP_TIMEOUT_MS || "30000",
     figmaDesktopAllowRemote: process.env.FIGMA_DESKTOP_ALLOW_REMOTE === "1",
-    coolifyMcpUrl: process.env.COOLIFY_MCP_URL || "http://36.50.55.5:8000/mcp",
-    coolifyMcpAuthHash: process.env.COOLIFY_MCP_AUTH_TOKEN
-      ? sha256(Buffer.from(process.env.COOLIFY_MCP_AUTH_TOKEN)).slice(0, 16)
+    penpotMcpUrl: process.env.PENPOT_MCP_URL || "http://127.0.0.1:9001/mcp/stream",
+    penpotMcpTimeoutMs: process.env.PENPOT_MCP_TIMEOUT_MS || "120000",
+    penpotUserTokenHash: process.env.PENPOT_USER_TOKEN
+      ? sha256(Buffer.from(process.env.PENPOT_USER_TOKEN)).slice(0, 16)
+      : "none",
+    coolifyBaseUrl: process.env.COOLIFY_BASE_URL || "",
+    coolifyAccessTokenHash: process.env.COOLIFY_ACCESS_TOKEN
+      ? sha256(Buffer.from(process.env.COOLIFY_ACCESS_TOKEN)).slice(0, 16)
       : "none"
   });
   return createHash("sha256").update(material).digest("hex").slice(0, 16);
@@ -1368,7 +1379,7 @@ async function setup(flags) {
     cfg.node = cfg.node || "node";
     cfg.workspace = await promptLine(rl, "First project root", cfg.workspace || process.cwd());
     cfg.port = await promptLine(rl, "MCP port", cfg.port || DEFAULT_PORT);
-    console.log("Runtime: trusted-local, compact 14-tool facade, direct execution without policy or approval round-trips.");
+    console.log("Runtime: trusted-local, compact 16-tool facade, direct execution without policy or approval round-trips.");
     cfg.extraRoots = flags.extraRoots ?? cfg.extraRoots ?? "";
     cfg.authToken = flags.authToken ?? cfg.authToken ?? "";
 

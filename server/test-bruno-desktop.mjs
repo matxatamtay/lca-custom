@@ -339,7 +339,7 @@ try {
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  check("Bruno is exposed through one compact facade", names.has("bruno") && !names.has("bruno_call_tool") && tools.tools.length === 14, JSON.stringify([...names]));
+  check("Bruno is exposed through one compact facade", names.has("bruno") && !names.has("bruno_call_tool") && tools.tools.length === 16, JSON.stringify([...names]));
 
   const collection = await call(client, "bruno_create_collection", {
     workspace_path: "/workspace/demo",

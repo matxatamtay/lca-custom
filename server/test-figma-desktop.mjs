@@ -232,7 +232,7 @@ try {
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  check("Figma is exposed through one compact facade", names.has("figma") && !names.has("figma_call_tool") && tools.tools.length === 14, JSON.stringify([...names]));
+  check("Figma is exposed through one compact facade", names.has("figma") && !names.has("figma_call_tool") && tools.tools.length === 16, JSON.stringify([...names]));
 
   const bridgeStatus = await call(client, "figma_status");
   const bridgeStatusJson = JSON.parse(bridgeStatus.content?.[0]?.text || "{}");

@@ -5,10 +5,11 @@ import { TARGET_TOOL_CATALOG } from "./tool-catalog.js";
 
 export const COMPACT_SERVER_INSTRUCTIONS = [
   "For every coding task call workspace_context first. It always queries current files, CodeGraph, and AgentMemory and returns a coverage receipt.",
+  "When lca_input provides a conversation primary folder, pass it as the top-level project field on every LCA tool call in that conversation. Omit project to preserve normal multi-project discovery.",
   "Use the compact facade tools. Each facade accepts a short action alias or an exact hidden backend tool name plus an arguments object. Call action=discover only when you need facade action discovery.",
   "Actions execute directly in the trusted local runtime without policy or approval round-trips. Project roots are discovery defaults, not authorization boundaries.",
   "Batch work, keep outputs bounded, and avoid repeating reads or commands. Use workspace_verify before declaring code changes complete.",
-  "Use figma, dbeaver, and bruno for desktop integrations, and coolify for the configured remote Coolify MCP. Use lca_input for the ChatGPT companion UI."
+  "Use figma, dbeaver, bruno, and penpot for desktop/design integrations, and coolify for the pinned local Coolify MCP stdio bridge. Penpot and Coolify destructive actions require the destructive alias and explicit confirmation. Use lca_input for the ChatGPT companion UI."
 ].join("\n");
 
 export interface BackendToolDefinition {
@@ -162,9 +163,31 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
     aliases: { status: "bruno_status", actions: "bruno_list_tools", call: "bruno_call_tool", run: "bruno_run_request" },
     prefix: "bruno_"
   },
+  penpot: {
+    defaultAction: "penpot_status",
+    aliases: {
+      status: "penpot_status",
+      actions: "penpot_list_tools",
+      call: "penpot_call_tool",
+      read: "penpot_read_tool",
+      inspect: "penpot_inspect_page",
+      selection: "penpot_inspect_selection",
+      export: "penpot_export_shape",
+      mutate: "penpot_execute_code",
+      destructive: "penpot_execute_destructive_code"
+    },
+    prefix: "penpot_"
+  },
   coolify: {
     defaultAction: "coolify_status",
-    aliases: { status: "coolify_status", actions: "coolify_list_tools", call: "coolify_call_tool" },
+    aliases: {
+      status: "coolify_status",
+      actions: "coolify_list_tools",
+      call: "coolify_call_tool",
+      read: "coolify_read_tool",
+      mutate: "coolify_mutate_tool",
+      destructive: "coolify_destructive_tool"
+    },
     prefix: "coolify_"
   }
 });
@@ -182,7 +205,8 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   figma: "Use the persistent Figma Desktop integration. Common actions: status, actions, call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",
   bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action.",
-  coolify: "Use the configured remote Coolify MCP integration. Common actions: status, actions, call, or an exact coolify_* backend action."
+  penpot: "Use the local Penpot MCP integration. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.",
+  coolify: "Use the pinned local Coolify MCP stdio integration. Common actions: status, actions, read, mutate, destructive, call, or an exact coolify_* backend action."
 });
 
 export interface CompactMcpInterfaceDependencies {
@@ -192,7 +216,7 @@ export interface CompactMcpInterfaceDependencies {
     definition: Record<string, unknown>,
     handler: (args: Record<string, unknown>, extra?: unknown) => unknown | Promise<unknown>
   ): void;
-  callBackendTool(name: string, args?: Record<string, unknown>): Promise<unknown>;
+  callBackendTool(name: string, args?: Record<string, unknown>, project?: string): Promise<unknown>;
   listBackendTools(): Promise<readonly BackendToolDefinition[]>;
   registerLcaInputTool(mcp: McpServer, name: string, title: string, description: string): void;
   structuredJsonResult(value: unknown): unknown;
@@ -211,6 +235,7 @@ export function registerCompactMcpTools(
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question."),
+        project: z.string().optional().describe("Conversation-scoped primary project or folder selected in lca_input. Relative paths and default discovery use it only for this tool call."),
         path: z.string().optional().describe("Root or subdirectory to inspect."),
         intent: z.enum(["understand", "debug", "implement", "refactor", "review"]).optional(),
         changed_files: z.array(z.string()).optional(),
@@ -218,7 +243,10 @@ export function registerCompactMcpTools(
         max_chars: z.number().int().min(1000).max(100000).optional()
       }
     },
-    async (args) => dependencies.callBackendTool("workspace_context", args)
+    async (rawArgs) => {
+      const { project, ...args } = rawArgs;
+      return dependencies.callBackendTool("workspace_context", args, nonEmptyString(project));
+    }
   );
 
   for (const facade of facadeNames()) {
@@ -231,6 +259,7 @@ export function registerCompactMcpTools(
         description: `${COMPACT_TOOL_DESCRIPTIONS[facade]} Use action=discover to list exact backend actions and their input keys.`,
         inputSchema: {
           action: z.string().optional().describe(`Short alias or exact backend tool name. Default: ${definition.defaultAction}. Use discover for available actions.`),
+          project: z.string().optional().describe("Conversation-scoped primary project or folder selected in lca_input. Relative paths and default discovery use it only for this tool call."),
           arguments: z.record(z.any()).optional().describe("Arguments forwarded unchanged to the selected backend tool.")
         }
       },
@@ -243,7 +272,7 @@ export function registerCompactMcpTools(
           );
         }
         const hiddenTool = resolveCompactAction(facade, action, await dependencies.listBackendTools());
-        return dependencies.callBackendTool(hiddenTool, forwardedArguments);
+        return dependencies.callBackendTool(hiddenTool, forwardedArguments, nonEmptyString(rawArgs.project));
       }
     );
   }

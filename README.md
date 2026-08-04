@@ -12,13 +12,13 @@ Trusted local MCP execution engine for ChatGPT with mandatory CodeGraph and Agen
 
 ## What ships
 
-ChatGPT sees exactly fifteen tools:
+ChatGPT sees exactly sixteen tools:
 
 ```text
 workspace_context  workspace_search  workspace_read   workspace_edit
 workspace_exec     workspace_process workspace_git    workspace_verify
 workspace_status   workspace_skill   figma            dbeaver
-bruno              lca_input
+bruno              penpot           coolify          lca_input
 ```
 
 `workspace_context` is the default first call for coding tasks. Every call queries three required providers in parallel:
@@ -94,11 +94,13 @@ Detailed connector instructions: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WE
 
 ## Architecture
 
-The model-facing MCP server dispatches into an internal in-memory backend containing 136 implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
+The model-facing MCP server dispatches into an internal in-memory backend containing 155 implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
 
 CodeGraph runs through a lazy persistent stdio MCP connection. AgentMemory runs as a separately pinned companion service with automatic health checking, startup, session lifecycle, observations, decision memories, export, and import. Its default lean install uses BM25 without requiring an external LLM key.
 
-Figma, DBeaver, Bruno, and the remote Coolify MCP share persistent Streamable HTTP clients with single-flight connection setup, cached `tools/list`, one retry after transport failure, and graceful close.
+Figma, DBeaver, Bruno, and Penpot use persistent local MCP clients. Coolify uses the pinned local `@masonator/coolify-mcp` stdio process. All integrations reuse connections, retry transport failures once, and close gracefully.
+
+`lca-custom tui` includes a Config screen that reads and edits the repository `.env.local`, masks secret values, writes with mode `600` where supported, and exposes Start, Stop, and Restart controls. The launcher reloads the latest file before each lifecycle command, so changing a Bruno, Penpot, or Coolify token does not require leaving the TUI.
 
 More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITECTURE.md).
 
@@ -118,9 +120,13 @@ Enable the official Figma Desktop MCP server in Dev Mode. LCA defaults to `http:
 
 Enable Bruno Desktop MCP and configure its local bearer token. LCA exposes collection, folder, request, environment, dotenv, preparation, execution, and retained-result capabilities through the single `bruno` facade.
 
+### Penpot
+
+Run the local Penpot stack, open the target design file, and connect MCP from Penpot. Keep the endpoint token-free in `PENPOT_MCP_URL` and store the generated credential separately in `PENPOT_USER_TOKEN`. The single `penpot` facade provides page/selection inspection, Plugin API lookup, PNG/SVG export, non-destructive drawing/edit code, and explicitly confirmed destructive code.
+
 ### Coolify
 
-Set `COOLIFY_MCP_URL` and `COOLIFY_MCP_AUTH_TOKEN` in `.env.local`. LCA exposes the upstream server through the single `coolify` facade; future upstream tools become callable through `coolify_call_tool` without adding another model-facing tool.
+Set `COOLIFY_BASE_URL` and `COOLIFY_ACCESS_TOKEN` in `.env.local`. LCA starts the pinned `@masonator/coolify-mcp` package over local stdio and exposes it through the single `coolify` facade. Use `read` for reads, `mutate` for create/update/deploy/start/restart operations, and `destructive` only after explicit confirmation for delete/stop/cancel/API-disable operations. The compatibility `call` action permits reads and ordinary mutations but rejects destructive operations.
 
 ### DBeaver
 
@@ -157,7 +163,7 @@ Historical baseline versus the compact runtime:
 
 | Metric | Before | Current target |
 |---|---:|---:|
-| Model-facing tools | 143 | 15 |
+| Model-facing tools | 143 | 16 |
 | `tools/list` bytes | 91,420 | under 20,000 |
 | Server instruction chars | 4,458 | under 1,000 |
 

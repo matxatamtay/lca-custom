@@ -27,6 +27,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
+import { ConversationProjectScope } from "./dist/orchestration/conversation-project-scope.js";
 import { summarizeArgs } from "./core/redaction.mjs";
 import {
   WorkspaceProtocol,
@@ -58,8 +59,23 @@ import {
   listBrunoDesktopTools
 } from "./bruno-desktop.mjs";
 import {
-  DEFAULT_COOLIFY_MCP_URL,
+  DEFAULT_PENPOT_MCP_URL,
+  callDestructivePenpotTool,
+  callMutatingPenpotTool,
+  callPenpotTool,
+  callReadOnlyPenpotTool,
+  closePenpotClients,
+  inspectPenpotPage,
+  inspectPenpotSelection,
+  listPenpotTools,
+  penpotStatus
+} from "./penpot-desktop.mjs";
+import {
+  DEFAULT_COOLIFY_BASE_URL,
   callCoolifyMcpTool,
+  callDestructiveCoolifyMcpTool,
+  callMutatingCoolifyMcpTool,
+  callReadOnlyCoolifyMcpTool,
   closeCoolifyMcpClients,
   coolifyMcpStatus,
   listCoolifyMcpTools
@@ -124,9 +140,10 @@ async function closeNextApplicationRuntime() {
   await lifecycleLog("next runtime close completed");
 }
 const COMPANION_WIDGET_PATH = path.join(APP_DIR, "lca-compact-input-v2.html");
-const COMPANION_WIDGET_URI = "ui://widget/lca-compact-input-v2.html";
+const COMPANION_WIDGET_LEGACY_URI = "ui://widget/lca-compact-input-v2.html";
 const DBEAVER_SQL_ARTIFACT_PATH = path.join(APP_DIR, "dbeaver-sql-artifact.html");
 const COMPANION_WIDGET_RESOURCE = loadRequiredHtmlResource(COMPANION_WIDGET_PATH, "LCA companion widget");
+const COMPANION_WIDGET_URI = `ui://widget/lca-compact-input-v2-${COMPANION_WIDGET_RESOURCE.sha256.slice(0, 12)}.html`;
 const DBEAVER_SQL_ARTIFACT_RESOURCE = loadRequiredHtmlResource(DBEAVER_SQL_ARTIFACT_PATH, "DBeaver SQL artifact");
 const DBEAVER_SQL_ARTIFACT_URI = `ui://widget/dbeaver-sql-artifact-${DBEAVER_SQL_ARTIFACT_RESOURCE.sha256.slice(0, 12)}.html`;
 const DBEAVER_SQL_ARTIFACT_LEGACY_URI = "ui://widget/dbeaver-sql-artifact.html";
@@ -141,6 +158,18 @@ const STARTUP_PROFILE = (() => {
 })();
 const EXTRA_ROOTS = parseExtraRoots();
 const ROOTS = dedupe([PRIMARY_ROOT, ...EXTRA_ROOTS]);
+const CONVERSATION_PROJECT_SCOPE = new ConversationProjectScope({
+  primaryRoot: PRIMARY_ROOT,
+  roots: ROOTS
+});
+
+function activePrimaryRoot() {
+  return CONVERSATION_PROJECT_SCOPE.primaryRoot();
+}
+
+function activeDiscoveryRoots() {
+  return CONVERSATION_PROJECT_SCOPE.discoveryRoots();
+}
 
 // LCA is a trusted local execution engine. Project roots drive discovery and
 // relative-path routing; they are not authorization boundaries.
@@ -181,9 +210,12 @@ const dbeaverRunIntents = new Map();
 const BRUNO_DESKTOP_MCP_URL = String(process.env.BRUNO_DESKTOP_MCP_URL || DEFAULT_BRUNO_DESKTOP_MCP_URL).trim();
 const BRUNO_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.BRUNO_DESKTOP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const BRUNO_DESKTOP_AUTH_TOKEN = String(process.env.BRUNO_DESKTOP_AUTH_TOKEN || "").trim();
-const COOLIFY_MCP_URL = String(process.env.COOLIFY_MCP_URL || DEFAULT_COOLIFY_MCP_URL).trim();
+const PENPOT_MCP_URL = String(process.env.PENPOT_MCP_URL || DEFAULT_PENPOT_MCP_URL).trim();
+const PENPOT_MCP_TIMEOUT_MS = boundedNumber(process.env.PENPOT_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
+const PENPOT_USER_TOKEN = String(process.env.PENPOT_USER_TOKEN || "").trim();
+const COOLIFY_BASE_URL = String(process.env.COOLIFY_BASE_URL || DEFAULT_COOLIFY_BASE_URL).trim();
 const COOLIFY_MCP_TIMEOUT_MS = boundedNumber(process.env.COOLIFY_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
-const COOLIFY_MCP_AUTH_TOKEN = String(process.env.COOLIFY_MCP_AUTH_TOKEN || "").trim();
+const COOLIFY_ACCESS_TOKEN = String(process.env.COOLIFY_ACCESS_TOKEN || "").trim();
 
 const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "get_code_connect_map",
@@ -206,6 +238,25 @@ const INDEX_PATH = path.resolve(WORKSPACE_DATA_DIR, "index.json");
 const PATCH_HISTORY_PATH = path.resolve(WORKSPACE_DATA_DIR, "patch-history.json");
 const BACKUPS_DIR = path.resolve(WORKSPACE_DATA_DIR, "backups");
 
+function activePatchDataDir() {
+  const scopedRoot = CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+  if (!scopedRoot) return WORKSPACE_DATA_DIR;
+  const scopeId = createHash("sha256").update(comparePath(scopedRoot)).digest("hex").slice(0, 16);
+  return path.join(WORKSPACE_DATA_DIR, "conversation-projects", scopeId);
+}
+
+function activePatchHistoryPath() {
+  return CONVERSATION_PROJECT_SCOPE.isScoped()
+    ? path.join(activePatchDataDir(), "patch-history.json")
+    : PATCH_HISTORY_PATH;
+}
+
+function activeBackupsDir() {
+  return CONVERSATION_PROJECT_SCOPE.isScoped()
+    ? path.join(activePatchDataDir(), "backups")
+    : BACKUPS_DIR;
+}
+
 // v2.5 Planner state
 const AGENT_STATE_DIR = path.join(PRIMARY_ROOT, ".agent", "state");
 const TASK_PLAN_PATH = path.join(AGENT_STATE_DIR, "current-task.json");
@@ -217,6 +268,24 @@ const WORKSPACE_PROTOCOL = new WorkspaceProtocol({
   stateDir: AGENT_STATE_DIR,
   vaultDir: MEMORY_VAULT_PATH
 });
+
+function activeAgentStateDir() {
+  const scopedRoot = CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+  return scopedRoot ? path.join(scopedRoot, ".agent", "state") : AGENT_STATE_DIR;
+}
+
+function activeTaskPlanPath() {
+  return path.join(activeAgentStateDir(), "current-task.json");
+}
+
+function activeDecisionsPath() {
+  return path.join(activeAgentStateDir(), "decisions.md");
+}
+
+function activeCheckpointPath() {
+  const scopedRoot = CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+  return scopedRoot ? path.join(scopedRoot, ".agent", "state", "checkpoint.json") : CHECKPOINT_PATH;
+}
 
 // v2.8 Profile
 let WORKSPACE_PROFILE = STARTUP_PROFILE;
@@ -348,6 +417,7 @@ const httpServer = http.createServer(async (req, res) => {
         app_resources: {
           companion_widget: {
             uri: COMPANION_WIDGET_URI,
+            legacy_uri: COMPANION_WIDGET_LEGACY_URI,
             bytes: COMPANION_WIDGET_RESOURCE.bytes,
             sha256: COMPANION_WIDGET_RESOURCE.sha256
           },
@@ -420,6 +490,7 @@ async function gracefulExit(signal) {
       closeFigmaDesktopClients(),
       closeDBeaverDesktopClients(),
       closeBrunoDesktopClients(),
+      closePenpotClients(),
       closeCoolifyMcpClients()
     ]);
     await lifecycleLog(`${signal} cleanup completed`);
@@ -495,6 +566,7 @@ function registerBackendTools(mcp) {
   registerFigmaDesktopTools(mcp);
   registerDBeaverDesktopTools(mcp);
   registerBrunoDesktopTools(mcp);
+  registerPenpotMcpTools(mcp);
   registerCoolifyMcpTools(mcp);
   registerFsReadTools(mcp);
   registerFsWriteTools(mcp);
@@ -514,7 +586,8 @@ function registerBackendTools(mcp) {
 function registerCompactTools(mcp) {
   compactMcpInterface.registerCompactMcpTools(mcp, {
     registerTool: reg,
-    callBackendTool: callLegacyTool,
+    callBackendTool: (name, args, project) =>
+      CONVERSATION_PROJECT_SCOPE.run(project, () => callLegacyTool(name, args)),
     listBackendTools: async () => (await getLegacyBackendRuntime()).tools,
     registerLcaInputTool,
     structuredJsonResult
@@ -946,13 +1019,221 @@ function registerBrunoDesktopTools(mcp) {
   forward("bruno_list_request_runs", "List Bruno request runs", "List request runs retained by the current Bruno Desktop process.", readOnly, { limit: z.number().int().min(1).max(1000).optional() });
 }
 
+function registerPenpotMcpTools(mcp) {
+  const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true };
+  const mutation = { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false };
+  const destructive = { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false };
+  const bridgeOptions = {
+    endpoint: PENPOT_MCP_URL,
+    timeoutMs: PENPOT_MCP_TIMEOUT_MS,
+    userToken: PENPOT_USER_TOKEN
+  };
+
+  reg(
+    mcp,
+    "penpot_status",
+    {
+      title: "Penpot MCP status",
+      description: "Check the local Penpot MCP connection and list live design tools without exposing the user token.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => jsonResult(await penpotStatus(bridgeOptions))
+  );
+
+  reg(
+    mcp,
+    "penpot_list_tools",
+    {
+      title: "List Penpot MCP tools",
+      description: "List every live Penpot MCP tool with its annotations and JSON schema.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => {
+      const result = await listPenpotTools(bridgeOptions);
+      return jsonResult({ endpoint: PENPOT_MCP_URL, count: result.tools.length, tools: result.tools });
+    }
+  );
+
+  reg(
+    mcp,
+    "penpot_call_tool",
+    {
+      title: "Call a safe Penpot MCP tool",
+      description: "Compatibility action for Penpot reads and ordinary mutations. Code that appears destructive is rejected.",
+      annotations: mutation,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callPenpotTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_read_tool",
+    {
+      title: "Call a read-only Penpot tool",
+      description: "Call only high-level overview, API documentation, export, or another upstream tool marked read-only.",
+      annotations: readOnly,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callReadOnlyPenpotTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_mutate_tool",
+    {
+      title: "Call a non-destructive Penpot mutation",
+      description: "Run Penpot execute_code for creation and ordinary edits. Delete/remove/clear-like code is rejected.",
+      annotations: mutation,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callMutatingPenpotTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_destructive_tool",
+    {
+      title: "Call a destructive Penpot operation",
+      description: "Run delete/remove/clear-like Penpot code only after explicit confirmation of the exact design impact.",
+      annotations: destructive,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional(),
+        confirmed: z.literal(true).describe("Must be true only after explicit user confirmation of the exact destructive design operation.")
+      }
+    },
+    async ({ tool, arguments: upstreamArguments, confirmed }) => callDestructivePenpotTool(
+      tool,
+      upstreamArguments || {},
+      { ...bridgeOptions, confirmed }
+    )
+  );
+
+  reg(
+    mcp,
+    "penpot_overview",
+    {
+      title: "Read Penpot MCP overview",
+      description: "Read the Penpot MCP high-level usage guide before using execute_code.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => callReadOnlyPenpotTool("high_level_overview", {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_api_info",
+    {
+      title: "Read Penpot Plugin API information",
+      description: "Look up a Penpot Plugin API type and optionally one member before generating design code.",
+      annotations: readOnly,
+      inputSchema: {
+        type: z.string().min(1),
+        member: z.string().min(1).optional()
+      }
+    },
+    async (args) => callReadOnlyPenpotTool("penpot_api_info", args, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_inspect_page",
+    {
+      title: "Inspect current Penpot page",
+      description: "Read a bounded tree of shapes from the currently focused Penpot page.",
+      annotations: readOnly,
+      inputSchema: {
+        max_depth: z.number().int().min(0).max(12).optional(),
+        max_shapes: z.number().int().min(1).max(5000).optional()
+      }
+    },
+    async ({ max_depth, max_shapes }) => inspectPenpotPage({ ...bridgeOptions, maxDepth: max_depth, maxShapes: max_shapes })
+  );
+
+  reg(
+    mcp,
+    "penpot_inspect_selection",
+    {
+      title: "Inspect current Penpot selection",
+      description: "Read a bounded tree rooted at the currently selected Penpot shapes.",
+      annotations: readOnly,
+      inputSchema: {
+        max_depth: z.number().int().min(0).max(12).optional(),
+        max_shapes: z.number().int().min(1).max(5000).optional()
+      }
+    },
+    async ({ max_depth, max_shapes }) => inspectPenpotSelection({ ...bridgeOptions, maxDepth: max_depth, maxShapes: max_shapes })
+  );
+
+  reg(
+    mcp,
+    "penpot_export_shape",
+    {
+      title: "Export Penpot shape",
+      description: "Export a shape, the first selected shape, or the current page as PNG or SVG for visual review.",
+      annotations: readOnly,
+      inputSchema: {
+        shape_id: z.string().min(1).describe("Shape ID, selection, or page."),
+        format: z.enum(["png", "svg"]).optional(),
+        mode: z.enum(["shape", "fill"]).optional()
+      }
+    },
+    async ({ shape_id, format, mode }) => callReadOnlyPenpotTool("export_shape", {
+      shapeId: shape_id,
+      ...(format ? { format } : {}),
+      ...(mode ? { mode } : {})
+    }, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_execute_code",
+    {
+      title: "Execute non-destructive Penpot code",
+      description: "Execute JavaScript in the active Penpot plugin context for drawing and ordinary edits. Destructive-looking code is blocked.",
+      annotations: mutation,
+      inputSchema: { code: z.string().min(1) }
+    },
+    async ({ code }) => callMutatingPenpotTool("execute_code", { code }, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "penpot_execute_destructive_code",
+    {
+      title: "Execute destructive Penpot code",
+      description: "Execute delete/remove/clear-like JavaScript only after explicit user confirmation.",
+      annotations: destructive,
+      inputSchema: {
+        code: z.string().min(1),
+        confirmed: z.literal(true).describe("Must be true only after explicit user confirmation of the exact destructive design operation.")
+      }
+    },
+    async ({ code, confirmed }) => callDestructivePenpotTool("execute_code", { code }, { ...bridgeOptions, confirmed })
+  );
+}
+
 function registerCoolifyMcpTools(mcp) {
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true };
-  const mutation = { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false };
+  const mutation = { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false };
+  const destructive = { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false };
   const bridgeOptions = {
-    endpoint: COOLIFY_MCP_URL,
+    baseUrl: COOLIFY_BASE_URL,
     timeoutMs: COOLIFY_MCP_TIMEOUT_MS,
-    authToken: COOLIFY_MCP_AUTH_TOKEN
+    accessToken: COOLIFY_ACCESS_TOKEN
   };
 
   reg(
@@ -960,7 +1241,7 @@ function registerCoolifyMcpTools(mcp) {
     "coolify_status",
     {
       title: "Coolify MCP status",
-      description: "Check the configured remote Coolify MCP endpoint and list its live tools without exposing the bearer token.",
+      description: "Start the pinned local Coolify MCP stdio server, verify the configured Coolify API connection, and list live tools without exposing the API token.",
       annotations: readOnly,
       inputSchema: {}
     },
@@ -972,13 +1253,13 @@ function registerCoolifyMcpTools(mcp) {
     "coolify_list_tools",
     {
       title: "List Coolify MCP tools",
-      description: "List every tool and JSON schema exposed by the configured Coolify MCP server.",
+      description: "List every tool, annotation, and JSON schema exposed by the pinned local Coolify MCP package.",
       annotations: readOnly,
       inputSchema: {}
     },
     async () => {
       const result = await listCoolifyMcpTools(bridgeOptions);
-      return jsonResult({ endpoint: COOLIFY_MCP_URL, count: result.tools.length, tools: result.tools });
+      return jsonResult({ base_url: COOLIFY_BASE_URL, transport: "stdio", count: result.tools.length, tools: result.tools });
     }
   );
 
@@ -987,7 +1268,7 @@ function registerCoolifyMcpTools(mcp) {
     "coolify_call_tool",
     {
       title: "Call any Coolify MCP tool",
-      description: "Forward a call to any currently exposed Coolify MCP tool. Use coolify_list_tools first to inspect the exact upstream schema.",
+      description: "Compatibility action for reads and ordinary mutations. Destructive actions are rejected and must use coolify_destructive_tool after explicit user confirmation.",
       annotations: mutation,
       inputSchema: {
         tool: z.string().min(1),
@@ -995,6 +1276,56 @@ function registerCoolifyMcpTools(mcp) {
       }
     },
     async ({ tool, arguments: upstreamArguments }) => callCoolifyMcpTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "coolify_read_tool",
+    {
+      title: "Call a read-only Coolify tool",
+      description: "Call a Coolify operation only when its live annotations/action classify it as read-only.",
+      annotations: readOnly,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callReadOnlyCoolifyMcpTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "coolify_mutate_tool",
+    {
+      title: "Call a non-destructive Coolify mutation",
+      description: "Call a create, update, deploy, start, restart, attach, or similar non-destructive Coolify operation. Read and destructive actions are rejected.",
+      annotations: mutation,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: upstreamArguments }) => callMutatingCoolifyMcpTool(tool, upstreamArguments || {}, bridgeOptions)
+  );
+
+  reg(
+    mcp,
+    "coolify_destructive_tool",
+    {
+      title: "Call a destructive Coolify operation",
+      description: "Call delete, stop, cancel, API-disable, or emergency-stop operations only after the user explicitly confirms the exact operation and blast radius.",
+      annotations: destructive,
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional(),
+        confirmed: z.literal(true).describe("Must be true only after explicit user confirmation of the exact destructive operation.")
+      }
+    },
+    async ({ tool, arguments: upstreamArguments, confirmed }) => callDestructiveCoolifyMcpTool(
+      tool,
+      upstreamArguments || {},
+      { ...bridgeOptions, confirmed }
+    )
   );
 }
 
@@ -1382,7 +1713,7 @@ function registerSkillTools(mcp) {
 
 // First workspace skills dir for authoring: <PRIMARY_ROOT>/.claude/skills.
 function defaultSkillsDir() {
-  return path.join(PRIMARY_ROOT, ".claude", "skills");
+  return path.join(activePrimaryRoot(), ".claude", "skills");
 }
 
 // Skill folder names: keep them simple path segments (no separators / traversal).
@@ -1511,6 +1842,12 @@ function registerCompanionAppResources(mcp) {
     async () => widgetResourcePayload(COMPANION_WIDGET_URI, COMPANION_WIDGET_RESOURCE, companionDescription)
   );
   mcp.registerResource(
+    "lca-companion-widget-legacy",
+    COMPANION_WIDGET_LEGACY_URI,
+    {},
+    async () => widgetResourcePayload(COMPANION_WIDGET_LEGACY_URI, COMPANION_WIDGET_RESOURCE, companionDescription)
+  );
+  mcp.registerResource(
     "dbeaver-sql-artifact-widget",
     DBEAVER_SQL_ARTIFACT_URI,
     {},
@@ -1540,7 +1877,7 @@ function registerCompanionTools(mcp) {
       }
     },
     async ({ query = "", path: rel, include, limit = 30 }) => {
-      const rootDirs = rel ? [resolvePath(rel)] : ROOTS;
+      const rootDirs = rel ? [resolvePath(rel)] : activeDiscoveryRoots();
       const result = await workspaceSearchData(rootDirs, query, { include, limit });
       return structuredJsonResult(result);
     }
@@ -1581,8 +1918,14 @@ function registerCompanionTools(mcp) {
       }
     },
     async ({ input, path: rel, mode, selected_context = [], include_context_pack = true }) => {
-      const rootDirs = rel ? [resolvePath(rel)] : ROOTS;
-      const result = await composeLcaPrompt(input, rootDirs, { mode, selectedContext: selected_context, includeContextPack: include_context_pack });
+      const conversationPrimary = rel ? resolvePath(rel) : CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+      const rootDirs = rel ? [conversationPrimary] : activeDiscoveryRoots();
+      const result = await composeLcaPrompt(input, rootDirs, {
+        mode,
+        selectedContext: selected_context,
+        includeContextPack: include_context_pack,
+        conversationPrimary
+      });
       return structuredJsonResult(result);
     }
   );
@@ -1599,7 +1942,8 @@ function registerLcaInputTool(mcp, name, title, description) {
       description,
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
-        initial_input: z.string().optional().describe("Optional text to prefill in the companion composer.")
+        initial_input: z.string().optional().describe("Optional text to prefill in the companion composer."),
+        primary_project: z.string().optional().describe("Optional project or nested folder to preselect for this rendered conversation input. This never changes the global LCA primary project.")
       },
       _meta: {
         ui: { resourceUri: COMPANION_WIDGET_URI, visibility: ["model", "app"] },
@@ -1609,10 +1953,14 @@ function registerLcaInputTool(mcp, name, title, description) {
         "openai/toolInvocation/invoked": "LCA input ready."
       }
     },
-    async ({ initial_input = "" }) => {
+    async ({ initial_input = "", primary_project }) => {
+      const primaryProject = CONVERSATION_PROJECT_SCOPE.normalize(primary_project);
       const payload = {
         initial_input,
         workspace: PRIMARY_ROOT,
+        global_primary: PRIMARY_ROOT,
+        primary_project: primaryProject || null,
+        scope_mode: primaryProject ? "conversation-project" : "all-projects",
         projects: ROOTS,
         shortcuts: WORKFLOW_COMMANDS
           .filter(({ name }) => COMPANION_QUICK_ACTIONS.has(name))
@@ -1620,7 +1968,11 @@ function registerLcaInputTool(mcp, name, title, description) {
       };
       return {
         structuredContent: payload,
-        content: [{ type: "text", text: "LCA input is ready. Request PiP to keep it visible when supported, use @ for context, / for workflows or skills, or the Plan quick action." }]
+        content: [{ type: "text", text: "LCA input is ready. Choose a conversation project to scope relative paths and default discovery, or keep All projects for normal multi-project surf. The global LCA primary is unchanged." }],
+        _meta: {
+          ui: { resourceUri: COMPANION_WIDGET_URI },
+          "openai/outputTemplate": COMPANION_WIDGET_URI
+        }
       };
     }
   );
@@ -1758,7 +2110,7 @@ function normalizeWorkspaceSearchRoots(rootDirs) {
     seen.add(key);
     roots.push(resolved);
   }
-  return roots.length ? roots : ROOTS;
+  return roots.length ? roots : activeDiscoveryRoots();
 }
 
 async function workspaceSearchData(rootDirs, query, { include, limit = 30 } = {}) {
@@ -1846,7 +2198,7 @@ async function workspaceSearchData(rootDirs, query, { include, limit = 30 } = {}
     if (wanted.has("symbol")) {
       const symbols = await scanSymbols(rootDir, { maxFiles: 600, maxMatches: 2000, files: listed.files });
       for (const sym of symbols) {
-        const abs = path.isAbsolute(sym.path) ? sym.path : path.resolve(PRIMARY_ROOT, sym.path);
+        const abs = path.isAbsolute(sym.path) ? sym.path : path.resolve(activePrimaryRoot(), sym.path);
         const rel = projectRelativePath(projectRoot, abs);
         const display = `${project}/${rel}`;
         const symbolMention = `${project}:${sym.name}`;
@@ -1955,7 +2307,7 @@ function workflowByName(name) {
   return WORKFLOW_COMMANDS.find((cmd) => cmd.name === key || cmd.command.slice(1) === key) || null;
 }
 
-async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], includeContextPack = true } = {}) {
+async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], includeContextPack = true, conversationPrimary } = {}) {
   const slashTokens = extractSlashTokens(input);
   const mentionTokens = extractMentionTokens(input);
   const explicitMode = slashTokens.map((token) => token.split(":")[0]).find((token) => workflowByName(token)) || mode;
@@ -2008,8 +2360,15 @@ async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], i
   } else {
     lines.push("Use LCA workspace tools when useful.");
   }
+  if (conversationPrimary) {
+    lines.push(`Conversation LCA primary folder: ${conversationPrimary}`);
+    lines.push(`For every LCA tool call in this conversation, pass project: ${JSON.stringify(conversationPrimary)} at the top level. Resolve relative paths, cwd, default search, CodeGraph, and AgentMemory scope from that folder. Do not scan other configured projects unless this task or explicit context references them; absolute paths to other projects remain available.`);
+  }
   if (includeContextPack) {
-    lines.push("Start by calling workspace_context with this task so filesystem, CodeGraph, and AgentMemory are all searched; do not ask me to copy file paths unless the @ context is ambiguous.");
+    const scopeInstruction = conversationPrimary
+      ? ` Pass project: ${JSON.stringify(conversationPrimary)} and path: ${JSON.stringify(conversationPrimary)} to workspace_context.`
+      : "";
+    lines.push(`Start by calling workspace_context with this task so filesystem, CodeGraph, and AgentMemory are all searched; do not ask me to copy file paths unless the @ context is ambiguous.${scopeInstruction}`);
   }
   if (skillTokens.length) {
     lines.push("", "Requested skills:");
@@ -2037,6 +2396,8 @@ async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], i
 
   return {
     mode: workflow?.name || null,
+    project: conversationPrimary || null,
+    scope_mode: conversationPrimary ? "conversation-project" : "all-projects",
     slash_commands: slashTokens.map((token) => `/${token}`),
     skills: skillTokens,
     mentions: mentionTokens.map((token) => `@${token}`),
@@ -2127,17 +2488,17 @@ function extractAgentMemoryDecision(name, args, success, root) {
 
 function inferObservationRoot(args) {
   const nested = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
-  const candidates = [args?.root, args?.path, args?.cwd, nested.root, nested.path, nested.cwd];
+  const candidates = [args?.project, args?.root, args?.path, args?.cwd, nested.root, nested.path, nested.cwd];
   for (const candidate of candidates) {
     if (typeof candidate !== "string" || !candidate.trim()) continue;
     try {
       const resolved = resolvePath(candidate);
-      return ROOTS.find((root) => isWithinRoots(resolved, [root])) || PRIMARY_ROOT;
+      return ROOTS.find((root) => isWithinRoots(resolved, [root])) || activePrimaryRoot();
     } catch {
       // Ignore optional path-like arguments that are not workspace paths.
     }
   }
-  return PRIMARY_ROOT;
+  return activePrimaryRoot();
 }
 
 function memorySafeArgsSummary(args) {
@@ -2145,6 +2506,7 @@ function memorySafeArgsSummary(args) {
   const summary = {};
   for (const [key, value] of Object.entries({
     action: args?.action,
+    project: args?.project,
     task: args?.task,
     intent: args?.intent,
     path: args?.path,
@@ -2187,6 +2549,9 @@ function workspaceInfoPayload() {
     auth: AUTH_TOKEN ? "bearer" : "none",
     roots: ROOTS,
     primary_root: PRIMARY_ROOT,
+    conversation_primary_root: CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot() || null,
+    effective_primary_root: activePrimaryRoot(),
+    discovery_roots: activeDiscoveryRoots(),
     host: { platform: os.platform(), release: os.release(), hostname: os.hostname(), cwd: process.cwd(), node: process.version },
     limits: {
       max_read_chars: MAX_READ_CHARS,
@@ -2294,12 +2659,14 @@ function registerBasicTools(mcp) {
       }
     },
     async ({ task_id, summary, completed = [], in_progress = [], next_actions = [], next_steps = [], files_changed = [], files_touched = [], tests = [] }) => {
+      const taskPlanPath = activeTaskPlanPath();
+      const checkpointPath = activeCheckpointPath();
       // v2.5: snapshot current-task.json into checkpoints dir
       try {
-        const cpStateDir = path.join(AGENT_STATE_DIR, "checkpoints");
+        const cpStateDir = path.join(activeAgentStateDir(), "checkpoints");
         await mkdir(cpStateDir, { recursive: true });
-        if (existsSync(TASK_PLAN_PATH)) {
-          const taskPlan = await readFile(TASK_PLAN_PATH, "utf8");
+        if (existsSync(taskPlanPath)) {
+          const taskPlan = await readFile(taskPlanPath, "utf8");
           await writeFile(path.join(cpStateDir, `task-${Date.now()}.json`), taskPlan, "utf8");
         }
       } catch { /* best-effort */ }
@@ -2312,11 +2679,11 @@ function registerBasicTools(mcp) {
         files_changed: dedupe([...files_changed, ...files_touched]),
         tests
       });
-      await mkdir(path.dirname(CHECKPOINT_PATH), { recursive: true });
-      await writeFile(CHECKPOINT_PATH, `${JSON.stringify(cp, null, 2)}\n`, "utf8");
+      await mkdir(path.dirname(checkpointPath), { recursive: true });
+      await writeFile(checkpointPath, `${JSON.stringify(cp, null, 2)}\n`, "utf8");
       return jsonResult({
         ok: true,
-        checkpoint_path: CHECKPOINT_PATH,
+        checkpoint_path: checkpointPath,
         handoff: cp,
         result_digest: buildResultDigest({ ok: true, taskId: cp.task_id, changedFiles: cp.files_changed, summary: "Saved structured handoff checkpoint." })
       });
@@ -2333,7 +2700,7 @@ function registerBasicTools(mcp) {
     },
     async () => {
       try {
-        const cp = JSON.parse(await readFile(CHECKPOINT_PATH, "utf8"));
+        const cp = JSON.parse(await readFile(activeCheckpointPath(), "utf8"));
         return jsonResult(cp);
       } catch {
         return textResult("No checkpoint saved yet.");
@@ -3931,7 +4298,7 @@ function parsePorcelain(out) {
 // Absolute paths are accepted. Relative paths resolve from the primary project.
 function resolvePath(input = ".") {
   const raw = String(input ?? ".").trim() || ".";
-  return path.normalize(path.isAbsolute(raw) ? raw : path.resolve(PRIMARY_ROOT, raw));
+  return path.normalize(path.isAbsolute(raw) ? raw : path.resolve(activePrimaryRoot(), raw));
 }
 
 function isWithinRoots(p, roots = ROOTS) {
@@ -3947,8 +4314,9 @@ function isWithinRoots(p, roots = ROOTS) {
 // file lives under it, otherwise the absolute path. Round-trips back through
 // resolvePath() because relative inputs resolve against the primary root.
 function toRel(abs) {
-  if (comparePath(abs) === comparePath(PRIMARY_ROOT)) return ".";
-  const withSep = PRIMARY_ROOT.endsWith(path.sep) ? PRIMARY_ROOT : PRIMARY_ROOT + path.sep;
+  const primaryRoot = activePrimaryRoot();
+  if (comparePath(abs) === comparePath(primaryRoot)) return ".";
+  const withSep = primaryRoot.endsWith(path.sep) ? primaryRoot : primaryRoot + path.sep;
   if (comparePath(abs).startsWith(comparePath(withSep))) return abs.slice(withSep.length).split(path.sep).join("/");
   return abs;
 }
@@ -4060,7 +4428,7 @@ function gitGrep(dir, query, { regex, limit, glob }) {
 async function attachContext(matches, ctx) {
   const cache = new Map();
   for (const m of matches) {
-    const abs = path.isAbsolute(m.path) ? m.path : path.resolve(PRIMARY_ROOT, m.path);
+    const abs = path.isAbsolute(m.path) ? m.path : path.resolve(activePrimaryRoot(), m.path);
     let lines = cache.get(abs);
     if (!lines) {
       try {
@@ -4282,7 +4650,7 @@ function runShellCommand(command, cwd, shell, timeoutMs) {
     let timedOut = false;
     let child;
     try {
-      child = spawn(file, args, spawnOptions(cwd, opts, { ...process.env, AGENT_WORKSPACE: PRIMARY_ROOT }));
+      child = spawn(file, args, spawnOptions(cwd, opts, { ...process.env, AGENT_WORKSPACE: activePrimaryRoot() }));
     } catch (err) {
       resolve({ exit_code: null, timed_out: false, stdout: "", stderr: String(err?.message || err) });
       return;
@@ -4335,7 +4703,7 @@ function spawnCapture(file, args, cwd, timeoutMs) {
 
 function startBackground(command, cwd, shell, name) {
   const { file, args, opts } = buildSpawn(command, shell);
-  const child = spawn(file, args, spawnOptions(cwd, opts, { ...process.env, AGENT_WORKSPACE: PRIMARY_ROOT }));
+  const child = spawn(file, args, spawnOptions(cwd, opts, { ...process.env, AGENT_WORKSPACE: activePrimaryRoot() }));
   const proc = {
     id: randomUUID(),
     name: name || command.slice(0, 40),
@@ -5591,20 +5959,21 @@ function registerRepoIntelTools(mcp) {
 
 async function readPatchHistory() {
   try {
-    return JSON.parse(await readFile(PATCH_HISTORY_PATH, "utf8"));
+    return JSON.parse(await readFile(activePatchHistoryPath(), "utf8"));
   } catch {
     return [];
   }
 }
 
 async function writePatchHistory(history) {
-  await mkdir(path.dirname(PATCH_HISTORY_PATH), { recursive: true });
-  await writeFile(PATCH_HISTORY_PATH, JSON.stringify(history, null, 2), "utf8");
+  const historyPath = activePatchHistoryPath();
+  await mkdir(path.dirname(historyPath), { recursive: true });
+  await writeFile(historyPath, JSON.stringify(history, null, 2), "utf8");
 }
 
 async function createBackupBatch(tool, filePaths) {
   const batchId = randomUUID();
-  const batchDir = path.join(BACKUPS_DIR, batchId);
+  const batchDir = path.join(activeBackupsDir(), batchId);
   await mkdir(batchDir, { recursive: true });
 
   const files = [];
@@ -6339,15 +6708,17 @@ function registerPlannerTools(mcp) {
       }
     },
     async ({ goal, steps }) => {
-      await mkdir(AGENT_STATE_DIR, { recursive: true });
+      const stateDir = activeAgentStateDir();
+      const taskPlanPath = activeTaskPlanPath();
+      await mkdir(stateDir, { recursive: true });
       const plan = {
         goal,
         steps: steps.map((text) => ({ text, done: false })),
         created: isoNow(),
         updated: isoNow()
       };
-      await writeFile(TASK_PLAN_PATH, JSON.stringify(plan, null, 2), "utf8");
-      return jsonResult({ ok: true, goal, steps_count: steps.length, path: TASK_PLAN_PATH });
+      await writeFile(taskPlanPath, JSON.stringify(plan, null, 2), "utf8");
+      return jsonResult({ ok: true, goal, steps_count: steps.length, path: taskPlanPath });
     }
   );
 
@@ -6364,9 +6735,10 @@ function registerPlannerTools(mcp) {
       }
     },
     async ({ set_step_done, add_steps, status }) => {
+      const taskPlanPath = activeTaskPlanPath();
       let plan;
       try {
-        plan = JSON.parse(await readFile(TASK_PLAN_PATH, "utf8"));
+        plan = JSON.parse(await readFile(taskPlanPath, "utf8"));
       } catch {
         return textResult("No task plan found. Call task_plan to create one.");
       }
@@ -6385,7 +6757,7 @@ function registerPlannerTools(mcp) {
       }
       if (changed) {
         plan.updated = isoNow();
-        await writeFile(TASK_PLAN_PATH, JSON.stringify(plan, null, 2), "utf8");
+        await writeFile(taskPlanPath, JSON.stringify(plan, null, 2), "utf8");
       }
 
       const done = plan.steps.filter((s) => s.done).length;
@@ -6406,14 +6778,16 @@ function registerPlannerTools(mcp) {
       }
     },
     async ({ decision, why }) => {
-      await mkdir(AGENT_STATE_DIR, { recursive: true });
+      const stateDir = activeAgentStateDir();
+      const decisionsPath = activeDecisionsPath();
+      await mkdir(stateDir, { recursive: true });
       const entry = `\n## ${isoNow()}\n\n**Decision:** ${decision}\n\n**Why:** ${why}\n`;
-      await appendFile(DECISIONS_PATH, entry, "utf8");
+      await appendFile(decisionsPath, entry, "utf8");
       let typed_knowledge = null;
       try {
         typed_knowledge = await WORKSPACE_PROTOCOL.knowledgeState({ action: "add", type: "decision", text: decision, why, source: "assistant" });
       } catch { /* no active structured brief; legacy decision log still succeeds */ }
-      return jsonResult({ ok: true, appended_to: DECISIONS_PATH, typed_knowledge });
+      return jsonResult({ ok: true, appended_to: decisionsPath, typed_knowledge });
     }
   );
 }

@@ -5,20 +5,29 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 
+import { loadEnvFileValues } from "./env-config.mjs";
+
 export class LauncherBridge {
   constructor(options = {}) {
     this.node = options.node || process.execPath;
     this.scriptPath = path.resolve(options.scriptPath);
     this.cwd = path.resolve(options.cwd || path.dirname(this.scriptPath));
     this.configPath = options.configPath ? path.resolve(options.configPath) : "";
+    this.envPath = options.envPath ? path.resolve(options.envPath) : "";
+    this.managedEnvKeys = new Set(options.managedEnvKeys || []);
     this.env = { ...process.env, ...(options.env || {}) };
     if (this.configPath) this.env.LCA_CUSTOM_CONFIG_PATH = this.configPath;
   }
 
-  run(args, options = {}) {
+  async run(args, options = {}) {
+    const fileEnv = this.envPath ? await loadEnvFileValues(this.envPath) : {};
+    for (const key of Object.keys(fileEnv)) this.managedEnvKeys.add(key);
+    const childEnv = { ...this.env };
+    for (const key of this.managedEnvKeys) delete childEnv[key];
+    Object.assign(childEnv, fileEnv);
     return capture(this.node, [this.scriptPath, ...args], {
       cwd: this.cwd,
-      env: this.env,
+      env: childEnv,
       timeoutMs: options.timeoutMs || 300_000
     });
   }
@@ -37,6 +46,16 @@ export class LauncherBridge {
   doctor() { return this.json(["doctor"], { timeoutMs: 300_000 }); }
   start() { return this.run(["start", "--background"], { timeoutMs: 600_000 }); }
   stop() { return this.run(["stop"], { timeoutMs: 60_000 }); }
+  async restart() {
+    const stopped = await this.stop();
+    if (stopped.code !== 0 && !/not running|already stopped|offline/i.test(`${stopped.stdout}\n${stopped.stderr}`)) return stopped;
+    const started = await this.start();
+    return {
+      ...started,
+      stdout: [stopped.stdout, started.stdout].filter(Boolean).join("\n"),
+      stderr: [stopped.stderr, started.stderr].filter(Boolean).join("\n")
+    };
+  }
   addProject(project) { return this.run(["add", project], { timeoutMs: 600_000 }); }
   removeProject(project) { return this.run(["remove", project], { timeoutMs: 600_000 }); }
   resetProjects(project) { return this.run(["reset", project], { timeoutMs: 600_000 }); }

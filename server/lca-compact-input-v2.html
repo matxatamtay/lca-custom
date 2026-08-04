@@ -125,6 +125,26 @@
       flex: 0 0 auto;
     }
     .icon-btn:hover { background: rgba(255,255,255,.06); }
+    .project-select {
+      min-width: 0;
+      max-width: 190px;
+      height: 24px;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 999px;
+      background: rgba(255,255,255,.03);
+      color: #d4d4d8;
+      padding: 0 24px 0 9px;
+      font-size: 12px;
+      cursor: pointer;
+      text-overflow: ellipsis;
+    }
+    .project-select:focus { outline: 1px solid rgba(16,163,127,.45); }
+    .project-select option { background: #202024; color: var(--text); }
+    .project-select.scoped {
+      border-color: rgba(16,163,127,.38);
+      background: rgba(16,163,127,.16);
+      color: #adf0dc;
+    }
     .plan-btn {
       height: 24px;
       border: 1px solid rgba(255,255,255,.08);
@@ -225,6 +245,9 @@
       </div>
       <div class="bottom-row">
         <button class="icon-btn" id="add-context" type="button" aria-label="Add context" title="Add @ context">+</button>
+        <select class="project-select" id="project-select" aria-label="Conversation primary project" title="Primary project for this conversation">
+          <option value="">All projects</option>
+        </select>
         <button class="plan-btn" id="plan-toggle" type="button" aria-pressed="false" title="Use Plan mode">Plan</button>
         <button class="icon-btn" id="pip" type="button" aria-label="Open PiP" title="Open PiP">▣</button>
         <span class="pill mode hidden" id="mode-pill"></span>
@@ -242,12 +265,17 @@
     const sendButton = document.getElementById('send');
     const pipButton = document.getElementById('pip');
     const addContextButton = document.getElementById('add-context');
+    const projectSelect = document.getElementById('project-select');
     const planButton = document.getElementById('plan-toggle');
     const statusEl = document.getElementById('status');
     const modePill = document.getElementById('mode-pill');
     const contextPill = document.getElementById('context-pill');
     const selected = [];
     let selectedMode = null;
+    let primaryProject = null;
+    let availableProjects = [];
+    let rpcRequestId = 0;
+    const rpcPending = new Map();
     let active = -1;
     let current = null;
     let pendingTimer = null;
@@ -271,6 +299,82 @@
     async function callTool(name, args) {
       if (!window.openai?.callTool) throw new Error('callTool unavailable');
       return unwrapToolResult(await window.openai.callTool(name, args || {}));
+    }
+
+    function callUiRpc(method, params) {
+      return new Promise((resolve, reject) => {
+        const id = `lca-${Date.now()}-${++rpcRequestId}`;
+        const timer = setTimeout(() => {
+          rpcPending.delete(id);
+          reject(new Error(`${method} timed out`));
+        }, 5000);
+        rpcPending.set(id, { resolve, reject, timer });
+        window.parent.postMessage({ jsonrpc: '2.0', id, method, params: params || {} }, '*');
+      });
+    }
+
+    window.addEventListener('message', (event) => {
+      const message = event.data;
+      if (!message || message.jsonrpc !== '2.0' || !message.id) return;
+      const pending = rpcPending.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      rpcPending.delete(message.id);
+      if (message.error) pending.reject(new Error(message.error.message || 'UI RPC failed'));
+      else pending.resolve(message.result);
+    });
+
+    function projectLabel(project) {
+      const normalized = String(project || '').replace(/[\/]+$/, '');
+      return normalized.split(/[\/]/).filter(Boolean).pop() || normalized;
+    }
+
+    function conversationScopeText() {
+      if (!primaryProject) {
+        return 'LCA conversation project scope is unset. Omit the top-level project field on LCA calls and preserve normal multi-project discovery.';
+      }
+      return `LCA conversation primary folder is ${primaryProject}. For every LCA tool call in this conversation, pass project: ${JSON.stringify(primaryProject)} at the top level. Resolve relative paths and default discovery from it. Other projects remain available through explicit absolute paths.`;
+    }
+
+    function populateProjectSelect(projects, selectedProject) {
+      availableProjects = Array.isArray(projects) ? projects.filter((item) => typeof item === 'string' && item) : [];
+      projectSelect.replaceChildren();
+      const all = document.createElement('option');
+      all.value = '';
+      all.textContent = 'All projects';
+      projectSelect.append(all);
+      for (const project of availableProjects) {
+        const option = document.createElement('option');
+        option.value = project;
+        option.textContent = projectLabel(project);
+        option.title = project;
+        projectSelect.append(option);
+      }
+      primaryProject = availableProjects.includes(selectedProject) ? selectedProject : null;
+      projectSelect.value = primaryProject || '';
+      projectSelect.classList.toggle('scoped', Boolean(primaryProject));
+      projectSelect.title = primaryProject || 'All configured projects';
+    }
+
+    async function persistConversationScope({ updateModel = true } = {}) {
+      const modelContent = conversationScopeText();
+      const state = {
+        modelContent,
+        privateContent: { primaryProject },
+        imageIds: []
+      };
+      if (window.openai?.setWidgetState) {
+        await Promise.resolve(window.openai.setWidgetState(state));
+      }
+      if (updateModel) {
+        await callUiRpc('ui/update-model-context', {
+          content: [{ type: 'text', text: modelContent }],
+          structuredContent: {
+            lcaConversationProject: primaryProject,
+            scopeMode: primaryProject ? 'conversation-project' : 'all-projects'
+          }
+        }).catch(() => undefined);
+      }
     }
 
     function setStatus(text, kind = '') {
@@ -474,7 +578,11 @@
 
     async function preloadSuggestions() {
       try {
-        const slashData = await callTool('slash_commands', { query: '/', limit: 24 });
+        const slashData = await callTool('workspace_skill', {
+          action: 'slash',
+          project: primaryProject || undefined,
+          arguments: { query: '/', limit: 24 }
+        });
         rememberSuggestions('/:', slashData.commands || []);
       } catch {}
     }
@@ -507,10 +615,17 @@
       try {
         let items;
         if (trigger.prefix === '@') {
-          const data = await callTool('workspace_search', { query: '@' + trigger.query, limit: 24 });
+          const data = await callTool('workspace_search', {
+            project: primaryProject || undefined,
+            arguments: { query: '@' + trigger.query, limit: 24 }
+          });
           items = data.results || [];
         } else {
-          const data = await callTool('slash_commands', { query: '/' + trigger.query, limit: 24 });
+          const data = await callTool('workspace_skill', {
+            action: 'slash',
+            project: primaryProject || undefined,
+            arguments: { query: '/' + trigger.query, limit: 24 }
+          });
           items = data.commands || [];
         }
         if (seq !== searchSeq) return;
@@ -548,11 +663,16 @@
         return '';
       }
       setStatus('composing…');
-      const data = await callTool('compose_prompt', {
-        input: task,
-        mode: selectedMode || undefined,
-        selected_context: selected,
-        include_context_pack: true
+      const data = await callTool('workspace_skill', {
+        action: 'compose',
+        project: primaryProject || undefined,
+        arguments: {
+          input: task,
+          path: primaryProject || undefined,
+          mode: selectedMode || undefined,
+          selected_context: selected,
+          include_context_pack: true
+        }
       });
       return data.prompt || '';
     }
@@ -638,6 +758,18 @@
       updateSuggestions();
     });
 
+    projectSelect.addEventListener('change', async () => {
+      primaryProject = projectSelect.value || null;
+      projectSelect.classList.toggle('scoped', Boolean(primaryProject));
+      projectSelect.title = primaryProject || 'All configured projects';
+      suggestionCache.clear();
+      lastSearchKey = '';
+      searchSeq += 1;
+      setStatus(primaryProject ? projectLabel(primaryProject) : 'all projects');
+      await persistConversationScope();
+      preloadSuggestions();
+    });
+
     planButton.addEventListener('click', () => {
       selectedMode = selectedMode === 'plan' ? null : 'plan';
       updateCompactMeta();
@@ -655,9 +787,15 @@
     function hydrateFromToolOutput() {
       const output = window.openai?.toolOutput || {};
       const inputArgs = window.openai?.toolInput || {};
+      const widgetState = window.openai?.widgetState || {};
+      const privateState = widgetState.privateContent || widgetState.private_content || {};
       const initial = output.initial_input || inputArgs.initial_input || '';
+      const storedProject = privateState.primaryProject || widgetState.primaryProject || widgetState.primary_project;
+      const requestedProject = storedProject || output.primary_project || inputArgs.primary_project || null;
+      populateProjectSelect(output.projects || [], requestedProject);
       if (initial && !input.value) input.value = initial;
       syncInputUi();
+      persistConversationScope().catch(() => undefined);
     }
 
     hydrateFromToolOutput();
