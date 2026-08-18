@@ -17,6 +17,6 @@ Core rules:
 2. CodeGraph and AgentMemory are mandatory context providers, not optional model-selected tools.
 3. `workspace_context` must produce a coverage receipt proving filesystem, CodeGraph, and AgentMemory were queried.
 4. Provider failures are surfaced explicitly. There is no silent fallback that pretends context is complete.
-5. The target ChatGPT-facing MCP surface stays at sixteen tools or fewer.
+5. The target ChatGPT-facing MCP surface stays at twenty tools or fewer.
 
 The first vertical slice is `BuildTaskContext`. Real CodeGraph and AgentMemory adapters will replace test doubles in later slices.

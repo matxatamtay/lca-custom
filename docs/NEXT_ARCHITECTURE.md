@@ -5,13 +5,13 @@
 The refactor is complete against the agreed product contract:
 
 - Node.js remains the runtime.
-- ChatGPT sees exactly sixteen compact tools.
+- ChatGPT sees exactly twenty compact tools, including delegated-agent/runtime UI facades plus the `notion` facade and direct `notion_page` app.
 - There is no model-facing legacy surface.
 - There are no mode, policy, approval, command-denylist, or root-authorization layers.
 - Tool actions execute directly as the local user.
 - Project roots are discovery and relative-path defaults; absolute paths are accepted.
 - Loopback binding, optional bearer auth, browser-origin checks, request/output budgets, timeouts, audit redaction, and process-tree cleanup remain operational safeguards.
-- DBeaver SQL retains its editor-first hidden-capability invariant.
+- DBeaver, Bruno, and Notion retain their existing integration-specific protection semantics; the trusted-local fast path applies everywhere else.
 
 ## Public MCP surface
 
@@ -24,6 +24,8 @@ workspace_exec
 workspace_process
 workspace_git
 workspace_verify
+workspace_agent
+workspace_ui
 workspace_status
 workspace_skill
 figma
@@ -31,10 +33,12 @@ dbeaver
 bruno
 penpot
 coolify
+notion
 lca_input
+notion_page
 ```
 
-The façade contract lives in `server/src/interfaces/mcp/compact-mcp-interface.ts`. A singleton in-memory backend contains 155 internal actions. Every hidden action belongs to exactly one façade, discovery is bounded, and cross-facade dispatch is rejected.
+The façade contract lives in `server/src/interfaces/mcp/compact-mcp-interface.ts`. The current compatibility backend exposes 185 internal actions behind those twenty compact tools. Every hidden action belongs to exactly one façade, discovery is bounded, and cross-facade dispatch is rejected.
 
 ## Mandatory context orchestration
 
@@ -91,7 +95,7 @@ AgentMemory `0.9.28` is isolated in `runtime/agentmemory` instead of sharing the
 
 ## Persistent desktop bridges
 
-`server/persistent-http-mcp-client.mjs` is shared by Figma, DBeaver, Bruno, and Penpot. Coolify uses a persistent local stdio client.
+`server/persistent-http-mcp-client.mjs` is shared by Figma, DBeaver, Bruno, and Penpot. Coolify uses a persistent local stdio client. Notion is stateless REST and keeps its bearer token only in local process configuration; its Apps SDK widget calls the compact `notion` facade rather than the API directly.
 
 - registry key includes endpoint, client name, timeout, and a hash of credentials
 - connection setup is single-flight
@@ -104,6 +108,30 @@ AgentMemory `0.9.28` is isolated in `runtime/agentmemory` instead of sharing the
 ### DBeaver invariant
 
 `dbeaver_propose_sql` returns a model-visible artifact and a widget-only run capability in `_meta`. The capability is absent from model-visible content. Preparation and execution require this capability, use the immutable SQL/connection captured at proposal time, and still require DBeaver’s native confirmation. Generic passthrough accepts only upstream tools declaring `readOnlyHint=true`.
+
+## Runtime event spine and agent durability
+
+All backend actions execute through `ActionExecutionPipeline`. The pipeline emits typed events into an append-only JSONL `RuntimeEventStore`; it does not reintroduce permission or approval checks. `tool/started` is enqueued without delaying action start, while completion/failure remains a durability barrier that preserves ordering.
+
+The runtime event stream drives multiple projections:
+
+- ToolMetrics latency and payload-size metadata
+- AgentMemory observations for model-facing calls
+- `workspace_status action=trace` correlation-grouped trajectory
+- the trace tree in `lca_input`
+- optional metadata-only OTLP/HTTP export when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured
+
+`AgentRunnerRegistry` persists job and DAG snapshots into the same event stream. A restart reconstructs durable descriptors; jobs that had already finalized an isolated worktree patch become `recoverable`, while interrupted active work without a recoverable patch is reported as `orphaned`. Resume/follow-up/interrupt are optional runner capabilities rather than fake universal behavior.
+
+Codex workers default to `danger-full-access`, network enabled, and isolated Git worktrees. File scopes are optional correctness assertions for isolated workers; shared parallel writers still need disjoint scopes unless overlap is explicitly allowed. Merge remains explicit and conflict-checked.
+
+## Code Mode and conversation runtime composition
+
+`workspace_exec action=code` runs a TypeScript program in a fresh bounded worker and exposes curated `lca.search/read/edit/exec/git/verify/status/agent/ui` bindings. Every binding resolves back to the existing hidden backend action and therefore re-enters normal tracing, metrics, correctness checks, and integration behavior. Recursive Code Mode calls are rejected.
+
+`ConversationRuntimeContext` extends the old project-only scope with conversation/session identity, runner/profile, worktree/shared isolation, network defaults, and correlation state while keeping project roots as discovery inputs rather than authorization boundaries. `RuntimePluginHost` provides a small reversible lifecycle abstraction with reverse-order disposal; LCA does not embed Cordis.
+
+Generated contracts under `docs/generated/` are produced from source and checked in CI: tool catalog, action catalog, runtime event catalog, provider capabilities, and runtime graph. JSONL remains the local source of truth even when OTLP export is enabled.
 
 ## Managed installer and doctor
 
@@ -147,17 +175,13 @@ Historical baseline from commit `944dcc6` is frozen in `evals/baseline.json`:
 - 4,458 instruction characters
 - 14.13 ms median local `tools/list`
 
-The compact benchmark is generated by `npm run benchmark:compact` and written to `evals/compact.json`. The final Linux measurement is:
+The current compact-surface gate reports:
 
-- 16 model-facing tools, down 88.81%
-- 11,355 bytes of `tools/list`, down 87.58%
-- 789 instruction characters, down 82.30%
-- 5.55 ms median local `tools/list`
-- 3.46 ms median warm `workspace_status`
-- 3.71 ms median warm `workspace_read`
-- complete coverage of 155 internal backend actions
+- 20 model-facing tools, down about 86% from the 143-tool historical baseline
+- 18,781 bytes of compact schema, under the 20 KB release budget
+- complete compact-facade coverage of 185 internal backend actions
 
-All release budgets remain satisfied: at most 16 tools, under 20 KB of schema, and under 1,000 instruction characters.
+The Phase 8 runtime benchmark reports a representative local run of roughly 0.2 ms average action-pipeline overhead, effectively zero measured p95 delay before action-body start, sub-microsecond conversation-context scope overhead, and Code Mode latency improvement well above the 15% ship threshold on independent-read workloads. Exact measurements are intentionally rerunnable with `npm run benchmark:runtime` and `npm run benchmark:code-mode` rather than frozen as universal hardware claims.
 
 ## Release gates
 
@@ -169,8 +193,10 @@ All release budgets remain satisfied: at most 16 tools, under 20 KB of schema, a
 - provider quota and conflict behavior
 - AgentMemory lifecycle, decisions, and supervisor recovery
 - persistent HTTP MCP connection semantics
-- Figma, DBeaver, Bruno, Penpot, and Coolify contracts
-- sixteen-tool schema and internal action coverage
+- Figma, DBeaver, Bruno, Penpot, Coolify, and Notion contracts
+- twenty-tool schema and complete internal action coverage
+- runtime event ordering, durable agent restart reconstruction, trajectory, Code Mode, and reversible runtime composition
+- generated architecture contract drift and optional metadata-only OTLP export
 - direct absolute-path, command, Git, delete, and desktop execution
 - auth header handling, origin rejection, body caps, audit redaction, undo isolation, and process cleanup
 - Pro snapshot, widget resources, project search, manual verification, and review flows

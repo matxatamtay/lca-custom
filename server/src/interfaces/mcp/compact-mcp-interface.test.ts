@@ -26,7 +26,7 @@ const backendTools = Object.values(COMPACT_GROUP_DEFINITIONS).flatMap((definitio
 test("facade registration order matches the target catalog", () => {
   const expected = TARGET_TOOL_CATALOG
     .map((tool) => tool.name)
-    .filter((name) => name !== "workspace_context" && name !== "lca_input");
+    .filter((name) => name !== "workspace_context" && name !== "lca_input" && name !== "notion_page");
   assert.deepEqual(facadeNames(), expected);
 });
 

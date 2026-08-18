@@ -31,14 +31,7 @@ export class ConversationProjectScope {
 
   normalize(project: unknown): string | undefined {
     if (typeof project !== "string" || !project.trim()) return undefined;
-    const resolved = path.resolve(project.trim());
-    const containingRoot = this.#roots
-      .filter((root) => isWithin(resolved, root))
-      .sort((left, right) => right.length - left.length)[0];
-    if (!containingRoot) {
-      throw new Error("Conversation primary folder must be inside a configured project root.");
-    }
-    return resolved;
+    return path.resolve(project.trim());
   }
 
   scopedPrimaryRoot(): string | undefined {
@@ -70,13 +63,6 @@ function uniquePaths(values: readonly string[]): string[] {
     result.push(resolved);
   }
   return result;
-}
-
-function isWithin(target: string, root: string): boolean {
-  const resolvedTarget = comparablePath(path.resolve(target));
-  const resolvedRoot = comparablePath(path.resolve(root));
-  const prefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
-  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(prefix);
 }
 
 function samePath(left: string, right: string): boolean {

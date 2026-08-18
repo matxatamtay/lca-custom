@@ -32,9 +32,9 @@ Full setup instructions are in [`docs/SETUP.md`](docs/SETUP.md). Security bounda
 
 Local endpoints default to:
 
-- MCP: `http://127.0.0.1:8790/mcp`
-- Health: `http://127.0.0.1:8790/healthz`
-- Extension bridge: `ws://127.0.0.1:8790/bridge`
+- MCP: `http://127.0.0.1:8791/mcp`
+- Health: `http://127.0.0.1:8791/healthz`
+- Extension bridge: `ws://127.0.0.1:8791/bridge`
 
 The server prints a short-lived pairing code. Enter it in the extension popup.
 

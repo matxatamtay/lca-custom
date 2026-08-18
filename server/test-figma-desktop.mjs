@@ -215,8 +215,8 @@ try {
   }
   check("node parser rejects non-Figma URLs", rejectedNonFigma);
 
-  const remoteStatus = await figmaDesktopStatus({ endpoint: "https://example.com/mcp" });
-  check("bridge rejects non-loopback endpoints by default", remoteStatus.connected === false && /loopback/.test(remoteStatus.error || ""), JSON.stringify(remoteStatus));
+  const remoteStatus = await figmaDesktopStatus({ endpoint: "https://example.com/mcp", timeoutMs: 1000 });
+  check("bridge accepts remote HTTP(S) endpoints and reports upstream connectivity errors", remoteStatus.connected === false && !/loopback/.test(remoteStatus.error || ""), JSON.stringify(remoteStatus));
 
   const status = await figmaDesktopStatus({ endpoint: mock.endpoint });
   check("module status connects to mock desktop MCP", status.connected && status.tools.includes("get_design_context"), JSON.stringify(status));
@@ -232,7 +232,7 @@ try {
   client = await connect(lca.port);
   const tools = await client.listTools();
   const names = new Set(tools.tools.map((tool) => tool.name));
-  check("Figma is exposed through one compact facade", names.has("figma") && !names.has("figma_call_tool") && tools.tools.length === 16, JSON.stringify([...names]));
+  check("Figma is exposed through one compact facade", names.has("figma") && !names.has("figma_call_tool") && tools.tools.length === 20, JSON.stringify([...names]));
 
   const bridgeStatus = await call(client, "figma_status");
   const bridgeStatusJson = JSON.parse(bridgeStatus.content?.[0]?.text || "{}");

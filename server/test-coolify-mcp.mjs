@@ -14,6 +14,7 @@ import {
   normalizeCoolifyBaseUrl,
   resolveCoolifyMcpEntry
 } from "./coolify-mcp.mjs";
+import { assertCoolifyPolicy } from "./coolify-mcp-policy.mjs";
 
 const testOptions = {
   baseUrl: "https://coolify.example.test",
@@ -85,34 +86,12 @@ test("rejects empty tool names before making an upstream API call", async () => 
   await assert.rejects(callCoolifyMcpTool("", {}, testOptions), /tool name is required/);
 });
 
-test("read policy rejects mutations before making an upstream API call", async () => {
-  await assert.rejects(
-    callReadOnlyCoolifyMcpTool("deploy", { uuid: "fake" }, testOptions),
-    /is mutation/
-  );
-});
-
-test("mutation policy rejects reads before making an upstream API call", async () => {
-  await assert.rejects(
-    callMutatingCoolifyMcpTool("list_servers", {}, testOptions),
-    /is read/
-  );
-});
-
-test("compatibility calls reject destructive actions", async () => {
-  await assert.rejects(
-    callCoolifyMcpTool("application", { action: "delete", uuid: "fake" }, testOptions),
-    /destructive/
-  );
-});
-
-test("destructive policy requires explicit confirmation", async () => {
-  await assert.rejects(
-    callDestructiveCoolifyMcpTool(
-      "application",
-      { action: "delete", uuid: "fake" },
-      testOptions
-    ),
-    /confirmed=true/
-  );
+test("Coolify classification remains metadata and never blocks trusted-local execution", () => {
+  const deploy = { name: "deploy", annotations: {} };
+  const list = { name: "list_servers", annotations: { readOnlyHint: true } };
+  const application = { name: "application", annotations: { destructiveHint: true } };
+  assert.equal(assertCoolifyPolicy("deploy", deploy, { uuid: "fake" }, "read", false), "mutation");
+  assert.equal(assertCoolifyPolicy("list_servers", list, {}, "mutation", false), "read");
+  assert.equal(assertCoolifyPolicy("application", application, { action: "delete" }, "safe", false), "destructive");
+  assert.equal(assertCoolifyPolicy("application", application, { action: "delete" }, "destructive", false), "destructive");
 });

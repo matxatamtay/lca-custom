@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import http from "node:http";
+import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import {
   mkdir,
@@ -27,7 +28,11 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { ConversationProjectScope } from "./dist/orchestration/conversation-project-scope.js";
+import { ConversationRuntimeContext } from "./dist/orchestration/conversation-runtime-context.js";
+import { ActionExecutionPipeline } from "./dist/runtime/action-execution-pipeline.js";
+import { RuntimeEventStore } from "./dist/runtime/runtime-event-store.js";
+import { RuntimeOtelExporter } from "./dist/runtime/runtime-otel-exporter.js";
+import { RuntimePluginHost } from "./dist/runtime/runtime-plugin.js";
 import { summarizeArgs } from "./core/redaction.mjs";
 import {
   WorkspaceProtocol,
@@ -80,12 +85,39 @@ import {
   coolifyMcpStatus,
   listCoolifyMcpTools
 } from "./coolify-mcp.mjs";
+import {
+  DEFAULT_NOTION_API_BASE,
+  DEFAULT_NOTION_VERSION,
+  notionFetchPage,
+  notionSearch,
+  notionStatus
+} from "./notion-api.mjs";
+import { buildNotionEditProposal } from "./notion-edit-proposal.mjs";
+import { registerNotionTools } from "./notion-tools.mjs";
+import { AgentRunnerRegistry } from "./agent-runner.mjs";
+import {
+  browserAgentStatus,
+  callBrowserAgentTool,
+  closeBrowserAgentClient,
+  listBrowserAgentTools
+} from "./browser-agent-client.mjs";
+import {
+  isTypeScriptFamilyFile,
+  tsDefinition,
+  tsDiagnostics,
+  tsOrganizeImports,
+  tsReferences,
+  tsRenameSymbol
+} from "./typescript-code-intelligence.mjs";
+import { ToolMetrics, measureJsonChars } from "./tool-metrics.mjs";
+import { runCodeMode } from "./code-mode-runtime.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
 // ----------------------------------------------------------------------------
 const VERSION = "4.4.0-pro";
 const PRODUCT_TIER = "pro";
+const TOOL_METRICS = new ToolMetrics({ recentLimit: 500 });
 const PORT = Number(process.env.PORT || 8790);
 // Bind to loopback by default. The local OpenAI tunnel-client forwards to this,
 // so we never need to listen on 0.0.0.0 (which would expose a shell to the LAN).
@@ -142,11 +174,17 @@ async function closeNextApplicationRuntime() {
 const COMPANION_WIDGET_PATH = path.join(APP_DIR, "lca-compact-input-v2.html");
 const COMPANION_WIDGET_LEGACY_URI = "ui://widget/lca-compact-input-v2.html";
 const DBEAVER_SQL_ARTIFACT_PATH = path.join(APP_DIR, "dbeaver-sql-artifact.html");
+const NOTION_PAGE_WIDGET_PATH = path.join(APP_DIR, "notion-page.html");
+const NOTION_PAGE_WIDGET_LEGACY_URI = "ui://widget/lca-notion-page.html";
+const NOTION_PAGE_WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
+const NOTION_PAGE_WIDGET_RUNTIME_KEY = "mcp-app-v1";
 const COMPANION_WIDGET_RESOURCE = loadRequiredHtmlResource(COMPANION_WIDGET_PATH, "LCA companion widget");
 const COMPANION_WIDGET_URI = `ui://widget/lca-compact-input-v2-${COMPANION_WIDGET_RESOURCE.sha256.slice(0, 12)}.html`;
 const DBEAVER_SQL_ARTIFACT_RESOURCE = loadRequiredHtmlResource(DBEAVER_SQL_ARTIFACT_PATH, "DBeaver SQL artifact");
 const DBEAVER_SQL_ARTIFACT_URI = `ui://widget/dbeaver-sql-artifact-${DBEAVER_SQL_ARTIFACT_RESOURCE.sha256.slice(0, 12)}.html`;
 const DBEAVER_SQL_ARTIFACT_LEGACY_URI = "ui://widget/dbeaver-sql-artifact.html";
+const NOTION_PAGE_WIDGET_RESOURCE = loadRequiredHtmlResource(NOTION_PAGE_WIDGET_PATH, "Notion page widget");
+const NOTION_PAGE_WIDGET_URI = `ui://widget/lca-notion-page-${NOTION_PAGE_WIDGET_RESOURCE.sha256.slice(0, 12)}-${NOTION_PAGE_WIDGET_RUNTIME_KEY}.html`;
 const DEFAULT_WORKSPACE = path.resolve(APP_DIR, "..", "agent-workspace");
 const PRIMARY_ROOT = path.resolve(process.env.AGENT_WORKSPACE || DEFAULT_WORKSPACE);
 const STARTUP_PROFILE = (() => {
@@ -158,17 +196,20 @@ const STARTUP_PROFILE = (() => {
 })();
 const EXTRA_ROOTS = parseExtraRoots();
 const ROOTS = dedupe([PRIMARY_ROOT, ...EXTRA_ROOTS]);
-const CONVERSATION_PROJECT_SCOPE = new ConversationProjectScope({
+const CONVERSATION_RUNTIME = new ConversationRuntimeContext({
   primaryRoot: PRIMARY_ROOT,
-  roots: ROOTS
+  roots: ROOTS,
+  runner: "codex",
+  isolation: "worktree",
+  networkAccess: true
 });
 
 function activePrimaryRoot() {
-  return CONVERSATION_PROJECT_SCOPE.primaryRoot();
+  return CONVERSATION_RUNTIME.primaryRoot();
 }
 
 function activeDiscoveryRoots() {
-  return CONVERSATION_PROJECT_SCOPE.discoveryRoots();
+  return CONVERSATION_RUNTIME.discoveryRoots();
 }
 
 // LCA is a trusted local execution engine. Project roots drive discovery and
@@ -191,6 +232,37 @@ const DATA_DIR = path.resolve(APP_DIR, "data");
 const LIFECYCLE_LOG_PATH = path.join(DATA_DIR, "lifecycle.log");
 const WORKSPACE_ID = createHash("sha256").update(comparePath(PRIMARY_ROOT)).digest("hex").slice(0, 16);
 const WORKSPACE_DATA_DIR = path.join(DATA_DIR, "workspaces", WORKSPACE_ID);
+const RUNTIME_EVENT_PATH = path.join(WORKSPACE_DATA_DIR, "runtime", "events.jsonl");
+const RUNTIME_EVENTS = new RuntimeEventStore({ path: RUNTIME_EVENT_PATH, maxInMemory: 30_000 });
+await RUNTIME_EVENTS.init();
+const ACTION_PIPELINE = new ActionExecutionPipeline(RUNTIME_EVENTS);
+ACTION_PIPELINE.subscribe(consumeActionObservation);
+const OTEL_EXPORTER = new RuntimeOtelExporter({
+  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+  serviceName: process.env.OTEL_SERVICE_NAME || "local-coding-agent"
+});
+ACTION_PIPELINE.subscribe((observation) => OTEL_EXPORTER.observe(observation));
+const RUNTIME_PLUGIN_HOST = new RuntimePluginHost({
+  runtime: CONVERSATION_RUNTIME,
+  events: RUNTIME_EVENTS
+});
+await RUNTIME_PLUGIN_HOST.mount({
+  name: "integration-clients",
+  start: () => ({
+    dispose: async () => {
+      await closeNextApplicationRuntime();
+      await closeLegacyBackendRuntime();
+      await Promise.all([
+        closeFigmaDesktopClients(),
+        closeDBeaverDesktopClients(),
+        closeBrunoDesktopClients(),
+        closePenpotClients(),
+        closeCoolifyMcpClients(),
+        closeBrowserAgentClient()
+      ]);
+    }
+  })
+});
 const NOTES_PATH = path.resolve(WORKSPACE_DATA_DIR, "notes.json");
 const CHECKPOINT_PATH = path.resolve(WORKSPACE_DATA_DIR, "checkpoint.json");
 const AUDIT_PATH = path.resolve(DATA_DIR, "audit.log");
@@ -216,6 +288,10 @@ const PENPOT_USER_TOKEN = String(process.env.PENPOT_USER_TOKEN || "").trim();
 const COOLIFY_BASE_URL = String(process.env.COOLIFY_BASE_URL || DEFAULT_COOLIFY_BASE_URL).trim();
 const COOLIFY_MCP_TIMEOUT_MS = boundedNumber(process.env.COOLIFY_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const COOLIFY_ACCESS_TOKEN = String(process.env.COOLIFY_ACCESS_TOKEN || "").trim();
+const NOTION_API_BASE = String(process.env.NOTION_API_BASE || DEFAULT_NOTION_API_BASE).trim();
+const NOTION_VERSION = String(process.env.NOTION_VERSION || DEFAULT_NOTION_VERSION).trim();
+const NOTION_API_KEY = String(process.env.NOTION_API_KEY || "").trim();
+const NOTION_TIMEOUT_MS = boundedNumber(process.env.NOTION_TIMEOUT_MS, 30_000, 1_000, 120_000);
 
 const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "get_code_connect_map",
@@ -239,20 +315,20 @@ const PATCH_HISTORY_PATH = path.resolve(WORKSPACE_DATA_DIR, "patch-history.json"
 const BACKUPS_DIR = path.resolve(WORKSPACE_DATA_DIR, "backups");
 
 function activePatchDataDir() {
-  const scopedRoot = CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+  const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
   if (!scopedRoot) return WORKSPACE_DATA_DIR;
   const scopeId = createHash("sha256").update(comparePath(scopedRoot)).digest("hex").slice(0, 16);
   return path.join(WORKSPACE_DATA_DIR, "conversation-projects", scopeId);
 }
 
 function activePatchHistoryPath() {
-  return CONVERSATION_PROJECT_SCOPE.isScoped()
+  return CONVERSATION_RUNTIME.isScoped()
     ? path.join(activePatchDataDir(), "patch-history.json")
     : PATCH_HISTORY_PATH;
 }
 
 function activeBackupsDir() {
-  return CONVERSATION_PROJECT_SCOPE.isScoped()
+  return CONVERSATION_RUNTIME.isScoped()
     ? path.join(activePatchDataDir(), "backups")
     : BACKUPS_DIR;
 }
@@ -270,7 +346,7 @@ const WORKSPACE_PROTOCOL = new WorkspaceProtocol({
 });
 
 function activeAgentStateDir() {
-  const scopedRoot = CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+  const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
   return scopedRoot ? path.join(scopedRoot, ".agent", "state") : AGENT_STATE_DIR;
 }
 
@@ -283,7 +359,7 @@ function activeDecisionsPath() {
 }
 
 function activeCheckpointPath() {
-  const scopedRoot = CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+  const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
   return scopedRoot ? path.join(scopedRoot, ".agent", "state", "checkpoint.json") : CHECKPOINT_PATH;
 }
 
@@ -312,6 +388,18 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_TASK_STEPS = 8;
 const MAX_PARALLEL_STEPS = 32;
 const MAX_TASK_CONCURRENCY = 4;
+let agentRunnerRegistry;
+
+function getAgentRunnerRegistry() {
+  if (!agentRunnerRegistry) {
+    agentRunnerRegistry = new AgentRunnerRegistry({
+      events: RUNTIME_EVENTS,
+      correlationId: () => ACTION_PIPELINE.currentCorrelationId(),
+      codexOptions: { maxParallel: MAX_PARALLEL_TASKS }
+    });
+  }
+  return agentRunnerRegistry;
+}
 const TASK_ID_SCHEMA = z.string().min(1).max(80).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).optional();
 const TOUCHES_SCHEMA = z.array(z.string().min(1).max(1000)).max(200).optional();
 const MAX_PROCS = 24;
@@ -357,6 +445,8 @@ await loadWorkspaceProfile();
 // Detect ripgrep once at startup — the fastest search engine when present.
 const RG_BIN = await detectRg();
 if (RG_BIN) console.log("ripgrep detected: search_text/find_files will use rg");
+const ADB_BIN = detectAdbBinary();
+if (ADB_BIN) console.log(`adb detected: ${ADB_BIN}`);
 
 function detectRg() {
   return new Promise((resolve) => {
@@ -369,6 +459,22 @@ function detectRg() {
     child.on("error", () => resolve(null));
     child.on("close", (code) => resolve(code === 0 ? "rg" : null));
   });
+}
+
+function detectAdbBinary() {
+  const executable = process.platform === "win32" ? "adb.exe" : "adb";
+  const candidates = [
+    process.env.ADB,
+    process.env.ANDROID_ADB,
+    process.env.ANDROID_HOME ? path.join(process.env.ANDROID_HOME, "platform-tools", executable) : null,
+    process.env.ANDROID_SDK_ROOT ? path.join(process.env.ANDROID_SDK_ROOT, "platform-tools", executable) : null,
+    path.join(os.homedir(), "Android", "Sdk", "platform-tools", executable),
+    path.join(os.homedir(), "Android", "sdk", "platform-tools", executable)
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return hasCommand("adb") ? "adb" : null;
 }
 
 const compactMcpInterface = await import("./dist/interfaces/mcp/compact-mcp-interface.js").catch((error) => {
@@ -426,6 +532,12 @@ const httpServer = http.createServer(async (req, res) => {
             legacy_uri: DBEAVER_SQL_ARTIFACT_LEGACY_URI,
             bytes: DBEAVER_SQL_ARTIFACT_RESOURCE.bytes,
             sha256: DBEAVER_SQL_ARTIFACT_RESOURCE.sha256
+          },
+          notion_page: {
+            uri: NOTION_PAGE_WIDGET_URI,
+            legacy_uri: NOTION_PAGE_WIDGET_LEGACY_URI,
+            bytes: NOTION_PAGE_WIDGET_RESOURCE.bytes,
+            sha256: NOTION_PAGE_WIDGET_RESOURCE.sha256
           }
         }
       });
@@ -484,15 +596,8 @@ async function gracefulExit(signal) {
   try {
     for (const proc of processes.values()) killProcessTree(proc);
     try { auditStream?.end(); } catch {}
-    await closeNextApplicationRuntime();
-    await closeLegacyBackendRuntime();
-    await Promise.all([
-      closeFigmaDesktopClients(),
-      closeDBeaverDesktopClients(),
-      closeBrunoDesktopClients(),
-      closePenpotClients(),
-      closeCoolifyMcpClients()
-    ]);
+    await RUNTIME_PLUGIN_HOST.dispose();
+    await RUNTIME_EVENTS.flush();
     await lifecycleLog(`${signal} cleanup completed`);
   } catch (error) {
     await lifecycleLog(`${signal} cleanup failed: ${error?.stack || error}`);
@@ -557,6 +662,7 @@ function createMcpServer() {
   );
   registerCompanionAppResources(mcp);
   registerCompactTools(mcp);
+  registerNotionPageTool(mcp);
   return mcp;
 }
 
@@ -568,6 +674,12 @@ function registerBackendTools(mcp) {
   registerBrunoDesktopTools(mcp);
   registerPenpotMcpTools(mcp);
   registerCoolifyMcpTools(mcp);
+  registerNotionTools(mcp, {
+    registerTool: reg,
+    jsonResult,
+    apiOptions: notionApiOptions(),
+    apiVersion: NOTION_VERSION
+  });
   registerFsReadTools(mcp);
   registerFsWriteTools(mcp);
   registerExecTools(mcp);
@@ -575,10 +687,13 @@ function registerBackendTools(mcp) {
   registerGitTool(mcp);
   registerSkillTools(mcp);
   registerRepoIntelTools(mcp);    // v2.1
+  registerCodeIntelligenceTools(mcp); // v4.5 — LSP/compiler-native navigation + refactor
   registerCompanionTools(mcp);    // v2.9 — @ context + / workflow UI helpers
   registerPatchEngineTools(mcp);  // v2.2
   registerTestRunnerTools(mcp);   // v2.3
   registerReviewTools(mcp);       // v2.4
+  registerAgentTools(mcp);        // v4.5 — delegated model agents
+  registerUiTools(mcp);           // v4.5 — browser + Android automation
   registerPlannerTools(mcp);      // v2.5
   registerProfileTools(mcp);      // v2.8
 }
@@ -587,7 +702,12 @@ function registerCompactTools(mcp) {
   compactMcpInterface.registerCompactMcpTools(mcp, {
     registerTool: reg,
     callBackendTool: (name, args, project) =>
-      CONVERSATION_PROJECT_SCOPE.run(project, () => callLegacyTool(name, args)),
+      project
+        ? CONVERSATION_RUNTIME.run({
+          primaryRoot: project,
+          correlationId: ACTION_PIPELINE.currentCorrelationId() || randomUUID()
+        }, () => callLegacyTool(name, args))
+        : callLegacyTool(name, args),
     listBackendTools: async () => (await getLegacyBackendRuntime()).tools,
     registerLcaInputTool,
     structuredJsonResult
@@ -708,6 +828,150 @@ function registerFigmaReadWrapper(mcp, lcaName, upstreamName, description) {
       return callFigmaDesktopTool(upstreamName, args, { endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS });
     }
   );
+}
+
+function runtimeTrajectory(input = {}) {
+  let events = RUNTIME_EVENTS.query({
+    correlationId: input.correlation_id || undefined,
+    typePrefix: input.type_prefix || undefined,
+    limit: input.limit || 300
+  });
+  if (input.tool) events = events.filter((event) => event.data?.name === input.tool);
+  if (input.surface) events = events.filter((event) => event.data?.surface === input.surface);
+  if (typeof input.ok === "boolean") events = events.filter((event) => event.data?.success === input.ok);
+  const grouped = new Map();
+  for (const event of events) {
+    const group = grouped.get(event.correlationId) || {
+      correlation_id: event.correlationId,
+      started_at: event.timestamp,
+      ended_at: event.timestamp,
+      events: []
+    };
+    group.ended_at = event.timestamp;
+    group.events.push({
+      seq: event.seq,
+      id: event.id,
+      timestamp: event.timestamp,
+      type: event.type,
+      parent_id: event.parentId || null,
+      data: event.data
+    });
+    grouped.set(event.correlationId, group);
+  }
+  return {
+    source: "runtime-event-jsonl",
+    path: RUNTIME_EVENTS.path,
+    count: events.length,
+    correlations: [...grouped.values()].sort((left, right) => left.started_at.localeCompare(right.started_at))
+  };
+}
+
+function registerNotionPageTool(mcp) {
+  reg(
+    mcp,
+    "notion_page",
+    {
+      title: "Notion page",
+      description: "Open the LCA Notion page app inside ChatGPT. It can also stage a read-only edit proposal for preview. Proposal inputs NEVER mutate Notion; only the widget's explicit Apply action may write later.",
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      inputSchema: {
+        page_id: z.string().min(1).optional(),
+        page_url: z.string().min(1).optional(),
+        query: z.string().optional(),
+        proposal_scope: z.enum(["whole_page", "selected_blocks", "selected_text"]).optional().describe("Stage a proposal for the whole page or a selected target. This is preview-only."),
+        proposal_prompt: z.string().optional().describe("The user's rewrite instruction, retained only as proposal context."),
+        proposal_source: z.string().optional().describe("Exact current Enhanced Markdown source for selected-content proposals. Must match exactly once."),
+        proposal_replacement: z.string().optional().describe("Replacement Enhanced Markdown for proposal_source. Preview-only; do not call mutation tools."),
+        proposal_markdown: z.string().optional().describe("Complete proposed Enhanced Markdown for whole-page preview. Preview-only; do not mutate Notion.")
+      },
+      _meta: {
+        ui: { resourceUri: NOTION_PAGE_WIDGET_URI, visibility: ["model", "app"] },
+        "openai/outputTemplate": NOTION_PAGE_WIDGET_URI,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening Notion…",
+        "openai/toolInvocation/invoked": "Notion page ready."
+      }
+    },
+    async ({
+      page_id,
+      page_url,
+      query = "",
+      proposal_scope,
+      proposal_prompt,
+      proposal_source,
+      proposal_replacement,
+      proposal_markdown
+    }) => {
+      let page = null;
+      let search = null;
+      let status = null;
+      let proposal = null;
+      if (page_id || page_url) {
+        const [openedPage, recentPages] = await Promise.all([
+          notionFetchPage(page_id || page_url, {
+            ...notionApiOptions(),
+            includeRenderData: false
+          }),
+          notionSearch({ query: "", page_size: 30 }, notionApiOptions()).catch(() => null)
+        ]);
+        page = openedPage;
+        if (recentPages) search = compactNotionWidgetSearch(recentPages);
+        if (proposal_scope || proposal_markdown !== undefined || proposal_replacement !== undefined) {
+          proposal = buildNotionEditProposal(page, {
+            proposal_scope,
+            proposal_prompt,
+            proposal_source,
+            proposal_replacement,
+            proposal_markdown
+          });
+        }
+      } else if (query) {
+        search = compactNotionWidgetSearch(await notionSearch({ query, page_size: 30 }, notionApiOptions()));
+      } else {
+        status = await notionStatus(notionApiOptions());
+        if (status.connected) {
+          search = compactNotionWidgetSearch(await notionSearch({ query: "", page_size: 30 }, notionApiOptions()));
+        }
+      }
+      const payload = { page: compactNotionWidgetPage(page), search, status, proposal, api_version: NOTION_VERSION };
+      return {
+        structuredContent: payload,
+        content: [{
+          type: "text",
+          text: proposal
+            ? `Prepared a staged Notion edit preview for “${page.title}”. Nothing has been written. Review the diff and use Apply in the widget to commit it.`
+            : page
+            ? `Opened Notion page “${page.title}”.`
+            : search
+              ? `Notion page app is ready with ${search.results.length} recently edited shared pages.`
+              : "Notion page app is ready."
+        }],
+        _meta: { ui: { resourceUri: NOTION_PAGE_WIDGET_URI }, "openai/outputTemplate": NOTION_PAGE_WIDGET_URI }
+      };
+    }
+  );
+}
+
+function compactNotionWidgetPage(page) {
+  if (!page) return null;
+  const { render_data: _renderData, ...compactPage } = page;
+  return compactPage;
+}
+
+function compactNotionWidgetSearch(search = {}) {
+  return {
+    query: String(search.query || ""),
+    results: (search.results || []).map((page) => ({
+      id: page.id,
+      title: page.title,
+      url: page.url,
+      icon: page.icon,
+      last_edited_time: page.last_edited_time,
+      in_trash: Boolean(page.in_trash)
+    })),
+    has_more: Boolean(search.has_more),
+    next_cursor: search.next_cursor || null
+  };
 }
 
 function buildFigmaDesktopArguments({
@@ -1060,8 +1324,8 @@ function registerPenpotMcpTools(mcp) {
     mcp,
     "penpot_call_tool",
     {
-      title: "Call a safe Penpot MCP tool",
-      description: "Compatibility action for Penpot reads and ordinary mutations. Code that appears destructive is rejected.",
+      title: "Call any Penpot MCP tool",
+      description: "Forward any live Penpot MCP operation directly in the trusted-local runtime. Classification remains metadata only.",
       annotations: mutation,
       inputSchema: {
         tool: z.string().min(1),
@@ -1075,8 +1339,8 @@ function registerPenpotMcpTools(mcp) {
     mcp,
     "penpot_read_tool",
     {
-      title: "Call a read-only Penpot tool",
-      description: "Call only high-level overview, API documentation, export, or another upstream tool marked read-only.",
+      title: "Call Penpot tool (read compatibility alias)",
+      description: "Compatibility alias that forwards the requested live Penpot MCP operation directly.",
       annotations: readOnly,
       inputSchema: {
         tool: z.string().min(1),
@@ -1090,8 +1354,8 @@ function registerPenpotMcpTools(mcp) {
     mcp,
     "penpot_mutate_tool",
     {
-      title: "Call a non-destructive Penpot mutation",
-      description: "Run Penpot execute_code for creation and ordinary edits. Delete/remove/clear-like code is rejected.",
+      title: "Call Penpot mutation",
+      description: "Compatibility alias that forwards the requested Penpot mutation directly.",
       annotations: mutation,
       inputSchema: {
         tool: z.string().min(1),
@@ -1106,18 +1370,17 @@ function registerPenpotMcpTools(mcp) {
     "penpot_destructive_tool",
     {
       title: "Call a destructive Penpot operation",
-      description: "Run delete/remove/clear-like Penpot code only after explicit confirmation of the exact design impact.",
+      description: "Forward a destructive Penpot operation directly in trusted-local mode without an LCA confirmation round-trip.",
       annotations: destructive,
       inputSchema: {
         tool: z.string().min(1),
-        arguments: z.record(z.any()).optional(),
-        confirmed: z.literal(true).describe("Must be true only after explicit user confirmation of the exact destructive design operation.")
+        arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments, confirmed }) => callDestructivePenpotTool(
+    async ({ tool, arguments: upstreamArguments }) => callDestructivePenpotTool(
       tool,
       upstreamArguments || {},
-      { ...bridgeOptions, confirmed }
+      bridgeOptions
     )
   );
 
@@ -1202,8 +1465,8 @@ function registerPenpotMcpTools(mcp) {
     mcp,
     "penpot_execute_code",
     {
-      title: "Execute non-destructive Penpot code",
-      description: "Execute JavaScript in the active Penpot plugin context for drawing and ordinary edits. Destructive-looking code is blocked.",
+      title: "Execute Penpot code",
+      description: "Execute JavaScript directly in the active Penpot plugin context.",
       annotations: mutation,
       inputSchema: { code: z.string().min(1) }
     },
@@ -1215,14 +1478,11 @@ function registerPenpotMcpTools(mcp) {
     "penpot_execute_destructive_code",
     {
       title: "Execute destructive Penpot code",
-      description: "Execute delete/remove/clear-like JavaScript only after explicit user confirmation.",
+      description: "Execute delete/remove/clear-like JavaScript directly in trusted-local mode.",
       annotations: destructive,
-      inputSchema: {
-        code: z.string().min(1),
-        confirmed: z.literal(true).describe("Must be true only after explicit user confirmation of the exact destructive design operation.")
-      }
+      inputSchema: { code: z.string().min(1) }
     },
-    async ({ code, confirmed }) => callDestructivePenpotTool("execute_code", { code }, { ...bridgeOptions, confirmed })
+    async ({ code }) => callDestructivePenpotTool("execute_code", { code }, bridgeOptions)
   );
 }
 
@@ -1268,7 +1528,7 @@ function registerCoolifyMcpTools(mcp) {
     "coolify_call_tool",
     {
       title: "Call any Coolify MCP tool",
-      description: "Compatibility action for reads and ordinary mutations. Destructive actions are rejected and must use coolify_destructive_tool after explicit user confirmation.",
+      description: "Forward any live Coolify MCP operation directly in the trusted-local runtime. Classification remains metadata only.",
       annotations: mutation,
       inputSchema: {
         tool: z.string().min(1),
@@ -1282,8 +1542,8 @@ function registerCoolifyMcpTools(mcp) {
     mcp,
     "coolify_read_tool",
     {
-      title: "Call a read-only Coolify tool",
-      description: "Call a Coolify operation only when its live annotations/action classify it as read-only.",
+      title: "Call Coolify tool (read compatibility alias)",
+      description: "Compatibility alias that forwards the requested live Coolify operation directly.",
       annotations: readOnly,
       inputSchema: {
         tool: z.string().min(1),
@@ -1297,8 +1557,8 @@ function registerCoolifyMcpTools(mcp) {
     mcp,
     "coolify_mutate_tool",
     {
-      title: "Call a non-destructive Coolify mutation",
-      description: "Call a create, update, deploy, start, restart, attach, or similar non-destructive Coolify operation. Read and destructive actions are rejected.",
+      title: "Call Coolify mutation",
+      description: "Compatibility alias that forwards the requested Coolify mutation directly.",
       annotations: mutation,
       inputSchema: {
         tool: z.string().min(1),
@@ -1313,20 +1573,28 @@ function registerCoolifyMcpTools(mcp) {
     "coolify_destructive_tool",
     {
       title: "Call a destructive Coolify operation",
-      description: "Call delete, stop, cancel, API-disable, or emergency-stop operations only after the user explicitly confirms the exact operation and blast radius.",
+      description: "Forward delete, stop, cancel, API-disable, or emergency-stop operations directly in trusted-local mode.",
       annotations: destructive,
       inputSchema: {
         tool: z.string().min(1),
-        arguments: z.record(z.any()).optional(),
-        confirmed: z.literal(true).describe("Must be true only after explicit user confirmation of the exact destructive operation.")
+        arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments, confirmed }) => callDestructiveCoolifyMcpTool(
+    async ({ tool, arguments: upstreamArguments }) => callDestructiveCoolifyMcpTool(
       tool,
       upstreamArguments || {},
-      { ...bridgeOptions, confirmed }
+      bridgeOptions
     )
   );
+}
+
+function notionApiOptions() {
+  return {
+    token: NOTION_API_KEY,
+    apiBase: NOTION_API_BASE,
+    version: NOTION_VERSION,
+    timeoutMs: NOTION_TIMEOUT_MS
+  };
 }
 
 function registerDBeaverDesktopTools(mcp) {
@@ -1811,21 +2079,30 @@ const WORKFLOW_COMMANDS = [
   }
 ];
 
-function widgetResourcePayload(uri, resource, description) {
+function widgetResourcePayload(uri, resource, description, {
+  mimeType = "text/html;profile=mcp-app",
+  redirectDomains = [],
+  resourceDomains = []
+} = {}) {
+  const legacyCsp = {
+    connect_domains: [],
+    resource_domains: resourceDomains,
+    ...(redirectDomains.length ? { redirect_domains: redirectDomains } : {})
+  };
   return {
     contents: [
       {
         uri,
-        mimeType: "text/html;profile=mcp-app",
+        mimeType,
         text: resource.text,
         _meta: {
           ui: {
             prefersBorder: true,
-            csp: { connectDomains: [], resourceDomains: [] }
+            csp: { connectDomains: [], resourceDomains }
           },
           "openai/widgetDescription": description,
           "openai/widgetPrefersBorder": true,
-          "openai/widgetCSP": { connect_domains: [], resource_domains: [] }
+          "openai/widgetCSP": legacyCsp
         }
       }
     ]
@@ -1835,6 +2112,7 @@ function widgetResourcePayload(uri, resource, description) {
 function registerCompanionAppResources(mcp) {
   const companionDescription = "Compact LCA input composer for PiP: one low-height prompt box with @ context, / workflow autocomplete, Enter-to-send, and token highlights.";
   const sqlArtifactDescription = "Interactive SQL artifact for DBeaver with Open, native-confirmed Run, Explain, and Save Snippet actions.";
+  const notionPageDescription = "Interactive Notion page viewer/editor with search, safe Markdown save, staged AI edit proposals, side-by-side synchronized diff review, explicit Apply approval, block/text selection, Add to ChatGPT, PiP, and fullscreen mode.";
   mcp.registerResource(
     "lca-companion-widget",
     COMPANION_WIDGET_URI,
@@ -1858,6 +2136,36 @@ function registerCompanionAppResources(mcp) {
     DBEAVER_SQL_ARTIFACT_LEGACY_URI,
     {},
     async () => widgetResourcePayload(DBEAVER_SQL_ARTIFACT_LEGACY_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, sqlArtifactDescription)
+  );
+  mcp.registerResource(
+    "notion-page-widget",
+    NOTION_PAGE_WIDGET_URI,
+    {},
+    async () => widgetResourcePayload(NOTION_PAGE_WIDGET_URI, NOTION_PAGE_WIDGET_RESOURCE, notionPageDescription, {
+      mimeType: NOTION_PAGE_WIDGET_MIME_TYPE,
+      redirectDomains: ["https://app.notion.com"],
+      resourceDomains: [
+        "https://s3-us-west-2.amazonaws.com",
+        "https://prod-files-secure.s3.us-west-2.amazonaws.com",
+        "https://file.notion.so",
+        "https://www.notion.so"
+      ]
+    })
+  );
+  mcp.registerResource(
+    "notion-page-widget-legacy",
+    NOTION_PAGE_WIDGET_LEGACY_URI,
+    {},
+    async () => widgetResourcePayload(NOTION_PAGE_WIDGET_LEGACY_URI, NOTION_PAGE_WIDGET_RESOURCE, notionPageDescription, {
+      mimeType: NOTION_PAGE_WIDGET_MIME_TYPE,
+      redirectDomains: ["https://app.notion.com"],
+      resourceDomains: [
+        "https://s3-us-west-2.amazonaws.com",
+        "https://prod-files-secure.s3.us-west-2.amazonaws.com",
+        "https://file.notion.so",
+        "https://www.notion.so"
+      ]
+    })
   );
 }
 
@@ -1918,7 +2226,7 @@ function registerCompanionTools(mcp) {
       }
     },
     async ({ input, path: rel, mode, selected_context = [], include_context_pack = true }) => {
-      const conversationPrimary = rel ? resolvePath(rel) : CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot();
+      const conversationPrimary = rel ? resolvePath(rel) : CONVERSATION_RUNTIME.scopedPrimaryRoot();
       const rootDirs = rel ? [conversationPrimary] : activeDiscoveryRoots();
       const result = await composeLcaPrompt(input, rootDirs, {
         mode,
@@ -1954,7 +2262,7 @@ function registerLcaInputTool(mcp, name, title, description) {
       }
     },
     async ({ initial_input = "", primary_project }) => {
-      const primaryProject = CONVERSATION_PROJECT_SCOPE.normalize(primary_project);
+      const primaryProject = CONVERSATION_RUNTIME.normalize(primary_project);
       const payload = {
         initial_input,
         workspace: PRIMARY_ROOT,
@@ -2418,25 +2726,54 @@ function reg(mcp, name, def, handler) {
     const startedAt = isoNow();
     const startedMs = performance.now();
     const argSummary = AUDIT_ENABLED && AUDIT_ARGS ? summarizeArgs(args) : "";
-    const inChars = argSummary.length;
+    const inChars = measureJsonChars(args ?? {});
     let result;
-    let ok = true;
     try {
-      result = await handler(args ?? {}, extra);
+      result = await ACTION_PIPELINE.execute({
+        name,
+        surface: modelFacing ? "facade" : "backend",
+        args: args ?? {},
+        resultIsError: (value) => Boolean(value?.isError)
+      }, () => handler(args ?? {}, extra));
     } catch (err) {
-      ok = false;
       result = { content: [{ type: "text", text: `ERROR: ${err?.message || err}` }], isError: true };
     }
-    const success = ok && !result?.isError;
+    const success = !result?.isError;
     const outChars = resultLen(result);
     const durationMs = Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10);
     const errText = success ? null : firstText(result).slice(0, 200);
     audit({ ts: startedAt, tool: name, ok: success, durationMs, inChars, outChars, error: errText || undefined, args: argSummary || undefined });
-    if (modelFacing && RECORD_AGENTMEMORY_SESSIONS) {
-      scheduleAgentMemoryObservation(name, args ?? {}, result, success, durationMs, outChars, errText);
-    }
     return result;
   });
+}
+
+function consumeActionObservation(observation) {
+  TOOL_METRICS.record({
+    ts: observation.startedAt,
+    tool: observation.name,
+    surface: observation.surface,
+    ok: observation.success,
+    durationMs: observation.durationMs,
+    inChars: observation.inChars,
+    outChars: observation.outChars
+  });
+  if (observation.surface !== "facade" || !RECORD_AGENTMEMORY_SESSIONS) return;
+  const result = observation.result ?? {
+    content: [{ type: "text", text: `ERROR: ${observation.error?.message || observation.error || "tool failed"}` }],
+    isError: true
+  };
+  const errText = observation.success
+    ? null
+    : firstText(result).slice(0, 200) || String(observation.error || "").slice(0, 200);
+  scheduleAgentMemoryObservation(
+    observation.name,
+    observation.args ?? {},
+    result,
+    observation.success,
+    observation.durationMs,
+    observation.outChars,
+    errText
+  );
 }
 
 function scheduleAgentMemoryObservation(name, args, result, success, durationMs, outChars, errText) {
@@ -2549,7 +2886,7 @@ function workspaceInfoPayload() {
     auth: AUTH_TOKEN ? "bearer" : "none",
     roots: ROOTS,
     primary_root: PRIMARY_ROOT,
-    conversation_primary_root: CONVERSATION_PROJECT_SCOPE.scopedPrimaryRoot() || null,
+    conversation_primary_root: CONVERSATION_RUNTIME.scopedPrimaryRoot() || null,
     effective_primary_root: activePrimaryRoot(),
     discovery_roots: activeDiscoveryRoots(),
     host: { platform: os.platform(), release: os.release(), hostname: os.hostname(), cwd: process.cwd(), node: process.version },
@@ -2595,6 +2932,39 @@ function registerBasicTools(mcp) {
       inputSchema: {}
     },
     async () => jsonResult(workspaceInfoPayload())
+  );
+
+  reg(
+    mcp,
+    "performance_profile",
+    {
+      title: "Tool performance profile",
+      description: "Aggregate privacy-safe tool latency, failure rate, and payload-size metrics. No tool arguments or output content are retained in this profiler.",
+      inputSchema: {
+        tool: z.string().optional(),
+        surface: z.enum(["facade", "backend"]).optional(),
+        ok: z.boolean().optional()
+      }
+    },
+    async (input) => jsonResult(TOOL_METRICS.profile(input))
+  );
+
+  reg(
+    mcp,
+    "tool_trace",
+    {
+      title: "Runtime trajectory",
+      description: "Read the append-only runtime trajectory grouped by correlation id, including tool and delegated-agent lifecycle events. Payload content is not persisted; only bounded execution metadata and durable agent descriptors are retained.",
+      inputSchema: {
+        limit: z.number().int().min(1).max(2000).optional(),
+        correlation_id: z.string().optional(),
+        type_prefix: z.string().optional(),
+        tool: z.string().optional(),
+        surface: z.enum(["facade", "backend"]).optional(),
+        ok: z.boolean().optional()
+      }
+    },
+    async (input) => jsonResult(runtimeTrajectory(input))
   );
 
   reg(
@@ -3369,6 +3739,9 @@ function registerFsWriteTools(mcp) {
               content: z.string().optional().describe("For create: full file content."),
               rename_to: z.string().optional().describe("For rename: destination path."),
               recursive: z.boolean().optional().describe("For delete of a directory."),
+              old_text: z.string().min(1).optional().describe("For update: shorthand for one exact text replacement."),
+              new_text: z.string().optional().describe("For update shorthand: replacement text paired with old_text."),
+              replace_all: z.boolean().optional().describe("For update shorthand: replace every exact old_text match."),
               edits: z
                 .array(z.object({ old_text: z.string().min(1), new_text: z.string(), replace_all: z.boolean().optional() }))
                 .optional()
@@ -3460,7 +3833,7 @@ function registerFsWriteTools(mcp) {
     "move_path",
     {
       title: "Move / rename",
-      description: "Move or rename a file or directory. Both ends must be inside the roots.",
+      description: "Move or rename a file or directory. Absolute paths are allowed; OS permissions and explicit task scope guards remain authoritative.",
       inputSchema: { from: z.string().min(1), to: z.string().min(1), task_id: TASK_ID_SCHEMA }
     },
     async ({ from, to, task_id }) => {
@@ -3481,7 +3854,7 @@ function registerFsWriteTools(mcp) {
     "delete_path",
     {
       title: "Delete path",
-      description: "Delete a file or directory inside the roots. Directories require recursive=true.",
+      description: "Delete a file or directory. Absolute paths are allowed; directories require recursive=true.",
       inputSchema: { path: z.string().min(1), recursive: z.boolean().optional(), task_id: TASK_ID_SCHEMA }
     },
     async ({ path: rel, recursive = false, task_id }) => {
@@ -3594,8 +3967,19 @@ async function applyOne(op) {
   }
   if (op.op === "update") {
     let content = await readFile(target, "utf8");
+    const shorthandRequested = op.old_text !== undefined || op.new_text !== undefined || op.replace_all !== undefined;
+    if ((op.old_text === undefined) !== (op.new_text === undefined)) {
+      throw new Error(`update shorthand for ${target} requires both old_text and new_text`);
+    }
+    const edits = [
+      ...(op.edits || []),
+      ...(op.old_text !== undefined && op.new_text !== undefined
+        ? [{ old_text: op.old_text, new_text: op.new_text, replace_all: Boolean(op.replace_all) }]
+        : [])
+    ];
+    if (!edits.length) throw new Error(`update requires at least one edit for ${target}`);
     let count = 0;
-    for (const edit of op.edits || []) {
+    for (const edit of edits) {
       if (!content.includes(edit.old_text)) throw new Error(`old_text not found in ${target}`);
       if (edit.replace_all) {
         count += content.split(edit.old_text).length - 1;
@@ -3605,6 +3989,7 @@ async function applyOne(op) {
         count += 1;
       }
     }
+    if (count === 0) throw new Error(`update made no replacements in ${target}`);
     await writeFile(target, content, "utf8");
     return { op: "update", path: toRel(target), ok: true, replacements: count };
   }
@@ -3839,6 +4224,42 @@ function registerExecTools(mcp) {
       });
     }
   );
+
+  reg(
+    mcp,
+    "run_code",
+    {
+      title: "Run Code Mode program",
+      description: "Execute one TypeScript program in a fresh bounded worker. The program receives curated async lca.search/read/edit/exec/git/verify/status/agent/ui bindings; every binding re-enters the normal LCA backend pipeline and trajectory.",
+      inputSchema: {
+        program: z.string().min(1).max(120_000),
+        timeout_ms: z.number().int().min(1000).max(600_000).optional(),
+        heap_mb: z.number().int().min(64).max(1024).optional()
+      }
+    },
+    async ({ program, timeout_ms = 120_000, heap_mb = 256 }) => jsonResult(await runCodeMode({
+      program,
+      wallMs: timeout_ms,
+      heapMb: heap_mb,
+      dispatch: dispatchCodeModeBinding
+    }))
+  );
+}
+
+async function dispatchCodeModeBinding(facade, action, args) {
+  const allowed = new Set([
+    "workspace_search", "workspace_read", "workspace_edit", "workspace_exec", "workspace_git",
+    "workspace_verify", "workspace_status", "workspace_agent", "workspace_ui"
+  ]);
+  if (!allowed.has(facade)) throw new Error(`Code Mode binding is not allowed: ${facade}`);
+  const runtime = await getLegacyBackendRuntime();
+  const hidden = compactMcpInterface.resolveCompactAction(facade, String(action || ""), runtime.tools);
+  if (hidden === "run_code") throw new Error("Recursive Code Mode execution is not allowed.");
+  const result = await callLegacyTool(hidden, args || {});
+  if (result?.isError) throw new Error(firstText(result) || `${hidden} failed`);
+  if (result?.structuredContent !== undefined) return result.structuredContent;
+  const text = firstText(result);
+  try { return JSON.parse(text); } catch { return text; }
 }
 
 async function runParallelTaskDag(tasks, { maxConcurrency, failFast, taskId }) {
@@ -4153,6 +4574,33 @@ function registerProcessTools(mcp) {
 
   reg(
     mcp,
+    "proc_wait",
+    {
+      title: "Wait for process condition",
+      description: "Wait for a managed process or readiness condition without model-side polling. Supports exit, output regex, TCP port, HTTP health, file existence, and file change.",
+      inputSchema: {
+        id: z.string().min(1),
+        condition: z.enum(["exit", "stdout_regex", "stderr_regex", "output_regex", "port_open", "http_healthy", "file_exists", "file_changed"]),
+        pattern: z.string().max(1000).optional(),
+        host: z.string().max(300).optional(),
+        port: z.number().int().min(1).max(65535).optional(),
+        url: z.string().url().max(20_000).optional(),
+        status_codes: z.array(z.number().int().min(100).max(599)).max(20).optional(),
+        path: z.string().max(4000).optional(),
+        timeout_ms: z.number().int().min(100).max(600_000).optional(),
+        poll_ms: z.number().int().min(50).max(5000).optional(),
+        tail_chars: z.number().int().min(100).max(PROC_BUFFER).optional()
+      }
+    },
+    async (input) => {
+      const proc = processes.get(input.id);
+      if (!proc) throw new Error(`No process with id ${input.id}`);
+      return jsonResult(await waitForProcessCondition(proc, input));
+    }
+  );
+
+  reg(
+    mcp,
     "proc_stop",
     {
       title: "Stop background process",
@@ -4166,6 +4614,632 @@ function registerProcessTools(mcp) {
       return jsonResult({ ok: true, id, status: proc.status });
     }
   );
+}
+
+function registerAgentTools(mcp) {
+  const commonTaskShape = {
+    runner: z.string().optional().describe("Agent runner name. Default: codex."),
+    task: z.string().min(1),
+    name: z.string().min(1).max(120).optional(),
+    cwd: z.string().optional().describe("Working directory. Default: conversation primary project."),
+    files: z.array(z.string().min(1)).max(200).optional().describe("Optional correctness scope for delegated writes. Omit to let an isolated worker edit any file needed for the task."),
+    context: z.string().max(80_000).optional().describe("Bounded parent-agent context to pass to the worker."),
+    model: z.string().optional(),
+    provider: z.string().min(1).max(64).optional().describe("Use one configured provider by name; explicit provider selection bypasses provider cooldown."),
+    provider_chain: z.array(z.string().min(1).max(64)).max(8).optional().describe("Ordered provider fallback chain. Secrets stay server-side in environment variables."),
+    reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+    sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional().describe("Default: danger-full-access."),
+    isolation: z.enum(["shared", "worktree"]).optional().describe("Writable jobs default to isolated git worktrees; read-only jobs default to shared."),
+    inherit_dirty: z.boolean().optional().describe("Copy current tracked/untracked state into the isolated baseline. Default true."),
+    network_access: z.boolean().optional().describe("Default: true."),
+    additional_directories: z.array(z.string().min(1)).max(20).optional(),
+    parent_task_id: z.string().min(1).max(120).optional(),
+    parent_session_id: z.string().min(1).max(200).optional(),
+    task_id: TASK_ID_SCHEMA
+  };
+
+  reg(
+    mcp,
+    "agent_capabilities",
+    {
+      title: "Agent runner capabilities",
+      description: "List available delegated model-agent runners and supported execution features.",
+      inputSchema: {}
+    },
+    async () => jsonResult(getAgentRunnerRegistry().capabilities())
+  );
+
+  reg(
+    mcp,
+    "agent_spawn",
+    {
+      title: "Spawn delegated coding agent",
+      description: "Start one delegated model-agent coding job. Codex is the default runner. Returns immediately with a managed job id.",
+      inputSchema: commonTaskShape
+    },
+    async (input) => {
+      const prepared = await prepareAgentTaskInput(input);
+      const job = getAgentRunnerRegistry().spawn(prepared);
+      return jsonResult({
+        runner: prepared.runner || "codex",
+        job,
+        scope: prepared.scope,
+        result_digest: buildResultDigest({
+          ok: true,
+          taskId: prepared.scope.task_id,
+          changedFiles: prepared.files || [],
+          summary: `Started delegated agent job ${job.id}.`
+        })
+      });
+    }
+  );
+
+  reg(
+    mcp,
+    "agent_spawn_parallel",
+    {
+      title: "Spawn parallel delegated coding agents",
+      description: "Start up to 8 independent model-agent jobs concurrently. Delegates default to danger-full-access with network enabled and isolated worktrees; only shared parallel writes require disjoint declared scopes.",
+      inputSchema: {
+        runner: z.string().optional(),
+        cwd: z.string().optional(),
+        context: z.string().max(80_000).optional(),
+        model: z.string().optional(),
+        provider: z.string().min(1).max(64).optional(),
+        provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
+        reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+        sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+        isolation: z.enum(["shared", "worktree"]).optional(),
+        inherit_dirty: z.boolean().optional(),
+        network_access: z.boolean().optional(),
+        additional_directories: z.array(z.string().min(1)).max(20).optional(),
+        allow_overlap: z.boolean().optional(),
+        task_id: TASK_ID_SCHEMA,
+        tasks: z.array(z.object({
+          task: z.string().min(1),
+          name: z.string().min(1).max(120).optional(),
+          cwd: z.string().optional(),
+          files: z.array(z.string().min(1)).max(200).optional(),
+          context: z.string().max(80_000).optional(),
+          model: z.string().optional(),
+          provider: z.string().min(1).max(64).optional(),
+          provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
+          reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+          sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+          isolation: z.enum(["shared", "worktree"]).optional(),
+          inherit_dirty: z.boolean().optional(),
+          network_access: z.boolean().optional(),
+          additional_directories: z.array(z.string().min(1)).max(20).optional()
+        })).min(1).max(MAX_PARALLEL_TASKS)
+      }
+    },
+    async (input) => {
+      const workdir = resolvePath(input.cwd || ".");
+      const common = { ...input, cwd: workdir };
+      delete common.tasks;
+      delete common.task_id;
+      const preparedTasks = [];
+      const allFiles = [];
+      for (const task of input.tasks) {
+        const taskCwd = resolveAgentPath(workdir, task.cwd || ".");
+        const files = resolveAgentPaths(taskCwd, task.files || []);
+        preparedTasks.push({ ...task, cwd: taskCwd, files });
+        allFiles.push(...files);
+      }
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, allFiles);
+      const batch = getAgentRunnerRegistry().spawnParallel({ ...common, tasks: preparedTasks, allow_overlap: input.allow_overlap });
+      return jsonResult({ runner: input.runner || "codex", ...batch, scope });
+    }
+  );
+
+  reg(
+    mcp,
+    "agent_list",
+    {
+      title: "List delegated agent jobs",
+      description: "List managed delegated model-agent jobs without returning full job output.",
+      inputSchema: { runner: z.string().optional() }
+    },
+    async (input) => jsonResult(getAgentRunnerRegistry().list(input))
+  );
+
+  reg(
+    mcp,
+    "agent_collect",
+    {
+      title: "Collect delegated agent results",
+      description: "Collect full results for a delegated agent batch or explicit job ids.",
+      inputSchema: {
+        runner: z.string().optional(),
+        batch_id: z.string().optional(),
+        job_ids: z.array(z.string().min(1)).max(MAX_PARALLEL_TASKS).optional()
+      }
+    },
+    async (input) => jsonResult(getAgentRunnerRegistry().collect(input))
+  );
+
+  reg(
+    mcp,
+    "agent_stop",
+    {
+      title: "Stop delegated agent",
+      description: "Cancel one managed delegated model-agent job.",
+      inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
+    },
+    async (input) => jsonResult(getAgentRunnerRegistry().stop(input))
+  );
+
+  reg(
+    mcp,
+    "agent_merge",
+    {
+      title: "Merge isolated agent result",
+      description: "Apply a completed isolated agent patch only after scope validation and git apply --check. Conflicts leave the source tree unchanged.",
+      inputSchema: {
+        runner: z.string().optional(),
+        job_id: z.string().min(1),
+        target_cwd: z.string().optional(),
+        cleanup: z.boolean().optional(),
+        task_id: TASK_ID_SCHEMA
+      }
+    },
+    async (input) => {
+      const registry = getAgentRunnerRegistry();
+      const collected = registry.collect({ runner: input.runner, job_ids: [input.job_id] });
+      const job = collected.jobs?.[0];
+      if (!job) throw new Error(`No delegated agent job ${input.job_id}.`);
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, job.changed_files || []);
+      const result = await registry.merge({
+        ...input,
+        target_cwd: input.target_cwd ? resolvePath(input.target_cwd) : undefined
+      });
+      return jsonResult({ ...result, scope });
+    }
+  );
+
+  reg(
+    mcp,
+    "agent_cleanup",
+    {
+      title: "Cleanup isolated agent worktree",
+      description: "Remove a delegated agent worktree and temporary patch after review, merge, or abandonment.",
+      inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
+    },
+    async (input) => jsonResult(await getAgentRunnerRegistry().cleanup(input))
+  );
+
+  reg(mcp, "agent_recover", {
+    title: "Recover delegated agent descriptor",
+    description: "Read the durable descriptor reconstructed after LCA restart, including recoverable worktree and patch metadata.",
+    inputSchema: { job_id: z.string().min(1) }
+  }, async (input) => jsonResult(getAgentRunnerRegistry().recover(input)));
+
+  reg(mcp, "agent_resume", {
+    title: "Resume delegated agent",
+    description: "Resume a provider-backed delegated agent when the selected runner advertises resume support; otherwise returns supported=false.",
+    inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
+  }, async (input) => jsonResult(await getAgentRunnerRegistry().resume(input)));
+
+  reg(mcp, "agent_followup", {
+    title: "Follow up delegated agent",
+    description: "Send a follow-up to a continuable delegated agent when supported by its runner.",
+    inputSchema: { runner: z.string().optional(), job_id: z.string().min(1), content: z.string().min(1).max(80_000) }
+  }, async (input) => jsonResult(await getAgentRunnerRegistry().followup(input)));
+
+  reg(mcp, "agent_interrupt", {
+    title: "Interrupt delegated agent",
+    description: "Interrupt the current delegated turn when supported by its runner without deleting durable state.",
+    inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
+  }, async (input) => jsonResult(await getAgentRunnerRegistry().interrupt(input)));
+
+  reg(
+    mcp,
+    "agent_dag",
+    {
+      title: "Start agent task DAG",
+      description: "Start a dependency-aware DAG of delegated coding agents. Independent ready nodes run concurrently; failed required dependencies block downstream nodes.",
+      inputSchema: {
+        runner: z.string().optional(),
+        cwd: z.string().optional(),
+        context: z.string().max(80_000).optional(),
+        model: z.string().optional(),
+        provider: z.string().min(1).max(64).optional(),
+        provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
+        reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+        sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+        isolation: z.enum(["shared", "worktree"]).optional(),
+        inherit_dirty: z.boolean().optional(),
+        network_access: z.boolean().optional(),
+        additional_directories: z.array(z.string().min(1)).max(20).optional(),
+        max_concurrency: z.number().int().min(1).max(MAX_PARALLEL_TASKS).optional(),
+        allow_overlap: z.boolean().optional(),
+        task_id: TASK_ID_SCHEMA,
+        tasks: z.array(z.object({
+          id: z.string().min(1).max(80),
+          task: z.string().min(1),
+          name: z.string().min(1).max(120).optional(),
+          depends_on: z.array(z.string().min(1).max(80)).max(32).optional(),
+          allow_failure: z.boolean().optional(),
+          cwd: z.string().optional(),
+          files: z.array(z.string().min(1)).max(200).optional(),
+          context: z.string().max(80_000).optional(),
+          model: z.string().optional(),
+          provider: z.string().min(1).max(64).optional(),
+          provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
+          reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+          sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
+          isolation: z.enum(["shared", "worktree"]).optional(),
+          inherit_dirty: z.boolean().optional(),
+          network_access: z.boolean().optional(),
+          additional_directories: z.array(z.string().min(1)).max(20).optional()
+        })).min(1).max(MAX_PARALLEL_STEPS)
+      }
+    },
+    async (input) => {
+      const workdir = resolvePath(input.cwd || ".");
+      const allFiles = [];
+      const tasks = input.tasks.map((task) => {
+        const taskCwd = resolveAgentPath(workdir, task.cwd || ".");
+        const files = resolveAgentPaths(taskCwd, task.files || []);
+        const additionalDirectories = resolveAgentPaths(taskCwd, task.additional_directories || []);
+        allFiles.push(...files);
+        return { ...task, cwd: taskCwd, files, additional_directories: additionalDirectories };
+      });
+      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, allFiles);
+      const dag = getAgentRunnerRegistry().spawnDag({
+        ...input,
+        cwd: workdir,
+        additional_directories: resolveAgentPaths(workdir, input.additional_directories || []),
+        tasks
+      });
+      return jsonResult({ ...dag, scope });
+    }
+  );
+
+  reg(
+    mcp,
+    "agent_dag_collect",
+    {
+      title: "Collect agent DAG",
+      description: "Inspect DAG node states and optionally include delegated job results.",
+      inputSchema: { dag_id: z.string().min(1), include_results: z.boolean().optional() }
+    },
+    async (input) => jsonResult(getAgentRunnerRegistry().collectDag(input))
+  );
+
+  reg(
+    mcp,
+    "agent_dag_stop",
+    {
+      title: "Stop agent DAG",
+      description: "Cancel active jobs and pending nodes in one delegated agent DAG.",
+      inputSchema: { dag_id: z.string().min(1) }
+    },
+    async (input) => jsonResult(getAgentRunnerRegistry().stopDag(input))
+  );
+}
+
+async function prepareAgentTaskInput(input) {
+  const cwd = resolvePath(input.cwd || ".");
+  const files = resolveAgentPaths(cwd, input.files || []);
+  const additionalDirectories = resolveAgentPaths(cwd, input.additional_directories || []);
+  const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, files);
+  return {
+    ...input,
+    cwd,
+    files,
+    additional_directories: additionalDirectories,
+    scope
+  };
+}
+
+function resolveAgentPaths(cwd, values) {
+  return [...new Set((values || []).map((value) => resolveAgentPath(cwd, value)))];
+}
+
+function resolveAgentPath(cwd, value) {
+  return path.isAbsolute(value) ? path.resolve(value) : path.resolve(cwd, value);
+}
+
+function registerUiTools(mcp) {
+  reg(
+    mcp,
+    "ui_status",
+    {
+      title: "UI automation status",
+      description: "Check Local Browser Agent connectivity plus ADB availability and attached Android devices.",
+      inputSchema: {}
+    },
+    async () => {
+      const [browser, android] = await Promise.all([
+        browserAgentStatus().catch((error) => ({ ok: false, error: error?.message || String(error) })),
+        androidDevices().catch((error) => ({ ok: false, error: error?.message || String(error), devices: [] }))
+      ]);
+      return jsonResult({ browser, android });
+    }
+  );
+
+  reg(
+    mcp,
+    "ui_browser_actions",
+    {
+      title: "List browser automation actions",
+      description: "List the browser_* tools exposed by Local Browser Agent, including their live input schemas.",
+      inputSchema: { refresh: z.boolean().optional() }
+    },
+    async ({ refresh = false }) => jsonResult({ tools: await listBrowserAgentTools({ refresh }) })
+  );
+
+  reg(
+    mcp,
+    "ui_browser_call",
+    {
+      title: "Call browser automation action",
+      description: "Call one browser_* Local Browser Agent action. Trusted-local browser builds auto-authorize ordinary HTTP/HTTPS tabs without an LCA approval round-trip.",
+      inputSchema: {
+        tool: z.string().regex(/^browser_[a-z0-9_]+$/i),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: args = {} }) => await callBrowserAgentTool(tool, args)
+  );
+
+  reg(
+    mcp,
+    "ui_android_devices",
+    {
+      title: "List Android devices",
+      description: "List ADB devices/emulators and their connection state.",
+      inputSchema: {}
+    },
+    async () => jsonResult(await androidDevices())
+  );
+
+  reg(
+    mcp,
+    "ui_android_adb",
+    {
+      title: "Run unrestricted ADB action",
+      description: "Run arbitrary ADB arguments against an online Android device/emulator in trusted-local mode. Covers shell, install/uninstall, push/pull, package/activity/service control, forwarding, bugreport, and other ADB capabilities without an LCA approval layer.",
+      inputSchema: {
+        serial: z.string().optional(),
+        args: z.array(z.string()).min(1).max(200),
+        timeout_ms: z.number().int().min(1000).max(600_000).optional()
+      }
+    },
+    async ({ serial, args, timeout_ms = 120_000 }) => {
+      const selected = await selectAndroidSerial(serial);
+      const result = await runAdb(selected, args, timeout_ms);
+      return jsonResult({ ok: result.exit_code === 0, serial: selected, args, ...result });
+    }
+  );
+
+  reg(
+    mcp,
+    "ui_android_screenshot",
+    {
+      title: "Capture Android screenshot",
+      description: "Capture the current Android screen through ADB, persist the PNG under .agent/artifacts/android, and return it as image content for visual inspection.",
+      inputSchema: { serial: z.string().optional() }
+    },
+    async ({ serial }) => {
+      const selected = await selectAndroidSerial(serial);
+      const png = await captureAndroidScreenshot(selected);
+      const dir = await androidArtifactDir();
+      const file = path.join(dir, `screen-${Date.now()}.png`);
+      await writeFile(file, png);
+      const metadata = { ok: true, serial: selected, path: file, bytes: png.length, mime_type: "image/png" };
+      return {
+        structuredContent: metadata,
+        content: [
+          { type: "text", text: JSON.stringify(metadata) },
+          { type: "image", data: png.toString("base64"), mimeType: "image/png" }
+        ]
+      };
+    }
+  );
+
+  reg(
+    mcp,
+    "ui_android_hierarchy",
+    {
+      title: "Read Android UI hierarchy",
+      description: "Dump the current Android UIAutomator XML hierarchy for semantic element inspection.",
+      inputSchema: { serial: z.string().optional(), max_chars: z.number().int().min(1000).max(1_000_000).optional() }
+    },
+    async ({ serial, max_chars = 250_000 }) => {
+      const selected = await selectAndroidSerial(serial);
+      const remote = `/sdcard/lca-window-${process.pid}.xml`;
+      const dump = await runAdb(selected, ["shell", "uiautomator", "dump", remote], 20_000);
+      if (dump.exit_code !== 0) throw new Error(dump.stderr || dump.stdout || "uiautomator dump failed");
+      const xml = await runAdb(selected, ["exec-out", "cat", remote], 20_000);
+      void runAdb(selected, ["shell", "rm", "-f", remote], 10_000);
+      const text = String(xml.stdout || "");
+      return jsonResult({
+        ok: xml.exit_code === 0,
+        serial: selected,
+        truncated: text.length > max_chars,
+        xml: text.slice(0, max_chars)
+      });
+    }
+  );
+
+  reg(
+    mcp,
+    "ui_android_input",
+    {
+      title: "Control Android device",
+      description: "Send a bounded ADB input or app-control action: tap, swipe, text, keyevent, launch, or force_stop.",
+      inputSchema: {
+        serial: z.string().optional(),
+        kind: z.enum(["tap", "swipe", "text", "keyevent", "launch", "force_stop"]),
+        x: z.number().int().optional(),
+        y: z.number().int().optional(),
+        x2: z.number().int().optional(),
+        y2: z.number().int().optional(),
+        duration_ms: z.number().int().min(0).max(10_000).optional(),
+        text: z.string().max(10_000).optional(),
+        keycode: z.union([z.string(), z.number().int()]).optional(),
+        package: z.string().max(300).optional()
+      }
+    },
+    async (input) => {
+      const selected = await selectAndroidSerial(input.serial);
+      const args = androidInputArgs(input);
+      const result = await runAdb(selected, args, 30_000);
+      return jsonResult({ ok: result.exit_code === 0, serial: selected, kind: input.kind, ...result });
+    }
+  );
+
+  reg(
+    mcp,
+    "ui_android_logcat",
+    {
+      title: "Read Android logcat",
+      description: "Read a bounded tail of Android logcat for crash/debug diagnosis.",
+      inputSchema: {
+        serial: z.string().optional(),
+        lines: z.number().int().min(10).max(5000).optional(),
+        filter: z.string().max(200).optional()
+      }
+    },
+    async ({ serial, lines = 500, filter }) => {
+      const selected = await selectAndroidSerial(serial);
+      const result = await runAdb(selected, ["logcat", "-d", "-t", String(lines)], 30_000);
+      let output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+      if (filter) {
+        const needle = filter.toLowerCase();
+        output = output.split(/\r?\n/).filter((line) => line.toLowerCase().includes(needle)).join("\n");
+      }
+      return jsonResult({ ok: result.exit_code === 0, serial: selected, filter: filter || null, logcat: output.slice(-MAX_COMMAND_OUTPUT) });
+    }
+  );
+
+  reg(
+    mcp,
+    "ui_android_record",
+    {
+      title: "Record Android screen",
+      description: "Record a short Android screen video through ADB and pull the MP4 into .agent/artifacts/android.",
+      inputSchema: {
+        serial: z.string().optional(),
+        duration_seconds: z.number().int().min(1).max(30).optional(),
+        bit_rate: z.number().int().min(100_000).max(50_000_000).optional()
+      }
+    },
+    async ({ serial, duration_seconds = 10, bit_rate = 8_000_000 }) => {
+      const selected = await selectAndroidSerial(serial);
+      const remote = `/sdcard/lca-record-${process.pid}-${Date.now()}.mp4`;
+      const record = await runAdb(selected, [
+        "shell", "screenrecord", "--time-limit", String(duration_seconds), "--bit-rate", String(bit_rate), remote
+      ], (duration_seconds + 10) * 1000);
+      if (record.exit_code !== 0) throw new Error(record.stderr || record.stdout || "screenrecord failed");
+      const dir = await androidArtifactDir();
+      const file = path.join(dir, `record-${Date.now()}.mp4`);
+      const pull = await runAdb(selected, ["pull", remote, file], 60_000);
+      void runAdb(selected, ["shell", "rm", "-f", remote], 10_000);
+      if (pull.exit_code !== 0) throw new Error(pull.stderr || pull.stdout || "adb pull failed");
+      const info = await stat(file);
+      return jsonResult({ ok: true, serial: selected, path: file, bytes: info.size, duration_seconds });
+    }
+  );
+}
+
+async function androidDevices() {
+  if (!ADB_BIN) return { ok: false, adb: false, devices: [], error: "adb unavailable" };
+  const result = await spawnCapture(ADB_BIN, ["devices", "-l"], activePrimaryRoot(), 10_000);
+  if (result.exit_code !== 0) return { ok: false, adb: false, devices: [], error: result.stderr || result.stdout || "adb unavailable" };
+  const devices = String(result.stdout || "")
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [serial, state, ...details] = line.split(/\s+/);
+      return { serial, state, details: details.join(" ") };
+    });
+  return { ok: true, adb: true, adb_path: ADB_BIN, devices };
+}
+
+async function selectAndroidSerial(requested) {
+  const status = await androidDevices();
+  if (!status.ok) throw new Error(status.error || "ADB is unavailable.");
+  const online = status.devices.filter((device) => device.state === "device");
+  if (requested) {
+    if (!online.some((device) => device.serial === requested)) throw new Error(`Android device ${requested} is not online.`);
+    return requested;
+  }
+  if (online.length === 1) return online[0].serial;
+  if (online.length === 0) throw new Error("No online Android device/emulator found.");
+  throw new Error(`Multiple Android devices are online (${online.map((device) => device.serial).join(", ")}); pass serial explicitly.`);
+}
+
+async function runAdb(serial, args, timeoutMs) {
+  return spawnCapture(ADB_BIN || "adb", ["-s", serial, ...args], activePrimaryRoot(), timeoutMs);
+}
+
+function androidInputArgs(input) {
+  if (input.kind === "tap") {
+    if (!Number.isInteger(input.x) || !Number.isInteger(input.y)) throw new Error("tap requires integer x and y.");
+    return ["shell", "input", "tap", String(input.x), String(input.y)];
+  }
+  if (input.kind === "swipe") {
+    for (const key of ["x", "y", "x2", "y2"]) if (!Number.isInteger(input[key])) throw new Error(`swipe requires integer ${key}.`);
+    return ["shell", "input", "swipe", String(input.x), String(input.y), String(input.x2), String(input.y2), String(input.duration_ms ?? 300)];
+  }
+  if (input.kind === "text") {
+    if (typeof input.text !== "string") throw new Error("text action requires text.");
+    return ["shell", "input", "text", input.text.replaceAll(" ", "%s")];
+  }
+  if (input.kind === "keyevent") {
+    if (input.keycode === undefined) throw new Error("keyevent requires keycode.");
+    return ["shell", "input", "keyevent", String(input.keycode)];
+  }
+  if (!input.package) throw new Error(`${input.kind} requires package.`);
+  if (input.kind === "launch") return ["shell", "monkey", "-p", input.package, "-c", "android.intent.category.LAUNCHER", "1"];
+  return ["shell", "am", "force-stop", input.package];
+}
+
+async function captureAndroidScreenshot(serial) {
+  return await new Promise((resolve, reject) => {
+    const child = spawn(ADB_BIN || "adb", ["-s", serial, "exec-out", "screencap", "-p"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const chunks = [];
+    let size = 0;
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error("Android screenshot timed out after 20 seconds."));
+    }, 20_000);
+    timer.unref?.();
+    child.stdout.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= 20 * 1024 * 1024) chunks.push(Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk) => { stderr = appendLimited(stderr, chunk.toString(), 8_000); });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderr || `adb screencap exited with code ${code}`));
+      if (size > 20 * 1024 * 1024) return reject(new Error("Android screenshot exceeded the 20 MiB capture limit."));
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
+async function androidArtifactDir() {
+  const dir = path.join(activePrimaryRoot(), ".agent", "artifacts", "android");
+  await mkdir(dir, { recursive: true });
+  return dir;
 }
 
 function registerGitTool(mcp) {
@@ -4727,6 +5801,134 @@ function startBackground(command, cwd, shell, name) {
   });
   processes.set(proc.id, proc);
   return proc;
+}
+
+async function waitForProcessCondition(proc, input) {
+  const startedMs = performance.now();
+  const timeoutMs = input.timeout_ms ?? 60_000;
+  const pollMs = input.poll_ms ?? 100;
+  const tailChars = input.tail_chars ?? 20_000;
+  const deadline = Date.now() + timeoutMs;
+  const filePath = input.path ? resolvePath(input.path) : null;
+  let baselineFile = null;
+  if (input.condition === "file_changed") baselineFile = await stat(filePath).catch(() => null);
+  const regex = ["stdout_regex", "stderr_regex", "output_regex"].includes(input.condition)
+    ? compileWaitRegex(input.pattern)
+    : null;
+
+  while (true) {
+    const check = await evaluateProcessWait(proc, input, { regex, filePath, baselineFile });
+    if (check.matched) {
+      return processWaitResult(proc, input.condition, check, startedMs, tailChars, false);
+    }
+    if (Date.now() >= deadline) {
+      return processWaitResult(proc, input.condition, check, startedMs, tailChars, true);
+    }
+    await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  }
+}
+
+async function evaluateProcessWait(proc, input, state) {
+  if (input.condition === "exit") {
+    return { matched: proc.status !== "running", detail: { status: proc.status, exit_code: proc.exitCode } };
+  }
+  if (input.condition === "stdout_regex") {
+    return { matched: state.regex.test(proc.stdout), detail: { pattern: state.regex.source } };
+  }
+  if (input.condition === "stderr_regex") {
+    return { matched: state.regex.test(proc.stderr), detail: { pattern: state.regex.source } };
+  }
+  if (input.condition === "output_regex") {
+    return { matched: state.regex.test(`${proc.stdout}\n${proc.stderr}`), detail: { pattern: state.regex.source } };
+  }
+  if (input.condition === "port_open") {
+    if (!input.port) throw new Error("port_open requires port.");
+    const host = input.host || "127.0.0.1";
+    return { matched: await tcpPortOpen(host, input.port, 750), detail: { host, port: input.port } };
+  }
+  if (input.condition === "http_healthy") {
+    if (!input.url) throw new Error("http_healthy requires url.");
+    const expected = input.status_codes?.length ? new Set(input.status_codes) : null;
+    try {
+      const response = await fetch(input.url, { signal: AbortSignal.timeout(1500) });
+      return {
+        matched: expected ? expected.has(response.status) : response.ok,
+        detail: { url: input.url, status: response.status }
+      };
+    } catch (error) {
+      return { matched: false, detail: { url: input.url, error: String(error?.message || error).slice(0, 300) } };
+    }
+  }
+  if (input.condition === "file_exists") {
+    if (!state.filePath) throw new Error("file_exists requires path.");
+    const info = await stat(state.filePath).catch(() => null);
+    return { matched: Boolean(info), detail: { path: state.filePath, exists: Boolean(info) } };
+  }
+  if (input.condition === "file_changed") {
+    if (!state.filePath) throw new Error("file_changed requires path.");
+    const current = await stat(state.filePath).catch(() => null);
+    const changed = fileStatChanged(state.baselineFile, current);
+    return {
+      matched: changed,
+      detail: {
+        path: state.filePath,
+        baseline_mtime_ms: state.baselineFile?.mtimeMs ?? null,
+        current_mtime_ms: current?.mtimeMs ?? null,
+        exists: Boolean(current)
+      }
+    };
+  }
+  return { matched: false, detail: {} };
+}
+
+function processWaitResult(proc, condition, check, startedMs, tailChars, timedOut) {
+  const tail = (value) => value.length > tailChars ? value.slice(-tailChars) : value;
+  return {
+    ok: !timedOut && check.matched,
+    matched: check.matched,
+    timed_out: timedOut,
+    condition,
+    id: proc.id,
+    status: proc.status,
+    exit_code: proc.exitCode,
+    duration_ms: Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10),
+    detail: check.detail,
+    stdout: tail(proc.stdout),
+    stderr: tail(proc.stderr)
+  };
+}
+
+function compileWaitRegex(pattern) {
+  if (!pattern) throw new Error("Regex wait conditions require pattern.");
+  try { return new RegExp(pattern, "m"); }
+  catch (error) { throw new Error(`Invalid wait regex: ${error?.message || error}`); }
+}
+
+function fileStatChanged(before, after) {
+  if (!before && after) return true;
+  if (before && !after) return true;
+  if (!before && !after) return false;
+  return before.mtimeMs !== after.mtimeMs || before.size !== after.size;
+}
+
+function tcpPortOpen(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function killProcessTree(proc) {
@@ -5680,6 +6882,142 @@ function analyzeDiff(diff) {
   return { summary, findings };
 }
 
+function registerCodeIntelligenceTools(mcp) {
+  const positionShape = {
+    file: z.string().min(1).max(4000),
+    symbol: z.string().min(1).max(500).optional(),
+    line: z.number().int().min(1).optional(),
+    column: z.number().int().min(1).optional(),
+    timeout_ms: z.number().int().min(1000).max(120_000).optional()
+  };
+
+  reg(mcp, "code_definition", {
+    title: "Find code definition",
+    description: "Find a symbol definition with native TypeScript LSP for TS/JS. Other languages use a bounded declaration-ranked text fallback.",
+    inputSchema: positionShape
+  }, async (input) => {
+    const root = activePrimaryRoot();
+    const file = resolvePath(input.file);
+    if (isTypeScriptFamilyFile(file)) return jsonResult(await tsDefinition({ root, ...input, file, timeoutMs: input.timeout_ms }));
+    if (!input.symbol) throw new Error("Non-TypeScript definition fallback requires symbol.");
+    return jsonResult(await fallbackCodeSymbolSearch(root, input.symbol, "definition"));
+  });
+
+  reg(mcp, "code_references", {
+    title: "Find code references",
+    description: "Find symbol references with native TypeScript LSP for TS/JS. Other languages use a bounded exact-symbol text fallback.",
+    inputSchema: { ...positionShape, include_declaration: z.boolean().optional(), limit: z.number().int().min(1).max(2000).optional() }
+  }, async (input) => {
+    const root = activePrimaryRoot();
+    const file = resolvePath(input.file);
+    if (isTypeScriptFamilyFile(file)) {
+      const result = await tsReferences({ root, ...input, file, includeDeclaration: input.include_declaration, timeoutMs: input.timeout_ms });
+      if (input.limit && result.references.length > input.limit) {
+        return jsonResult({ ...result, count: result.references.length, references: result.references.slice(0, input.limit), truncated: true });
+      }
+      return jsonResult(result);
+    }
+    if (!input.symbol) throw new Error("Non-TypeScript reference fallback requires symbol.");
+    return jsonResult(await fallbackCodeSymbolSearch(root, input.symbol, "references", input.limit ?? 500));
+  });
+
+  reg(mcp, "code_diagnostics", {
+    title: "Read compiler diagnostics",
+    description: "Return structured native TypeScript compiler diagnostics for one TS/JS file or the active TypeScript project.",
+    inputSchema: { file: z.string().max(4000).optional(), limit: z.number().int().min(1).max(2000).optional() }
+  }, async ({ file, limit }) => {
+    const root = activePrimaryRoot();
+    const resolved = file ? resolvePath(file) : null;
+    if (resolved && !isTypeScriptFamilyFile(resolved)) {
+      return jsonResult({ supported: false, engine: "quality-gate-fallback", file: resolved, recommendation: "Use workspace_verify lint/tests/build for this language." });
+    }
+    return jsonResult(await tsDiagnostics({ root, ...(resolved ? { file: resolved } : {}), limit }));
+  });
+
+  reg(mcp, "code_rename_symbol", {
+    title: "Rename code symbol",
+    description: "Preview or apply a TypeScript/JavaScript LSP symbol rename. Preview is the default; apply=true enforces the active task scope guard before writing.",
+    inputSchema: { ...positionShape, new_name: z.string().min(1).max(500), apply: z.boolean().optional(), task_id: TASK_ID_SCHEMA }
+  }, async (input) => {
+    const root = activePrimaryRoot();
+    const file = resolvePath(input.file);
+    if (!isTypeScriptFamilyFile(file)) throw new Error("Safe semantic rename is currently available for TypeScript/JavaScript through TypeScript LSP.");
+    const base = { root, file, symbol: input.symbol, line: input.line, column: input.column, newName: input.new_name, timeoutMs: input.timeout_ms };
+    const preview = await tsRenameSymbol({ ...base, apply: false });
+    const changedFiles = preview.changes.map((change) => change.file);
+    const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, changedFiles);
+    const result = input.apply === true ? await tsRenameSymbol({ ...base, apply: true }) : preview;
+    return jsonResult({
+      ...result,
+      scope,
+      result_digest: buildResultDigest({
+        ok: true,
+        taskId: scope.task_id,
+        changedFiles,
+        summary: `${input.apply === true ? "Applied" : "Previewed"} semantic rename across ${changedFiles.length} file(s).`
+      })
+    });
+  });
+
+  reg(mcp, "code_organize_imports", {
+    title: "Organize imports",
+    description: "Preview or apply TypeScript LSP source.organizeImports edits. Preview is the default and writes require the active task scope guard.",
+    inputSchema: { file: z.string().min(1).max(4000), apply: z.boolean().optional(), timeout_ms: z.number().int().min(1000).max(120_000).optional(), task_id: TASK_ID_SCHEMA }
+  }, async (input) => {
+    const root = activePrimaryRoot();
+    const file = resolvePath(input.file);
+    if (!isTypeScriptFamilyFile(file)) throw new Error("Native organize-imports is currently available for TypeScript/JavaScript through TypeScript LSP.");
+    const base = { root, file, timeoutMs: input.timeout_ms };
+    const preview = await tsOrganizeImports({ ...base, apply: false });
+    const changedFiles = preview.changes.map((change) => change.file);
+    const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, changedFiles);
+    const result = input.apply === true && preview.supported !== false ? await tsOrganizeImports({ ...base, apply: true }) : preview;
+    return jsonResult({
+      ...result,
+      scope,
+      result_digest: buildResultDigest({
+        ok: true,
+        taskId: scope.task_id,
+        changedFiles,
+        summary: `${input.apply === true ? "Applied" : "Previewed"} organize-imports for ${path.basename(file)}.`
+      })
+    });
+  });
+}
+
+async function fallbackCodeSymbolSearch(root, symbol, mode, limit = 500) {
+  const pattern = `\\b${escapeRegexLiteral(symbol)}\\b`;
+  let matches = null;
+  let engine = "scan";
+  if (RG_BIN) {
+    matches = await ripgrepGrep(root, pattern, { regex: true, limit, glob: null });
+    if (matches) engine = "ripgrep";
+  }
+  if (!matches) matches = await searchTree(root, pattern, { regex: true, limit, glob: null });
+  if (mode === "definition") matches = [...matches].sort((left, right) => definitionCandidateScore(right.text, symbol) - definitionCandidateScore(left.text, symbol));
+  return {
+    engine: `${engine}-symbol-fallback`,
+    semantic: false,
+    symbol,
+    mode,
+    count: matches.length,
+    matches,
+    warning: "Fallback is text-based; use a language-specific LSP for semantic accuracy."
+  };
+}
+
+function definitionCandidateScore(text, symbol) {
+  const value = String(text || "");
+  let score = 0;
+  if (new RegExp(`\\b(class|interface|struct|enum|trait|type|def|fn|fun|function|const|let|var)\\s+${escapeRegexLiteral(symbol)}\\b`, "i").test(value)) score += 100;
+  if (new RegExp(`\\b${escapeRegexLiteral(symbol)}\\s*[:=(]`, "i").test(value)) score += 30;
+  return score;
+}
+
+function escapeRegexLiteral(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\function registerRepoIntelTools(mcp) {");
+}
+
 function registerRepoIntelTools(mcp) {
   reg(
     mcp,
@@ -6337,16 +7675,155 @@ function parseTestFailures(output) {
   return failures;
 }
 
+function parseStructuredDiagnostics(output) {
+  const diagnostics = [];
+  const lines = String(output || "").split(/\r?\n/);
+  let pendingRust = null;
+  const push = (item) => {
+    const key = `${item.file || ""}:${item.line || ""}:${item.column || ""}:${item.code || ""}:${item.message}`;
+    if (diagnostics.some((existing) => existing._key === key)) return;
+    diagnostics.push({ ...item, _key: key });
+  };
+
+  for (let index = 0; index < lines.length && diagnostics.length < 100; index += 1) {
+    const line = lines[index];
+    let match;
+    if ((match = line.match(/^(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.+)$/i))) {
+      push({ file: match[1], line: Number(match[2]), column: Number(match[3]), severity: match[4].toLowerCase(), code: match[5], message: match[6].trim(), source: "typescript" });
+      continue;
+    }
+    if ((match = line.match(/^(.+?):(\d+):(\d+):\s*(error|warning|info)\b[:\s-]*(.*?)(?:\s+([A-Za-z][\w/-]+))?$/i))) {
+      push({ file: match[1], line: Number(match[2]), column: Number(match[3]), severity: match[4].toLowerCase(), code: match[6] || null, message: (match[5] || line).trim(), source: "generic" });
+      continue;
+    }
+    if ((match = line.match(/^e:\s+file:\/\/(.+?):(\d+):(\d+)\s+(.+)$/i))) {
+      push({ file: `/${match[1].replace(/^\/+/, "")}`, line: Number(match[2]), column: Number(match[3]), severity: "error", code: null, message: match[4].trim(), source: "kotlin" });
+      continue;
+    }
+    if ((match = line.match(/^(error|warning)(?:\[([^\]]+)\])?:\s*(.+)$/i))) {
+      pendingRust = { severity: match[1].toLowerCase(), code: match[2] || null, message: match[3].trim(), source: "rust" };
+      continue;
+    }
+    if (pendingRust && (match = line.match(/^\s*-->\s+(.+?):(\d+):(\d+)/))) {
+      push({ ...pendingRust, file: match[1], line: Number(match[2]), column: Number(match[3]) });
+      pendingRust = null;
+      continue;
+    }
+    if ((match = line.match(/^(error|warning|info)\s+[•-]\s+(.+?)\s+[•-]\s+(.+?):(\d+):(\d+)\s+[•-]\s+([\w.:-]+)$/i))) {
+      push({ file: match[3], line: Number(match[4]), column: Number(match[5]), severity: match[1].toLowerCase(), code: match[6], message: match[2].trim(), source: "dart" });
+    }
+  }
+  return diagnostics.map(({ _key, ...diagnostic }) => diagnostic);
+}
+
 async function runGatedCommand(command, cwd, timeoutMs = 120_000) {
   const result = await runShellCommand(command, cwd, undefined, timeoutMs);
   const output = (result.stdout + "\n" + result.stderr).trim();
   const ok = result.exit_code === 0;
   const failures = ok ? [] : parseTestFailures(output);
+  const diagnostics = parseStructuredDiagnostics(output);
   const summary = output.slice(0, 3000);
-  return { ok, command, exit_code: result.exit_code, timed_out: result.timed_out, summary, failures };
+  return {
+    ok,
+    command,
+    exit_code: result.exit_code,
+    timed_out: result.timed_out,
+    duration_ms: result.duration_ms ?? null,
+    summary,
+    failures,
+    diagnostics,
+    diagnostic_count: diagnostics.length
+  };
+}
+
+async function getChangedFilesForVerification(rootDir) {
+  const diffRes = await spawnCapture("git", ["diff", "HEAD", "--name-only"], rootDir, DEFAULT_CMD_TIMEOUT);
+  const untrackedRes = await spawnCapture("git", ["ls-files", "--others", "--exclude-standard"], rootDir, DEFAULT_CMD_TIMEOUT);
+  return [...new Set([
+    ...(diffRes.stdout || "").split(/\r?\n/).filter(Boolean),
+    ...(untrackedRes.stdout || "").split(/\r?\n/).filter(Boolean)
+  ])];
+}
+
+async function affectedTestsForChanges(rootDir, changedFiles, limit = 300) {
+  const direct = new Set();
+  for (const file of changedFiles) {
+    const ext = path.extname(file);
+    const base = path.basename(file, ext);
+    const dir = path.dirname(file);
+    for (const candidate of [
+      path.join(dir, `${base}.test${ext}`), path.join(dir, `${base}.spec${ext}`),
+      path.join(dir, "__tests__", `${base}.test${ext}`), path.join(dir, "__tests__", `${base}.spec${ext}`),
+      path.join("test", `${base}.test${ext}`), path.join("tests", `test_${base}.py`), path.join("tests", `${base}_test.py`)
+    ]) {
+      if (existsSync(path.join(rootDir, candidate))) direct.add(candidate);
+    }
+  }
+
+  const foundTests = await findFiles(rootDir, "*test*", Math.max(limit * 4, 500));
+  const candidates = foundTests.files
+    .map((file) => path.isAbsolute(file) ? path.resolve(file) : resolvePath(file))
+    .filter((file) => {
+      const relative = path.relative(rootDir, file);
+      return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+    })
+    .map((file) => path.relative(rootDir, file).split(path.sep).join("/"))
+    .filter((file) => /(?:^|\/)(?:__tests__|tests?|spec)(?:\/|$)|\.(?:test|spec)\.[^/]+$/i.test(file));
+  const related = new Set(direct);
+  const needles = changedFiles
+    .filter((file) => !/(?:^|\/)(?:tests?|__tests__)(?:\/|$)|\.(?:test|spec)\./i.test(file))
+    .flatMap((file) => {
+      const normalized = file.replaceAll("\\", "/").replace(/\.[^.\/]+$/, "");
+      return [path.basename(normalized), normalized.replace(/^src\//, ""), normalized];
+    })
+    .filter((value) => value.length >= 3);
+
+  for (const candidate of candidates.slice(0, 1200)) {
+    if (related.size >= limit || !needles.length) break;
+    let text;
+    try { text = await readFile(path.join(rootDir, candidate), "utf8"); } catch { continue; }
+    if (needles.some((needle) => text.includes(needle))) related.add(candidate);
+  }
+  return { direct: [...direct], affected: [...related], scanned_tests: Math.min(candidates.length, 1200) };
+}
+
+async function buildVerificationPlan(rootDir) {
+  const changedFiles = await getChangedFilesForVerification(rootDir);
+  const commands = await getTestCommandsMerged(rootDir);
+  const tests = await affectedTestsForChanges(rootDir, changedFiles);
+  const riskSignals = [];
+  if (changedFiles.some((file) => /(^|\/)(migrations?|schema|database)(\/|$)|\.sql$/i.test(file))) riskSignals.push("database_or_schema_change");
+  if (changedFiles.some((file) => /(^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|pubspec\.lock|go\.sum)$/i.test(file))) riskSignals.push("dependency_lock_change");
+  if (changedFiles.some((file) => /(^|\/)(Dockerfile|docker-compose|compose\.|\.github\/workflows|infra|deploy)/i.test(file))) riskSignals.push("deployment_or_ci_change");
+  if (changedFiles.some((file) => /auth|security|permission|token|crypto/i.test(file))) riskSignals.push("security_sensitive_change");
+  const gates = ["lint", "typecheck", "test", "build"]
+    .filter((gate) => commands[gate])
+    .map((gate) => ({ gate, command: commands[gate], recommended: gate !== "build" || riskSignals.length > 0 }));
+  return {
+    root: rootDir,
+    changed_files: changedFiles,
+    affected_tests: tests,
+    risk_signals: riskSignals,
+    gates,
+    strategy: tests.affected.length ? "dependency_aware_targeted" : "full_suite_fallback"
+  };
 }
 
 function registerTestRunnerTools(mcp) {
+  reg(
+    mcp,
+    "verification_plan",
+    {
+      title: "Build verification plan",
+      description: "Inspect changed files, affected tests, risk signals, and detected gates without executing them.",
+      inputSchema: { cwd: z.string().optional() }
+    },
+    async ({ cwd = "." }) => {
+      const rootDir = resolvePath(cwd);
+      return jsonResult(await buildVerificationPlan(rootDir));
+    }
+  );
+
   reg(
     mcp,
     "quality_gate",
@@ -6467,46 +7944,20 @@ function registerTestRunnerTools(mcp) {
     },
     async ({ cwd = ".", timeout_ms = 120_000 }) => {
       const rootDir = resolvePath(cwd);
-      // Get changed files
-      const diffRes = await spawnCapture("git", ["diff", "--name-only"], rootDir, DEFAULT_CMD_TIMEOUT);
-      const untrackedRes = await spawnCapture("git", ["ls-files", "--others", "--exclude-standard"], rootDir, DEFAULT_CMD_TIMEOUT);
-      const changedFiles = [
-        ...(diffRes.stdout || "").split(/\r?\n/).filter(Boolean),
-        ...(untrackedRes.stdout || "").split(/\r?\n/).filter(Boolean)
-      ];
-
-      // Map to test files
-      const testFiles = new Set();
-      for (const f of changedFiles) {
-        const base = path.basename(f, path.extname(f));
-        const dir = path.dirname(f);
-        // Direct test file check
-        for (const pattern of [
-          path.join(dir, `${base}.test${path.extname(f)}`),
-          path.join(dir, `${base}.spec${path.extname(f)}`),
-          path.join(dir, "__tests__", `${base}.test${path.extname(f)}`),
-          path.join(dir, "__tests__", `${base}.spec${path.extname(f)}`),
-          path.join("test", `${base}.test${path.extname(f)}`),
-          path.join("tests", `test_${base}.py`),
-          path.join("tests", `${base}_test.py`)
-        ]) {
-          if (existsSync(path.join(rootDir, pattern))) testFiles.add(pattern);
-        }
-      }
+      const changedFiles = await getChangedFilesForVerification(rootDir);
+      const affected = await affectedTestsForChanges(rootDir, changedFiles);
+      const testFiles = new Set(affected.affected);
 
       const cmds = await getTestCommandsMerged(rootDir);
       if (testFiles.size === 0) {
-        // Fall back to full test run
         if (!cmds.test) throw new Error("No changed test files found and no test command detected.");
         const res = await runGatedCommand(cmds.test, rootDir, timeout_ms);
-        return jsonResult({ ...res, strategy: "full_fallback", changed_files: changedFiles.length });
+        return jsonResult({ ...res, strategy: "full_fallback", changed_files: changedFiles, affected_tests: affected });
       }
 
-      // Build targeted test command
-      const fileList = [...testFiles].join(" ");
+      const fileList = [...testFiles].map(shellQuoteForCommand).join(" ");
       let cmd;
       if (cmds.test && cmds.test.startsWith("npm")) {
-        // Jest / Vitest — pass file list
         cmd = `${cmds.test} -- ${fileList}`;
       } else if (cmds.test && cmds.test.includes("pytest")) {
         cmd = `python -m pytest ${fileList}`;
@@ -6514,9 +7965,15 @@ function registerTestRunnerTools(mcp) {
         cmd = cmds.test || `echo "No test command"`;
       }
       const res = await runGatedCommand(cmd, rootDir, timeout_ms);
-      return jsonResult({ ...res, strategy: "targeted", test_files: [...testFiles], changed_files: changedFiles });
+      return jsonResult({ ...res, strategy: "dependency_aware_targeted", test_files: [...testFiles], changed_files: changedFiles, affected_tests: affected });
     }
   );
+}
+
+function shellQuoteForCommand(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(text)) return text;
+  return `'${text.replaceAll("'", `'"'"'`)}'`;
 }
 
 // ============================================================================

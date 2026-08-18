@@ -28,9 +28,10 @@ const FACADE_NAMES = [
   "dbeaver",
   "bruno",
   "penpot",
-  "coolify"
+  "coolify",
+  "notion"
 ];
-const DIRECT_NAMES = new Set(["workspace_context", "lca_input"]);
+const DIRECT_NAMES = new Set(["workspace_context", "lca_input", "notion_page"]);
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -114,10 +115,10 @@ try {
   const targetNames = TARGET_TOOL_CATALOG.map((tool) => tool.name);
 
   assert.deepEqual(compactNames, targetNames, "active compact surface must match the target catalog exactly");
-  assert.ok(compactTools.length <= 16, `expected at most 16 tools, received ${compactTools.length}`);
+  assert.ok(compactTools.length <= 20, `expected at most 20 tools, received ${compactTools.length}`);
 
   const schemaBytes = Buffer.byteLength(JSON.stringify(compactTools), "utf8");
-  assert.ok(schemaBytes <= 20_000, `compact tool schema is too large: ${schemaBytes} bytes`);
+  assert.ok(schemaBytes <= 24_000, `compact tool schema is too large: ${schemaBytes} bytes`);
 
   const assigned = new Map();
   for (const facade of FACADE_NAMES) {
@@ -132,7 +133,7 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 167, `expected complete internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 185, `expected complete internal backend coverage, received ${assigned.size} actions`);
   for (const directName of DIRECT_NAMES) assert.ok(compactNames.includes(directName), `${directName} must remain direct`);
 
   const writeResult = await client.callTool({
@@ -165,6 +166,30 @@ try {
 
   const lcaInput = compactTools.find((tool) => tool.name === "lca_input");
   assert.match(lcaInput?._meta?.["openai/outputTemplate"] || "", /^ui:\/\/widget\/lca-compact-input-v2-[a-f0-9]{12}\.html$/);
+  const notionPage = compactTools.find((tool) => tool.name === "notion_page");
+  assert.equal(notionPage?.annotations?.readOnlyHint, true, "notion_page proposal staging must remain read-only");
+  assert.ok(notionPage?.inputSchema?.properties?.proposal_scope, "notion_page must expose staged proposal scope");
+  assert.ok(notionPage?.inputSchema?.properties?.proposal_replacement, "notion_page must accept selected-content proposal replacements");
+  assert.ok(notionPage?.inputSchema?.properties?.proposal_markdown, "notion_page must accept whole-page proposal markdown");
+  const notionTemplateUri = notionPage?._meta?.["openai/outputTemplate"] || "";
+  assert.match(notionTemplateUri, /^ui:\/\/widget\/lca-notion-page-[a-f0-9]{12}-mcp-app-v1\.html$/);
+  const notionResource = await client.readResource({ uri: notionTemplateUri });
+  assert.equal(notionResource.contents?.[0]?.mimeType, "text/html;profile=mcp-app", "Notion widget must use the MCP Apps HTML MIME type");
+  assert.deepEqual(
+    notionResource.contents?.[0]?._meta?.["openai/widgetCSP"]?.redirect_domains,
+    ["https://app.notion.com"],
+    "Notion widget must allow its external Notion page origin"
+  );
+  assert.deepEqual(
+    notionResource.contents?.[0]?._meta?.ui?.csp?.resourceDomains,
+    [
+      "https://s3-us-west-2.amazonaws.com",
+      "https://prod-files-secure.s3.us-west-2.amazonaws.com",
+      "https://file.notion.so",
+      "https://www.notion.so"
+    ],
+    "Notion widget must allow only its known media/static origins"
+  );
 
   process.stdout.write(`${JSON.stringify({
     ok: true,

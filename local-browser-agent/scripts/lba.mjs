@@ -87,7 +87,7 @@ function parseArgs(argv) {
 }
 
 function options(flags = {}) {
-  const port = String(flags.port || process.env.LBA_PORT || "8790");
+  const port = String(flags.port || process.env.LBA_PORT || "8791");
   if (!/^\d+$/.test(port) || Number(port) < 1024 || Number(port) > 65535) throw new Error(`Invalid port: ${port}`);
   return {
     port,

@@ -36,6 +36,8 @@ jobs:
           node --check test-agent-runner.mjs
           node --check tui.mjs
           node --check tui/app.mjs
+          node --check tui/clipboard.mjs
+          node --check tui/terminal-paste.mjs
           node --check tui/client.mjs
           node --check tui/model.mjs
           node --check tui/launcher-bridge.mjs
@@ -45,6 +47,10 @@ jobs:
           node --check test-pro.mjs
           node --check persistent-http-mcp-client.mjs
           node --check test-persistent-http-mcp-client.mjs
+          node --check notion-api.mjs
+          node --check notion-tools.mjs
+          node --check test-notion-api.mjs
+          node --check test-notion-widget.mjs
           node --check figma-desktop.mjs
           node --check dbeaver-desktop.mjs
           node --check bruno-desktop.mjs
@@ -74,12 +80,17 @@ jobs:
           node ../scripts/local-coding-agent.mjs skills validate
           npm run typecheck
           npm run test:unit
+          npm run test:runtime
           npm run test:integration:context
           npm run test:persistent-http
           npm run test:tui
           npm run test:figma
           npm run test:dbeaver
           npm run test:bruno
+          npm run test:penpot
+          npm run test:coolify
+          npm run test:notion
+          npm run test:notion:widget
           npm run test:compact
       - name: Parse Bash launcher
         if: runner.os != 'Windows'
@@ -142,6 +153,21 @@ jobs:
         run: |
           npm run test:trusted-runtime
           npm run test:tui:pty
+
+  architecture-contracts:
+    name: Architecture contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+        working-directory: server
+      - run: npm run docs:check
+        working-directory: server
 
   eval:
     name: Eval suite

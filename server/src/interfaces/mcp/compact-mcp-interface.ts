@@ -9,7 +9,7 @@ export const COMPACT_SERVER_INSTRUCTIONS = [
   "Use the compact facade tools. Each facade accepts a short action alias or an exact hidden backend tool name plus an arguments object. Call action=discover only when you need facade action discovery.",
   "Actions execute directly in the trusted local runtime without policy or approval round-trips. Project roots are discovery defaults, not authorization boundaries.",
   "Batch work, keep outputs bounded, and avoid repeating reads or commands. Use workspace_verify before declaring code changes complete.",
-  "Use figma, dbeaver, bruno, and penpot for desktop/design integrations, and coolify for the pinned local Coolify MCP stdio bridge. Penpot and Coolify destructive actions require the destructive alias and explicit confirmation. Use lca_input for the ChatGPT companion UI."
+  "Use figma, dbeaver, bruno, penpot, coolify, and notion for integrations. DBeaver, Bruno, and Notion keep their integration-specific protection semantics; other integrations execute directly in the trusted-local runtime. Use lca_input for the ChatGPT companion UI and notion_page for the interactive Notion page app."
 ].join("\n");
 
 export interface BackendToolDefinition {
@@ -30,7 +30,7 @@ interface CompactGroupDefinition {
 
 export type CompactFacadeName = Exclude<
   (typeof TARGET_TOOL_CATALOG)[number]["name"],
-  "workspace_context" | "lca_input"
+  "workspace_context" | "lca_input" | "notion_page"
 >;
 
 export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, CompactGroupDefinition>> = Object.freeze({
@@ -45,9 +45,17 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       overview: "repo_overview",
       important: "important_files",
       index: "index_status",
-      todos: "todo_scan"
+      todos: "todo_scan",
+      definition: "code_definition",
+      references: "code_references",
+      diagnostics: "code_diagnostics",
+      rename: "code_rename_symbol",
+      organize_imports: "code_organize_imports"
     },
-    exact: new Set(["workspace_search", "search_text", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan"])
+    exact: new Set([
+      "workspace_search", "search_text", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan",
+      "code_definition", "code_references", "code_diagnostics", "code_rename_symbol", "code_organize_imports"
+    ])
   },
   workspace_read: {
     defaultAction: "read_many",
@@ -101,12 +109,12 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   },
   workspace_exec: {
     defaultAction: "run_commands",
-    aliases: { one: "run_command", many: "run_commands", parallel: "parallel_tasks" },
-    exact: new Set(["run_command", "run_commands", "parallel_tasks"])
+    aliases: { one: "run_command", many: "run_commands", parallel: "parallel_tasks", code: "run_code" },
+    exact: new Set(["run_command", "run_commands", "parallel_tasks", "run_code"])
   },
   workspace_process: {
     defaultAction: "proc_list",
-    aliases: { start: "proc_start", list: "proc_list", output: "proc_output", stop: "proc_stop" },
+    aliases: { start: "proc_start", list: "proc_list", output: "proc_output", wait: "proc_wait", stop: "proc_stop" },
     prefix: "proc_"
   },
   workspace_git: {
@@ -117,6 +125,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   workspace_verify: {
     defaultAction: "quality_gate",
     aliases: {
+      plan: "verification_plan",
       detect: "detect_test_commands",
       gate: "quality_gate",
       tests: "run_tests",
@@ -128,7 +137,44 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       summary: "change_summary",
       session: "session_report"
     },
-    exact: new Set(["detect_test_commands", "quality_gate", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
+    exact: new Set(["verification_plan", "detect_test_commands", "quality_gate", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
+  },
+  workspace_agent: {
+    defaultAction: "agent_list",
+    aliases: {
+      capabilities: "agent_capabilities",
+      spawn: "agent_spawn",
+      parallel: "agent_spawn_parallel",
+      list: "agent_list",
+      collect: "agent_collect",
+      stop: "agent_stop",
+      merge: "agent_merge",
+      cleanup: "agent_cleanup",
+      recover: "agent_recover",
+      resume: "agent_resume",
+      followup: "agent_followup",
+      interrupt: "agent_interrupt",
+      dag: "agent_dag",
+      dag_collect: "agent_dag_collect",
+      dag_stop: "agent_dag_stop"
+    },
+    prefix: "agent_"
+  },
+  workspace_ui: {
+    defaultAction: "ui_status",
+    aliases: {
+      status: "ui_status",
+      browser_actions: "ui_browser_actions",
+      browser_call: "ui_browser_call",
+      devices: "ui_android_devices",
+      adb: "ui_android_adb",
+      screenshot: "ui_android_screenshot",
+      hierarchy: "ui_android_hierarchy",
+      input: "ui_android_input",
+      logcat: "ui_android_logcat",
+      record: "ui_android_record"
+    },
+    prefix: "ui_"
   },
   workspace_status: {
     defaultAction: "workspace_info",
@@ -139,9 +185,11 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       profile: "project_profile",
       loaded_profile: "profile_status",
       reload_profile: "reload_profile",
-      ping: "ping"
+      ping: "ping",
+      performance: "performance_profile",
+      trace: "tool_trace"
     },
-    exact: new Set(["ping", "workspace_info", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
+    exact: new Set(["ping", "workspace_info", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile", "performance_profile", "tool_trace"])
   },
   workspace_skill: {
     defaultAction: "list_skills",
@@ -189,6 +237,20 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       destructive: "coolify_destructive_tool"
     },
     prefix: "coolify_"
+  },
+  notion: {
+    defaultAction: "notion_status",
+    aliases: {
+      status: "notion_status",
+      actions: "notion_capabilities",
+      search: "notion_search",
+      fetch: "notion_fetch_page",
+      create: "notion_create_page",
+      update: "notion_update_markdown",
+      replace: "notion_replace_markdown",
+      call: "notion_call"
+    },
+    prefix: "notion_"
   }
 });
 
@@ -200,13 +262,16 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   workspace_process: "Start, list, inspect output from, and stop managed background processes.",
   workspace_git: "Run Git commands and return compact status or diffs.",
   workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, and session-report gates.",
+  workspace_agent: "Spawn, inspect, collect, and stop delegated model-agent coding jobs. Codex is the default runner.",
+  workspace_ui: "Inspect and control Chromium tabs through Local Browser Agent and connected Android devices through ADB without an LCA approval round-trip.",
   workspace_status: "Inspect workspace, trusted runtime, project profile, dependency health, and readiness state.",
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
   figma: "Use the persistent Figma Desktop integration. Common actions: status, actions, call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",
   bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action.",
   penpot: "Use the local Penpot MCP integration. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.",
-  coolify: "Use the pinned local Coolify MCP stdio integration. Common actions: status, actions, read, mutate, destructive, call, or an exact coolify_* backend action."
+  coolify: "Use the pinned local Coolify MCP stdio integration. Common actions: status, actions, read, mutate, destructive, call, or an exact coolify_* backend action.",
+  notion: "Use the Notion REST API integration. Common actions: status, actions, search, fetch, create, update, replace, call, or an exact notion_* backend action. AI-generated edits must be staged through notion_page for preview and explicit Apply approval before update/replace is used."
 });
 
 export interface CompactMcpInterfaceDependencies {
@@ -337,7 +402,7 @@ export function compactDefinitionContains(definition: CompactGroupDefinition, to
 export function facadeNames(): readonly CompactFacadeName[] {
   return TARGET_TOOL_CATALOG
     .map((tool) => tool.name)
-    .filter((name): name is CompactFacadeName => name !== "workspace_context" && name !== "lca_input");
+    .filter((name): name is CompactFacadeName => name !== "workspace_context" && name !== "lca_input" && name !== "notion_page");
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

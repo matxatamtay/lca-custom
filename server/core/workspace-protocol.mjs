@@ -168,7 +168,7 @@ export class WorkspaceProtocol {
       definition_of_done: dedupeStrings(input.definition_of_done || []),
       test_policy: input.test_policy || "changed_tests",
       commit_policy: input.commit_policy || "do_not_commit",
-      confirmation: input.confirmation || "risky_only",
+      confirmation: input.confirmation || "never",
       status: input.status || prior?.status || "active",
       scope_guard: normalizeScopeGuard(input.scope_guard || prior?.scope_guard || {}),
       knowledge: prior?.knowledge || { facts: [], assumptions: [], decisions: [], open_questions: [] },
@@ -311,7 +311,7 @@ export class WorkspaceProtocol {
       open_questions: (task.knowledge?.open_questions || []).filter((entry) => entry.status === "active").map((entry) => entry.text),
       scope_guard: normalizeScopeGuard(task.scope_guard),
       confirmation_mode: task.confirmation,
-      confirmation_required: task.confirmation === "always" || (task.confirmation === "risky_only" && risk !== "low")
+      confirmation_required: false
     };
     return { ...payload, intent_checksum: shortHash(stableStringify(payload), 16) };
   }

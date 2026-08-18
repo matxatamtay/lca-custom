@@ -54,3 +54,52 @@ test("returns no evidence when the task has no searchable terms", async () => {
   assert.deepEqual(await adapter.search({ task: "a b", root: "/repo" }), []);
   assert.equal(called, false);
 });
+
+test("filters generated and license noise unless licensing is the task", async () => {
+  const seen: string[][] = [];
+  const adapter = new RipgrepFilesystemContextAdapter({
+    runner: {
+      async run(_command, args) {
+        seen.push([...args]);
+        return { stdout: "" };
+      }
+    }
+  });
+
+  await adapter.search({ task: "Implement context reranking", root: "/repo" });
+  await adapter.search({ task: "Review AGPL license", root: "/repo" });
+
+  assert.ok(seen[0]?.includes("!dist/**"));
+  assert.ok(seen[0]?.includes("!LICENSE"));
+  assert.equal(seen[1]?.includes("!LICENSE"), false);
+});
+
+test("ranks changed source matches ahead of documentation matches", async () => {
+  const adapter = new RipgrepFilesystemContextAdapter({
+    runner: {
+      async run() {
+        return {
+          stdout: [
+            JSON.stringify({
+              type: "match",
+              data: { path: { text: "docs/context.md" }, lines: { text: "context reranking\n" }, line_number: 1 }
+            }),
+            JSON.stringify({
+              type: "match",
+              data: { path: { text: "src/context.ts" }, lines: { text: "export function reranking() {}\n" }, line_number: 10 }
+            })
+          ].join("\n")
+        };
+      }
+    }
+  });
+
+  const result = await adapter.search({
+    task: "context reranking",
+    root: "/repo",
+    changedFiles: ["src/context.ts"],
+    budget: { maxItems: 2 }
+  });
+
+  assert.equal(result[0]?.path, "/repo/src/context.ts");
+});

@@ -11,7 +11,7 @@
     "url": "https://github.com/luongduy2798/local-coding-agent.git"
   },
   "scripts": {
-    "start": "npm run build:next && node server.mjs",
+    "start": "npm run build:next && npm run build:notion-widget && node server.mjs",
     "tui": "node tui.mjs",
     "test:agent": "node test-agent.mjs",
     "test:security": "npm run test:trusted-runtime",
@@ -24,29 +24,44 @@
     "test:bruno": "node test-bruno-desktop.mjs",
     "test:penpot": "node --test test-penpot-desktop.mjs",
     "test:coolify": "node --test test-coolify-mcp.mjs",
+    "test:notion": "node --test test-notion-api.mjs test-notion-enhanced-markdown.mjs test-notion-edit-proposal.mjs",
+    "test:notion:widget": "npm run build:notion-widget && node --test test-notion-widget.mjs",
     "test:persistent-http": "node --test test-persistent-http-mcp-client.mjs",
     "test:tui": "node --test test-tui.mjs",
     "test:tui:pty": "npm run build:next && python3 test-tui-pty.py",
     "benchmark:compact": "node ../evals/compact.mjs",
+    "benchmark:code-mode": "node benchmarks/code-mode-benchmark.mjs",
+    "benchmark:runtime": "npm run build:next && node benchmarks/runtime-next-benchmark.mjs",
     "build:next": "tsc -p tsconfig.build.json",
+    "docs:generate": "npm run build:next && node scripts/generate-architecture-catalogs.mjs",
+    "docs:check": "npm run build:next && node scripts/generate-architecture-catalogs.mjs --check",
     "typecheck": "tsc --noEmit",
-    "test:unit": "tsx --test src/application/context/build-task-context.test.ts src/infrastructure/mcp/persistent-mcp-tool-client.test.ts src/adapters/codegraph/codegraph-adapter.test.ts src/adapters/agentmemory/agentmemory-http-adapter.test.ts src/adapters/filesystem/ripgrep-filesystem-context-adapter.test.ts src/orchestration/agentmemory-supervisor.test.ts src/orchestration/agentmemory-session-manager.test.ts src/orchestration/conversation-project-scope.test.ts src/interfaces/mcp/tool-catalog.test.ts src/interfaces/mcp/compact-mcp-interface.test.ts",
+    "test:unit": "tsx --test src/application/context/build-task-context.test.ts src/infrastructure/mcp/persistent-mcp-tool-client.test.ts src/adapters/codegraph/codegraph-adapter.test.ts src/adapters/agentmemory/agentmemory-http-adapter.test.ts src/adapters/filesystem/ripgrep-filesystem-context-adapter.test.ts src/orchestration/agentmemory-supervisor.test.ts src/orchestration/agentmemory-session-manager.test.ts src/orchestration/conversation-project-scope.test.ts src/orchestration/conversation-runtime-context.test.ts src/runtime/runtime-event-store.test.ts src/runtime/action-execution-pipeline.test.ts src/runtime/runtime-plugin.test.ts src/runtime/runtime-otel-exporter.test.ts src/interfaces/mcp/tool-catalog.test.ts src/interfaces/mcp/compact-mcp-interface.test.ts",
+    "test:runtime": "npm run build:next && node --test agent-runner.test.mjs agent-runner-durability.test.mjs codex-delegation.test.mjs code-mode-runtime.test.mjs",
     "test:integration:context": "tsx --test src/integration/task-context.integration.test.ts",
     "test:compact": "npm run build:next && node test-compact-surface.mjs",
     "test:next": "npm run typecheck && npm run test:unit",
     "test:trusted-runtime": "node test-security-runner.mjs",
-    "test:all": "npm run typecheck && npm run test:unit && npm run test:integration:context && npm run test:persistent-http && npm run test:tui && npm run test:figma && npm run test:dbeaver && npm run test:bruno && npm run test:penpot && npm run test:coolify && npm run test:compact && npm run test:agent:isolated && npm run test:pro && npm run test:trusted-runtime && npm run test:hardening && npm run eval",
-    "test:agent:isolated": "node test-agent-runner.mjs"
+    "test:all": "npm run typecheck && npm run test:unit && npm run test:runtime && npm run test:integration:context && npm run test:persistent-http && npm run test:tui && npm run test:figma && npm run test:dbeaver && npm run test:bruno && npm run test:penpot && npm run test:coolify && npm run test:notion && npm run test:notion:widget && npm run test:compact && npm run test:agent:isolated && npm run test:pro && npm run test:trusted-runtime && npm run test:hardening && npm run docs:check && npm run eval",
+    "test:agent:isolated": "node test-agent-runner.mjs",
+    "build:notion-widget": "node build-notion-widget.mjs"
   },
   "dependencies": {
     "@colbymchenry/codegraph": "1.5.0",
     "@masonator/coolify-mcp": "2.16.0",
     "@modelcontextprotocol/sdk": "^1.20.0",
+    "@notionhq/client": "^2.3.0",
+    "@openai/codex-sdk": "0.147.0",
     "neo-blessed": "0.2.0",
+    "notion-compat": "^7.10.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-notion-x": "^7.10.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "20.19.43",
+    "esbuild": "^0.28.1",
     "tsx": "4.23.1",
     "typescript": "7.0.2"
   }

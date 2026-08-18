@@ -54,10 +54,11 @@ test("parallel conversations keep independent primary folders", async () => {
   assert.equal(scope.primaryRoot(), primary);
 });
 
-test("conversation selection cannot silently introduce an unregistered root", () => {
+test("conversation selection may use an absolute folder outside discovery roots", () => {
   const scope = createScope();
-  assert.throws(
-    () => scope.run("/tmp/not-configured", () => undefined),
-    /inside a configured project root/
-  );
+  const external = path.resolve("/tmp/not-configured");
+  scope.run(external, () => {
+    assert.equal(scope.primaryRoot(), external);
+    assert.deepEqual(scope.discoveryRoots(), [external]);
+  });
 });

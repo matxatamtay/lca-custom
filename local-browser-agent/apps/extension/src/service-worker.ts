@@ -4,7 +4,7 @@ import { interactBrowser, navigateBrowser } from "./browser-actions.js";
 import { allowActiveTab, listAllowedTabs, revokeTab } from "./tab-consent.js";
 import "./devtools-registry.js";
 
-const BRIDGE_URL = "ws://127.0.0.1:8790/bridge";
+const BRIDGE_URL = "ws://127.0.0.1:8791/bridge";
 const TOKEN_KEY = "lba.bridgeToken";
 const VERSION = chrome.runtime.getManifest().version;
 

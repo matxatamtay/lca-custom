@@ -35,13 +35,12 @@ export class RipgrepFilesystemContextAdapter implements FilesystemContextPort {
 
     const root = path.resolve(request.root);
     const maxItems = Math.max(1, Math.min(100, request.budget?.maxItems ?? 20));
+    const maxCandidates = Math.max(maxItems, Math.min(500, maxItems * 8));
     const args = [
       "--json",
       "--ignore-case",
       "--hidden",
-      "--glob", "!.git/**",
-      "--glob", "!.codegraph/**",
-      "--glob", "!node_modules/**",
+      ...defaultIgnoreGlobs(request.task).flatMap((glob) => ["--glob", glob]),
       ...terms.flatMap((term) => ["-e", term]),
       "."
     ];
@@ -50,7 +49,9 @@ export class RipgrepFilesystemContextAdapter implements FilesystemContextPort {
       ? Math.max(300, Math.floor(request.budget.maxChars / maxItems))
       : 4_000;
 
-    return parseRipgrepJson(stdout, root, maxItems, maxCharsPerItem);
+    return [...parseRipgrepJson(stdout, root, maxCandidates, maxCharsPerItem, terms, request.changedFiles)]
+      .sort(compareFilesystemEvidence)
+      .slice(0, maxItems);
   }
 }
 
@@ -75,10 +76,13 @@ class ExecFileSearchCommandRunner implements SearchCommandRunner {
 function parseRipgrepJson(
   stdout: string,
   root: string,
-  maxItems: number,
-  maxCharsPerItem: number
+  maxCandidates: number,
+  maxCharsPerItem: number,
+  terms: readonly string[],
+  changedFiles: readonly string[] | undefined
 ): readonly ContextEvidence[] {
   const evidence: ContextEvidence[] = [];
+  const changed = new Set((changedFiles ?? []).map((value) => normalizePathForMatch(path.resolve(root, value))));
   for (const line of stdout.split("\n")) {
     if (!line.trim()) continue;
     let event: unknown;
@@ -94,6 +98,8 @@ function parseRipgrepJson(
     const lineText = textValue(asRecord(data.lines))?.trimEnd() ?? "";
     const lineNumber = typeof data.line_number === "number" ? data.line_number : undefined;
     if (!relativePath || !lineText) continue;
+    const absolutePath = path.resolve(root, relativePath);
+    const score = filesystemEvidenceScore(relativePath, lineText, terms, changed.has(normalizePathForMatch(absolutePath)));
 
     evidence.push({
       id: `filesystem-${relativePath}:${lineNumber ?? 0}`,
@@ -101,16 +107,79 @@ function parseRipgrepJson(
       kind: "text",
       title: `${relativePath}${lineNumber ? `:${lineNumber}` : ""}`,
       content: lineText.slice(0, maxCharsPerItem),
-      path: path.resolve(root, relativePath),
-      score: 100,
+      path: absolutePath,
+      score,
       metadata: {
         line: lineNumber ?? null,
-        engine: "ripgrep"
+        engine: "ripgrep",
+        relevance_score: score
       }
     });
-    if (evidence.length >= maxItems) break;
+    if (evidence.length >= maxCandidates) break;
   }
   return evidence;
+}
+
+function defaultIgnoreGlobs(task: string): readonly string[] {
+  const globs = [
+    "!.git/**",
+    "!.codegraph/**",
+    "!node_modules/**",
+    "!dist/**",
+    "!build/**",
+    "!coverage/**",
+    "!.next/**",
+    "!.turbo/**",
+    "!target/**",
+    "!vendor/**",
+    "!**/*.min.js",
+    "!**/*.min.css"
+  ];
+  if (!/\b(license|licensing|copyright|gpl|agpl|mit|apache|copyleft)\b/i.test(task)) {
+    globs.push("!LICENSE", "!LICENSE.*", "!COPYING", "!COPYING.*");
+  }
+  return globs;
+}
+
+function filesystemEvidenceScore(
+  relativePath: string,
+  lineText: string,
+  terms: readonly string[],
+  changed: boolean
+): number {
+  const normalizedPath = relativePath.toLowerCase();
+  const normalizedLine = lineText.toLowerCase();
+  let score = 100;
+  let matchedTerms = 0;
+  for (const term of terms) {
+    const normalized = term.toLowerCase();
+    if (normalizedLine.includes(normalized)) {
+      score += 18;
+      matchedTerms += 1;
+    }
+    if (normalizedPath.includes(normalized)) score += 24;
+  }
+  score += Math.min(36, matchedTerms * 6);
+  if (changed) score += 45;
+  if (isLikelySourcePath(normalizedPath)) score += 12;
+  if (/\/(test|tests|__tests__)\/|\.(test|spec)\.[^.]+$/i.test(normalizedPath)) score += 8;
+  if (/\/(docs?|examples?|fixtures?)\//i.test(`/${normalizedPath}`)) score -= 8;
+  if (/\.(md|txt|lock)$/i.test(normalizedPath)) score -= 12;
+  return score;
+}
+
+function compareFilesystemEvidence(left: ContextEvidence, right: ContextEvidence): number {
+  const score = (right.score ?? 0) - (left.score ?? 0);
+  if (score !== 0) return score;
+  return left.id.localeCompare(right.id);
+}
+
+function isLikelySourcePath(value: string): boolean {
+  return /\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|kts|dart|swift|cs|cpp|cc|c|h|hpp|rb|php|vue|svelte)$/i.test(value);
+}
+
+function normalizePathForMatch(value: string): string {
+  return path.normalize(value).replaceAll("\\", "/").toLowerCase();
 }
 
 function extractSearchTerms(task: string): readonly string[] {

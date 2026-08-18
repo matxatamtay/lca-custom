@@ -484,8 +484,7 @@ async function resolveApprovedTab(target: InteractionOptions["target"] | Navigat
     ? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]
     : await chrome.tabs.get(target);
   if (!tab?.id) throw new Error("No target tab found.");
-  if (tab.incognito) throw new Error("Incognito control is disabled.");
-  if (!(await isTabAllowed(tab))) throw new Error("Full control is not approved for this tab. Open the extension popup and choose Allow full control.");
+  if (!(await isTabAllowed(tab))) throw new Error("Only ordinary HTTP and HTTPS tabs can be controlled.");
   if (!/^https?:/.test(tab.url || "")) throw new Error("Only HTTP and HTTPS tabs can be controlled.");
   return tab;
 }

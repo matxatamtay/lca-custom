@@ -1,6 +1,6 @@
 # Local Coding Agent MCP server
 
-Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees sixteen compact tools while an internal in-memory backend retains the richer implementation details.
+Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees twenty compact tools while an internal in-memory backend retains the richer implementation details.
 
 ## Public MCP tools
 
@@ -13,6 +13,8 @@ workspace_exec
 workspace_process
 workspace_git
 workspace_verify
+workspace_agent
+workspace_ui
 workspace_status
 workspace_skill
 figma
@@ -20,7 +22,9 @@ dbeaver
 bruno
 penpot
 coolify
+notion
 lca_input
+notion_page
 ```
 
 Use `workspace_context` first for coding tasks. It always fans out to current filesystem search, CodeGraph, and AgentMemory and returns per-provider coverage. Use `action=discover` on a facade only when its exact backend actions are needed.
@@ -36,7 +40,7 @@ Actions execute directly without mode, policy, or approval turns. Project roots 
 lca-custom tui
 ```
 
-The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public sixteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
+The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public twenty-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
 
 ## Run
 
@@ -69,7 +73,13 @@ Neither dependency is exposed as a separate ChatGPT tool surface. The applicatio
 
 ## MCP integrations
 
-Figma, DBeaver, Bruno, and Penpot use persistent local MCP clients. Coolify runs the pinned `@masonator/coolify-mcp` package as a persistent local stdio child process. Connections and `tools/list` responses are reused, retryable transport failures reconnect once, and all clients close during graceful server exit. Penpot and Coolify credentials are fingerprinted only for process configuration identity and are never returned in status results. Both integrations separate read, ordinary mutation, and destructive calls; destructive calls require an explicit-confirmation argument.
+Figma, DBeaver, Bruno, and Penpot use persistent MCP clients. Coolify runs the pinned `@masonator/coolify-mcp` package as a persistent local stdio child process. Notion uses the official REST API through `NOTION_API_KEY` and exposes both the compact `notion` facade and the direct `notion_page` Apps SDK widget. Penpot and Coolify execute directly in trusted-local mode; DBeaver, Bruno, and Notion preserve their integration-specific protection semantics. Notion full-page Markdown replacement keeps optimistic conflict detection and child-content deletion disabled unless explicitly requested.
+
+## Runtime trajectory and delegated agents
+
+Every backend action runs through `ActionExecutionPipeline`. The append-only runtime source of truth is `data/workspaces/<id>/runtime/events.jsonl`; ToolMetrics, AgentMemory observations, the `workspace_status action=trace` trajectory, and optional OTLP export are consumers of that event stream. Delegated Codex work defaults to `danger-full-access` with network access enabled inside isolated Git worktrees, while merge remains conflict-checked. Agent/DAG descriptors are persisted so a restart reconstructs completed, recoverable, or orphaned work instead of losing lifecycle state.
+
+`workspace_exec action=code` runs a TypeScript orchestration program in a fresh bounded worker. Its curated LCA bindings re-enter the ordinary hidden backend pipeline, so nested reads, edits, commands, verification, agents, and UI actions keep normal tracing and correctness checks.
 
 ### DBeaver SQL flow
 
@@ -115,4 +125,4 @@ Direct model-style preparation or execution without the widget capability is rej
 npm run test:all
 ```
 
-Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:penpot`, `test:coolify`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
+Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:penpot`, `test:coolify`, `test:notion`, `test:notion:widget`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.

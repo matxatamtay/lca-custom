@@ -189,3 +189,41 @@ test("reserves one result per provider before filling the remaining budget", asy
   assert.ok(result.evidence.some((item) => item.provider === "codegraph"));
   assert.ok(result.evidence.some((item) => item.provider === "agentmemory"));
 });
+
+test("reranks filesystem evidence referenced by CodeGraph ahead of unrelated matches", async () => {
+  const useCase = new BuildTaskContext({
+    filesystem: {
+      async search() {
+        return [
+          { ...evidence("filesystem", "unrelated", "context implementation"), path: "/repo/docs/context.md", score: 100 },
+          { ...evidence("filesystem", "source", "context implementation"), path: "/repo/src/context.ts", score: 100 }
+        ];
+      }
+    },
+    codegraph: {
+      async ensureIndexed() {},
+      async context() {
+        return [{ ...evidence("codegraph", "graph", "BuildTaskContext at src/context.ts:20"), path: "/repo/src/context.ts" }];
+      }
+    },
+    agentmemory: { async recall() { return []; } }
+  });
+
+  const result = await useCase.execute({ task: "context implementation", root: "/repo", budget: { maxItems: 4 } });
+  const filesystem = result.evidence.filter((item) => item.provider === "filesystem");
+  assert.equal(filesystem[0]?.path, "/repo/src/context.ts");
+});
+
+test("enforces the global character budget", async () => {
+  const long = "x".repeat(2_000);
+  const useCase = new BuildTaskContext({
+    filesystem: { async search() { return [evidence("filesystem", "file", long)]; } },
+    codegraph: { async ensureIndexed() {}, async context() { return [evidence("codegraph", "graph", long)]; } },
+    agentmemory: { async recall() { return [evidence("agentmemory", "memory", long)]; } }
+  });
+
+  const result = await useCase.execute({ task: "budget test", root: "/repo", budget: { maxItems: 3, maxChars: 1_200 } });
+  const used = result.evidence.reduce((sum, item) => sum + item.content.length + item.title.length + (item.path?.length ?? 0) + 40, 0);
+  assert.ok(result.evidence.length >= 1);
+  assert.ok(used <= 1_200);
+});

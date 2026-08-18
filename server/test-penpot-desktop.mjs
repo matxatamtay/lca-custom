@@ -41,30 +41,31 @@ function fakeClient() {
 test("Penpot endpoint normalization keeps credentials out of the public endpoint", () => {
   assert.equal(normalizePenpotEndpoint("http://localhost:9001/mcp/stream?userToken=secret"), "http://localhost:9001/mcp/stream");
   assert.throws(() => normalizePenpotEndpoint("ftp://localhost/mcp"), /http or https/);
-  assert.throws(() => normalizePenpotEndpoint("https://penpot.example.com/mcp"), /loopback/);
+  assert.equal(normalizePenpotEndpoint("https://penpot.example.com/mcp"), "https://penpot.example.com/mcp");
   const connection = new URL(penpotConnectionEndpoint("http://127.0.0.1:9001/mcp/stream", "test-token"));
   assert.equal(connection.origin + connection.pathname, "http://127.0.0.1:9001/mcp/stream");
   assert.equal(connection.searchParams.get("userToken"), "test-token");
 });
 
-test("Penpot policy separates reads, mutations, and destructive code", () => {
+test("Penpot classification is metadata and does not block trusted-local execution", () => {
   assert.equal(classifyPenpotTool(tools[0]), "read");
   assert.equal(classifyPenpotTool(tools[1]), "read");
   assert.equal(classifyPenpotTool(tools[2]), "read");
   assert.equal(classifyPenpotTool(tools[3], { code: "return penpot.currentPage" }), "mutation");
   assert.equal(classifyPenpotTool(tools[3], { code: "shape.remove()" }), "destructive");
-  assert.throws(() => assertPenpotPolicy("execute_code", tools[3], { code: "shape.remove()" }, "mutation"), /destructive/);
-  assert.throws(() => assertPenpotPolicy("execute_code", tools[3], { code: "shape.remove()" }, "destructive", false), /confirmed=true/);
+  assert.equal(assertPenpotPolicy("execute_code", tools[3], { code: "shape.remove()" }, "mutation"), "destructive");
+  assert.equal(assertPenpotPolicy("execute_code", tools[3], { code: "shape.remove()" }, "destructive", false), "destructive");
   assert.equal(assertPenpotPolicy("execute_code", tools[3], { code: "shape.remove()" }, "destructive", true), "destructive");
 });
 
-test("Penpot bridge forwards policy-approved tools", async () => {
+test("Penpot bridge forwards all live tools through trusted-local compatibility aliases", async () => {
   const client = fakeClient();
   await callReadOnlyPenpotTool("high_level_overview", {}, { client });
   await callMutatingPenpotTool("execute_code", { code: "return { ok: true }" }, { client });
-  await callDestructivePenpotTool("execute_code", { code: "shape.remove()" }, { client, confirmed: true });
+  await callDestructivePenpotTool("execute_code", { code: "shape.remove()" }, { client });
   assert.deepEqual(client.calls.map((call) => call.name), ["high_level_overview", "execute_code", "execute_code"]);
-  await assert.rejects(() => callMutatingPenpotTool("execute_code", { code: "shape.delete()" }, { client }), /destructive/);
+  await callMutatingPenpotTool("execute_code", { code: "shape.delete()" }, { client });
+  assert.equal(client.calls.length, 4);
 });
 
 test("Penpot inspection helpers execute bounded read templates", async () => {

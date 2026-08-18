@@ -1,6 +1,6 @@
 # Local Coding Agent TUI
 
-`lca-custom tui` opens a full-screen terminal interface backed by the same sixteen compact MCP tools used by ChatGPT. It supports keyboard navigation and terminal mouse events. Closing the TUI leaves the managed LCA server and tunnel running.
+`lca-custom tui` opens a full-screen terminal interface backed by the same twenty compact MCP tools used by ChatGPT. It supports keyboard navigation and terminal mouse events. Closing the TUI leaves the managed LCA server and tunnel running.
 
 ## Start
 
@@ -32,14 +32,14 @@ Requirements:
 | Verify | Detect commands, run focused tests/build/lint, review diffs, security scan, and quality gates |
 | Tasks & Notes | Task plans, step completion, local notes, checkpoints, and patch undo |
 | Skills | List, read, create, and delete reusable LCA skills |
-| Integrations | Live Figma, DBeaver, Bruno, Penpot, and Coolify status plus action discovery |
+| Integrations | Live Figma, DBeaver, Bruno, Penpot, Coolify, and Notion status plus action discovery; set the masked Notion key |
 | Config | Load and edit `.env.local`, mask secrets, and start/stop/restart the managed runtime |
 | Memory | AgentMemory health, private backup-directory export, offline validation, and safe import |
-| Tool Console | Inspect the 16 compact tools, discover hidden actions, and call any façade with JSON |
+| Tool Console | Inspect the 20 compact tools, discover hidden actions, and call any façade with JSON |
 | Logs | Tail launcher, lifecycle, and audit logs |
 | Help | Complete keyboard and mouse reference |
 
-The Tool Console is the complete-capability escape hatch. It can reach all hidden backend actions while preserving the compact public MCP contract. Penpot adds page/selection inspection, API lookup, export, drawing/edit execution, and explicitly confirmed destructive execution.
+The Tool Console is the complete-capability escape hatch. It can reach all hidden backend actions while preserving the compact public MCP contract. Penpot and Coolify execute directly in trusted-local mode; DBeaver, Bruno, and Notion retain their integration-specific protection semantics.
 
 ## Input
 
@@ -62,7 +62,9 @@ v verify      t tasks/notes   k skills      i integrations
 e config      m memory        a tool console  l logs       h help
 ```
 
-The Config screen works even when the MCP daemon is offline because it reads the repository `.env.local` directly. Secret-like keys, including tokens, API keys, passwords, DSNs, and database URLs, are always masked. Editing a secret starts with an empty censored field; submitting blank preserves the existing value. Clear and Delete are explicit actions. Writes are atomic and use mode `600` where supported. The launcher reloads the file before every Start, Stop, and Restart, so updated Bruno, Penpot, or Coolify credentials take effect after Restart.
+The Config screen works even when the MCP daemon is offline because it reads the repository `.env.local` directly. Secret-like keys, including tokens, API keys, passwords, DSNs, and database URLs, are always masked. Editing a secret starts with an empty censored field; submitting blank preserves the existing value. Clear and Delete are explicit actions. Writes are atomic and use mode `600` where supported. The Integrations screen has a dedicated censored **Notion Key** action that writes `NOTION_API_KEY`. The launcher reloads the file before every Start, Stop, and Restart, so updated Bruno, Penpot, Coolify, or Notion credentials take effect after Restart.
+
+Every prompt dialog enables terminal **bracketed paste** while it is open. `Ctrl+Shift+V` or right-click **Paste** is captured from the terminal and inserted directly into the focused textbox, including censored secret inputs, without requiring a Wayland clipboard helper. The **Paste** button and `Ctrl+V` / `Shift+Insert` remain system-clipboard fallbacks: Linux tries `wl-paste`, `xclip`, `xsel`, then GTK3; macOS uses `pbpaste`; Windows uses PowerShell. Clipboard contents are never printed outside the textbox.
 
 ## Project semantics
 
@@ -100,9 +102,9 @@ neo-blessed renderer
         ↓
 LcaTuiClient
         ↓ persistent Streamable HTTP
-16 compact MCP tools
+20 compact MCP tools
         ↓ in-memory backend
-155 implementation actions
+185 implementation actions
 ```
 
 Project mutation, runtime lifecycle, and AgentMemory portability operations go through a small launcher subprocess bridge. Before every launcher command it reloads `.env.local`, removes values deleted in the Config screen, and passes the current values by environment rather than command-line arguments. The persistent MCP client reconnects once after server restarts or transport replacement.

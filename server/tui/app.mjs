@@ -7,6 +7,7 @@ import path from "node:path";
 
 import blessed from "neo-blessed";
 
+import { readClipboardText } from "./clipboard.mjs";
 import { directoryPickerRows, nextPickerDirectory } from "./folder-picker.mjs";
 import {
   isSecretEnvKey,
@@ -17,6 +18,7 @@ import {
   updateEnvConfig
 } from "./env-config.mjs";
 import { fuzzyFilter } from "./palette.mjs";
+import { attachBracketedPaste } from "./terminal-paste.mjs";
 import {
   closeResourceTab,
   createResourceTab,
@@ -932,6 +934,7 @@ export class LcaTuiApp {
       this.client.integration("bruno", "status"),
       this.client.integration("penpot", "status"),
       this.client.integration("coolify", "status"),
+      this.client.integration("notion", "status"),
       this.client.memoryHealth(),
       this.launcher.status()
     ]);
@@ -944,10 +947,11 @@ export class LcaTuiApp {
       integrationSummary("DBeaver", settled[4]),
       integrationSummary("Bruno", settled[5]),
       integrationSummary("Penpot", settled[6]),
-      integrationSummary("Coolify", settled[7])
+      integrationSummary("Coolify", settled[7]),
+      integrationSummary("Notion", settled[8])
     ];
-    const memory = value(8, { status: "offline" });
-    const launcher = value(9, {});
+    const memory = value(9, { status: "offline" });
+    const launcher = value(10, {});
     this.primaryRoot = path.resolve(info.primary_root || info.workspace || health.workspace || this.primaryRoot);
     this.currentPath ||= this.primaryRoot;
     this.gitRoot ||= this.primaryRoot;
@@ -1479,9 +1483,10 @@ export class LcaTuiApp {
   async refreshIntegrations() {
     this.setActions([
       { label: "Refresh", handler: () => this.refreshIntegrations() },
-      { label: "Discover", handler: () => this.discoverIntegration() }
+      { label: "Discover", handler: () => this.discoverIntegration() },
+      { label: "Notion Key", handler: () => this.configureNotion() }
     ]);
-    const names = ["figma", "dbeaver", "bruno", "penpot", "coolify"];
+    const names = ["figma", "dbeaver", "bruno", "penpot", "coolify", "notion"];
     const settled = await Promise.allSettled(names.map((name) => this.client.integration(name, "status")));
     const rows = names.map((name, index) => {
       const result = settled[index];
@@ -1494,7 +1499,7 @@ export class LcaTuiApp {
       };
     });
     this.setRows(rows, async (row) => this.setDetail(row.name, row.preview, { raw: true }), "MCP integrations");
-    this.setDetail("Integrations", "Figma, DBeaver, Bruno, and Penpot use persistent local MCP clients. Penpot reads PENPOT_MCP_URL plus the masked PENPOT_USER_TOKEN from .env.local and provides page/selection inspection, API lookup, export, drawing, and guarded destructive actions. Coolify runs the pinned @masonator/coolify-mcp package over local stdio. Select one and click Discover to inspect its live actions.", { raw: true });
+    this.setDetail("Integrations", "Figma, DBeaver, Bruno, and Penpot use persistent local MCP clients. Coolify runs its pinned stdio bridge. Notion uses the official REST API with a masked NOTION_API_KEY and the 2026-03-11 API version. Click Notion Key to set the secret, restart LCA, then Refresh to validate it. Select any integration and click Discover to inspect its actions.", { raw: true });
   }
 
   async discoverIntegration() {
@@ -1502,6 +1507,23 @@ export class LcaTuiApp {
     if (!row?.name) return;
     const value = await this.client.integration(row.name, "discover");
     this.setDetail(`${row.name} actions`, JSON.stringify(value, null, 2), { raw: true });
+  }
+
+  async configureNotion() {
+    const config = await readEnvConfig(this.envPath);
+    const configured = Boolean(String(config.values.NOTION_API_KEY || "").trim());
+    const value = await this.prompt(
+      "Notion API key",
+      configured ? "New secret (blank keeps current key)" : "Internal integration token / personal access token",
+      "",
+      { secret: true }
+    );
+    if (value === null || value === "") return;
+    await updateEnvConfig(this.envPath, {
+      NOTION_API_KEY: value,
+      NOTION_VERSION: config.values.NOTION_VERSION || "2026-03-11"
+    });
+    this.setDetail("Notion configured", "NOTION_API_KEY was saved masked in .env.local. Restart LCA, then open Integrations and Refresh to validate access. Share the pages you want LCA to use with this Notion connection.", { raw: true });
   }
 
   async refreshConfig() {
@@ -1537,7 +1559,7 @@ export class LcaTuiApp {
       `Variables: ${rows.length}`,
       "",
       "Secret values are masked and never copied into list/detail output. Files are written atomically with mode 600 where supported.",
-      "The launcher reloads this file before every Start/Stop/Restart, so new Bruno/Coolify tokens take effect after Restart."
+      "The launcher reloads this file before every Start/Stop/Restart, so new Bruno/Coolify/Notion tokens take effect after Restart."
     ].join("\n"), { raw: true });
   }
 
@@ -2009,12 +2031,53 @@ export class LcaTuiApp {
         inputOnFocus: true,
         style: { bg: THEME.bg, fg: THEME.text, border: { fg: THEME.border }, focus: { border: { fg: THEME.accent } } }
       });
-      const ok = modalButton(form, "OK", "center", -7, THEME.accent);
+      const pasteHint = blessed.text({
+        parent: form,
+        top: 6,
+        left: 2,
+        right: 2,
+        height: 1,
+        content: "Ctrl+V / Shift+Insert: paste clipboard · terminal paste: Ctrl+Shift+V",
+        style: { fg: THEME.muted }
+      });
+      const paste = modalButton(form, "Paste", "center", -19, THEME.panelAlt);
+      const ok = modalButton(form, "OK", "center", -6, THEME.accent);
       const cancel = modalButton(form, "Cancel", "center", 5, THEME.border);
+      const detachTerminalPaste = attachBracketedPaste(this.screen.program, input, {
+        onPaste: () => {
+          pasteHint.setContent("Pasted from terminal.");
+          pasteHint.style.fg = THEME.accent2;
+          input.focus();
+          this.screen.render();
+        }
+      });
       let done = false;
+      const pasteClipboard = () => {
+        const result = readClipboardText();
+        if (!result.ok) {
+          pasteHint.setContent(result.error);
+          pasteHint.style.fg = THEME.warning;
+          input.focus();
+          this.screen.render();
+          return;
+        }
+        if (!result.text) {
+          pasteHint.setContent("Clipboard is empty.");
+          pasteHint.style.fg = THEME.warning;
+          input.focus();
+          this.screen.render();
+          return;
+        }
+        input.setValue(`${input.getValue()}${result.text}`);
+        pasteHint.setContent(`Pasted from ${result.backend}.`);
+        pasteHint.style.fg = THEME.accent2;
+        input.focus();
+        this.screen.render();
+      };
       const finish = (value) => {
         if (done) return;
         done = true;
+        detachTerminalPaste();
         input.cancel?.();
         form.destroy();
         this.modalOpen = false;
@@ -2022,7 +2085,9 @@ export class LcaTuiApp {
         resolve(value);
       };
       input.on("submit", (value) => finish(value));
+      input.key(["C-v", "S-insert"], pasteClipboard);
       input.key(["escape"], () => finish(null));
+      paste.on("press", pasteClipboard);
       ok.on("press", () => finish(input.getValue()));
       cancel.on("press", () => finish(null));
       form.key(["escape"], () => finish(null));

@@ -50,9 +50,9 @@ lba stop
 
 Default endpoints:
 
-- MCP: `http://127.0.0.1:8790/mcp`
-- health: `http://127.0.0.1:8790/healthz`
-- extension bridge: `ws://127.0.0.1:8790/bridge`
+- MCP: `http://127.0.0.1:8791/mcp`
+- health: `http://127.0.0.1:8791/healthz`
+- extension bridge: `ws://127.0.0.1:8791/bridge`
 
 ## Load the Chromium extension
 

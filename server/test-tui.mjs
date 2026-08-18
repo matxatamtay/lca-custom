@@ -3,6 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,7 @@ import {
 } from "./tui/model.mjs";
 import { LcaTuiApp } from "./tui/app.mjs";
 import { LcaTuiClient } from "./tui/client.mjs";
+import { clipboardReaders, normalizeClipboardText, readClipboardText } from "./tui/clipboard.mjs";
 import {
   isSecretEnvKey,
   maskedEnvValue,
@@ -34,6 +36,14 @@ import {
 import { LauncherBridge, launcherInvocation } from "./tui/launcher-bridge.mjs";
 import { directoryPickerRows, nextPickerDirectory } from "./tui/folder-picker.mjs";
 import { fuzzyFilter, fuzzyScore } from "./tui/palette.mjs";
+import {
+  BRACKETED_PASTE_DISABLE,
+  BRACKETED_PASTE_ENABLE,
+  BRACKETED_PASTE_END,
+  BRACKETED_PASTE_START,
+  attachBracketedPaste,
+  createBracketedPasteParser
+} from "./tui/terminal-paste.mjs";
 import {
   closeResourceTab,
   createResourceTab,
@@ -66,6 +76,88 @@ test("TUI ships every planned feature screen with unique shortcuts", () => {
   assert.ok(TUI_SHORTCUTS.some(([key]) => key === "Mouse"));
   assert.equal(viewByShortcut("g")?.id, "git");
   assert.equal(viewByShortcut("", "?")?.id, "help");
+});
+
+test("clipboard bridge supports Ubuntu Wayland fallback and sanitizes terminal paste wrappers", () => {
+  const readers = clipboardReaders("linux", { WAYLAND_DISPLAY: "wayland-0" });
+  assert.deepEqual(readers.map((reader) => reader.backend), ["wl-paste", "xclip", "xsel", "gtk3"]);
+  assert.equal(normalizeClipboardText("\x1b[200~secret\r\nvalue\x1b[201~"), "secret\nvalue");
+});
+
+test("clipboard bridge falls through unavailable readers without exposing clipboard content", () => {
+  const calls = [];
+  const result = readClipboardText({
+    readers: [
+      { backend: "missing", command: "missing", args: [] },
+      { backend: "gtk3", command: "python3", args: ["-c", "ignored"] }
+    ],
+    spawnSync(command) {
+      calls.push(command);
+      if (command === "missing") return { status: 127, stdout: "" };
+      return { status: 0, stdout: "copied-value" };
+    }
+  });
+  assert.deepEqual(calls, ["missing", "python3"]);
+  assert.deepEqual(result, { ok: true, text: "copied-value", backend: "gtk3" });
+});
+
+test("clipboard bridge skips successful-but-empty readers", () => {
+  const result = readClipboardText({
+    readers: [
+      { backend: "empty", command: "empty", args: [] },
+      { backend: "next", command: "next", args: [] }
+    ],
+    spawnSync(command) {
+      return command === "empty"
+        ? { status: 0, stdout: "" }
+        : { status: 0, stdout: "terminal-safe-value" };
+    }
+  });
+  assert.deepEqual(result, { ok: true, text: "terminal-safe-value", backend: "next" });
+});
+
+test("bracketed paste parser handles split terminal markers", () => {
+  const events = [];
+  const parser = createBracketedPasteParser({
+    onStart: () => events.push("start"),
+    onPaste: (text) => events.push(["paste", text]),
+    onEnd: () => events.push("end")
+  });
+  parser.push(BRACKETED_PASTE_START.slice(0, 3));
+  parser.push(`${BRACKETED_PASTE_START.slice(3)}abc\r\ndef`);
+  parser.push(BRACKETED_PASTE_END.slice(0, 4));
+  parser.push(BRACKETED_PASTE_END.slice(4));
+  assert.deepEqual(events, ["start", ["paste", "abc\ndef"], "end"]);
+});
+
+test("terminal paste temporarily suspends textbox key handling and restores it", () => {
+  const program = new EventEmitter();
+  const writes = [];
+  program.write = (text) => writes.push(text);
+  const input = new EventEmitter();
+  input.value = "before:";
+  input.getValue = () => input.value;
+  input.setValue = (value) => { input.value = value; };
+  input.screen = { render() {} };
+  input.__listener = () => undefined;
+  input.on("keypress", input.__listener);
+  const scheduled = [];
+  const pasted = [];
+  const detach = attachBracketedPaste(program, input, {
+    schedule: (fn) => scheduled.push(fn),
+    onPaste: (length) => pasted.push(length)
+  });
+
+  program.emit("data", `${BRACKETED_PASTE_START}token-value${BRACKETED_PASTE_END}`);
+  assert.equal(input.listenerCount("keypress"), 0);
+  assert.equal(input.getValue(), "before:token-value");
+  assert.deepEqual(pasted, [11]);
+  assert.equal(writes[0], BRACKETED_PASTE_ENABLE);
+
+  scheduled.splice(0).forEach((fn) => fn());
+  assert.equal(input.listenerCount("keypress"), 1);
+  detach();
+  assert.equal(writes.at(-1), BRACKETED_PASTE_DISABLE);
 });
 
 test("tab order can be normalized, reordered, and persisted", () => {
@@ -377,8 +469,10 @@ test("env config preserves comments, masks secrets, and writes mode 600", async 
     assert.equal(parsed.values.BRUNO_DESKTOP_AUTH_TOKEN, "first-test-token");
     assert.equal(isSecretEnvKey("BRUNO_DESKTOP_AUTH_TOKEN"), true);
     assert.equal(isSecretEnvKey("PENPOT_USER_TOKEN"), true);
+    assert.equal(isSecretEnvKey("NOTION_API_KEY"), true);
     assert.equal(maskedEnvValue("BRUNO_DESKTOP_AUTH_TOKEN", "first-test-token"), "••••••");
     assert.equal(maskedEnvValue("PENPOT_USER_TOKEN", "penpot-test-token"), "••••••");
+    assert.equal(maskedEnvValue("NOTION_API_KEY", "notion-secret"), "••••••");
     assert.equal(maskedEnvValue("BRUNO_DESKTOP_MCP_URL", "http://127.0.0.1:3847/mcp"), "http://127.0.0.1:3847/mcp");
 
     const merged = mergeEnvText(initial, {
