@@ -195,7 +195,7 @@ export function registerCompactMcpTools(
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question."),
-        path: z.string().optional().describe("Root or subdirectory to inspect."),
+        path: z.string().optional().describe("Root or subdirectory to inspect. When omitted, the backend may select a uniquely mentioned configured project from the task."),
         intent: z.enum(["understand", "debug", "implement", "refactor", "review"]).optional(),
         changed_files: z.array(z.string()).optional(),
         max_items: z.number().int().min(3).max(50).optional(),

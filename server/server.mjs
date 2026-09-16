@@ -69,6 +69,7 @@ import {
   coolifyMcpStatus,
   listCoolifyMcpTools
 } from "./coolify-mcp.mjs";
+import { resolveTaskProjectRoot } from "./project-routing.mjs";
 
 // ----------------------------------------------------------------------------
 // Configuration (all overridable via environment variables)
@@ -3483,7 +3484,39 @@ function parsePorcelain(out) {
 // Absolute paths are accepted. Relative paths resolve from the primary project.
 function resolvePath(input = ".") {
   const raw = String(input ?? ".").trim() || ".";
-  return path.normalize(path.isAbsolute(raw) ? raw : path.resolve(PRIMARY_ROOT, raw));
+  if (path.isAbsolute(raw)) return path.normalize(raw);
+  const configured = resolveConfiguredProjectReference(raw);
+  return path.normalize(configured || path.resolve(PRIMARY_ROOT, raw));
+}
+
+function resolveConfiguredProjectReference(input) {
+  const segments = String(input || "")
+    .split(/[\\/]+/)
+    .filter(Boolean);
+  if (!segments.length || segments.includes("..")) return null;
+
+  const portable = segments.join("/");
+  const labels = projectRootLabels();
+  const basenameCounts = new Map();
+  for (const root of ROOTS) {
+    const name = path.basename(root);
+    basenameCounts.set(name, (basenameCounts.get(name) || 0) + 1);
+  }
+
+  const matches = new Map();
+  for (const root of ROOTS) {
+    const aliases = new Set([labels.get(comparePath(root))]);
+    const basename = path.basename(root);
+    if (basenameCounts.get(basename) === 1) aliases.add(basename);
+    for (const alias of aliases) {
+      if (!alias) continue;
+      if (portable !== alias && !portable.startsWith(`${alias}/`)) continue;
+      const remainder = portable === alias ? "" : portable.slice(alias.length + 1);
+      const resolved = path.resolve(root, remainder);
+      matches.set(comparePath(resolved), resolved);
+    }
+  }
+  return matches.size === 1 ? [...matches.values()][0] : null;
 }
 
 function isWithinRoots(p, roots = ROOTS) {
@@ -4874,15 +4907,28 @@ function registerRepoIntelTools(mcp) {
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question to investigate."),
-        path: z.string().optional().describe("Project root or subdirectory. Defaults to the primary workspace root."),
+        path: z.string().optional().describe("Project root or subdirectory. When omitted, a uniquely mentioned configured project in task is selected before falling back to the primary workspace root."),
         intent: z.enum(["understand", "debug", "implement", "refactor", "review"]).optional(),
         changed_files: z.array(z.string().min(1)).max(100).optional().describe("Known changed or relevant files to seed graph context."),
         max_items: z.number().int().min(3).max(100).optional().describe("Maximum evidence items returned. Defaults to 18."),
         max_chars: z.number().int().min(1000).max(200000).optional().describe("Approximate context character budget. Defaults to 60000.")
       }
     },
-    async ({ task, path: rel = ".", intent, changed_files = [], max_items = 18, max_chars = 60000 }) => {
-      const rootDir = resolvePath(rel);
+    async ({ task, path: rel, intent, changed_files = [], max_items = 18, max_chars = 60000 }) => {
+      const hasExplicitPath = typeof rel === "string" && rel.trim().length > 0;
+      const rootDir = hasExplicitPath
+        ? resolvePath(rel)
+        : resolveTaskProjectRoot(task, ROOTS, PRIMARY_ROOT);
+      let rootInfo;
+      try {
+        rootInfo = await stat(rootDir);
+      } catch (error) {
+        if (error?.code === "ENOENT") {
+          throw new Error("Workspace root does not exist: " + rootDir);
+        }
+        throw error;
+      }
+      if (!rootInfo.isDirectory()) throw new Error("Workspace root is not a directory: " + rootDir);
       const runtime = await getNextApplicationRuntime();
       const context = await runtime.application.buildTaskContext.execute({
         task,

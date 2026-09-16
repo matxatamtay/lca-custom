@@ -1368,7 +1368,7 @@ async function setup(flags) {
     cfg.node = cfg.node || "node";
     cfg.workspace = await promptLine(rl, "First project root", cfg.workspace || process.cwd());
     cfg.port = await promptLine(rl, "MCP port", cfg.port || DEFAULT_PORT);
-    console.log("Runtime: trusted-local, compact 14-tool facade, direct execution without policy or approval round-trips.");
+    console.log("Runtime: trusted-local, compact 15-tool facade, direct execution without policy or approval round-trips.");
     cfg.extraRoots = flags.extraRoots ?? cfg.extraRoots ?? "";
     cfg.authToken = flags.authToken ?? cfg.authToken ?? "";
 

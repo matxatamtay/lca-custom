@@ -12,13 +12,13 @@ Trusted local MCP execution engine for ChatGPT with mandatory CodeGraph and Agen
 
 ## What ships
 
-ChatGPT sees exactly fourteen tools:
+ChatGPT sees exactly fifteen tools:
 
 ```text
 workspace_context  workspace_search  workspace_read   workspace_edit
 workspace_exec     workspace_process workspace_git    workspace_verify
 workspace_status   workspace_skill   figma            dbeaver
-bruno              lca_input
+bruno              coolify           lca_input
 ```
 
 `workspace_context` is the default first call for coding tasks. Every call queries three required providers in parallel:
@@ -94,11 +94,11 @@ Detailed connector instructions: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WE
 
 ## Architecture
 
-The model-facing MCP server dispatches into an internal in-memory backend containing 136 implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
+The model-facing MCP server dispatches into an internal in-memory backend containing 144 implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
 
 CodeGraph runs through a lazy persistent stdio MCP connection. AgentMemory runs as a separately pinned companion service with automatic health checking, startup, session lifecycle, observations, decision memories, export, and import. Its default lean install uses BM25 without requiring an external LLM key.
 
-Figma, DBeaver, Bruno, and the remote Coolify MCP share persistent Streamable HTTP clients with single-flight connection setup, cached `tools/list`, one retry after transport failure, and graceful close.
+Figma Desktop, Figma Remote, DBeaver, Bruno, and the remote Coolify MCP use persistent Streamable HTTP connections with cached `tools/list` and graceful close. Figma Remote adds OAuth PKCE with local `0600` token storage and a fail-closed write guard.
 
 More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITECTURE.md).
 

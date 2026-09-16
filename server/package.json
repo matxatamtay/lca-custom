@@ -28,7 +28,7 @@
     "benchmark:compact": "node ../evals/compact.mjs",
     "build:next": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test:unit": "tsx --test src/application/context/build-task-context.test.ts src/infrastructure/mcp/persistent-mcp-tool-client.test.ts src/adapters/codegraph/codegraph-adapter.test.ts src/adapters/agentmemory/agentmemory-http-adapter.test.ts src/adapters/filesystem/ripgrep-filesystem-context-adapter.test.ts src/orchestration/agentmemory-supervisor.test.ts src/orchestration/agentmemory-session-manager.test.ts src/interfaces/mcp/tool-catalog.test.ts src/interfaces/mcp/compact-mcp-interface.test.ts",
+    "test:unit": "tsx --test test-project-routing.mjs src/application/context/build-task-context.test.ts src/infrastructure/mcp/persistent-mcp-tool-client.test.ts src/adapters/codegraph/codegraph-adapter.test.ts src/adapters/agentmemory/agentmemory-http-adapter.test.ts src/adapters/filesystem/ripgrep-filesystem-context-adapter.test.ts src/orchestration/agentmemory-supervisor.test.ts src/orchestration/agentmemory-session-manager.test.ts src/interfaces/mcp/tool-catalog.test.ts src/interfaces/mcp/compact-mcp-interface.test.ts",
     "test:integration:context": "tsx --test src/integration/task-context.integration.test.ts",
     "test:compact": "npm run build:next && node test-compact-surface.mjs",
     "test:next": "npm run typecheck && npm run test:unit",

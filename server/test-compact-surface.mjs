@@ -26,7 +26,8 @@ const FACADE_NAMES = [
   "workspace_skill",
   "figma",
   "dbeaver",
-  "bruno"
+  "bruno",
+  "coolify"
 ];
 const DIRECT_NAMES = new Set(["workspace_context", "lca_input"]);
 
@@ -130,7 +131,7 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 136, `expected complete internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 144, `expected complete internal backend coverage, received ${assigned.size} actions`);
   for (const directName of DIRECT_NAMES) assert.ok(compactNames.includes(directName), `${directName} must remain direct`);
 
   const writeResult = await client.callTool({

@@ -246,7 +246,7 @@ test("project add flow uses the folder picker instead of a typed path", async ()
   ]);
 });
 
-test("compact facade calls preserve the 14-tool public contract", () => {
+test("compact facade calls preserve the 15-tool public contract", () => {
   assert.deepEqual(compactFacadeCall("workspace_git", "status", { cwd: "/tmp/repo" }), {
     name: "workspace_git",
     arguments: { action: "status", arguments: { cwd: "/tmp/repo" } }

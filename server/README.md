@@ -1,6 +1,6 @@
 # Local Coding Agent MCP server
 
-Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees fourteen compact tools while an internal in-memory backend retains the richer implementation details.
+Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees fifteen compact tools while an internal in-memory backend retains the richer implementation details.
 
 ## Public MCP tools
 
@@ -18,6 +18,7 @@ workspace_skill
 figma
 dbeaver
 bruno
+coolify
 lca_input
 ```
 
@@ -31,7 +32,7 @@ Actions execute directly without mode, policy, or approval turns. Project roots 
 lca-custom tui
 ```
 
-The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fourteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
+The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fifteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
 
 ## Run
 
