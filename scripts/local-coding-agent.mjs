@@ -384,11 +384,21 @@ function readRepoEnvFile() {
   return parseDotEnv(readFileSync(ENV_LOCAL_PATH, "utf8"));
 }
 
+function readManagedRepoEnvKeys() {
+  if (!existsSync(ENV_EXAMPLE_PATH)) return new Set();
+  return new Set(Object.keys(parseDotEnv(readFileSync(ENV_EXAMPLE_PATH, "utf8"))));
+}
+
+export function applyRepoEnvValues(values, environment = process.env, { override = false, managedKeys = new Set() } = {}) {
+  for (const [key, value] of Object.entries(values || {})) {
+    if (override || environment[key] === undefined || managedKeys.has(key)) environment[key] = value;
+  }
+  return environment;
+}
+
 function loadRepoEnvIntoProcess({ override = false } = {}) {
   const values = readRepoEnvFile();
-  for (const [key, value] of Object.entries(values)) {
-    if (override || process.env[key] === undefined) process.env[key] = value;
-  }
+  applyRepoEnvValues(values, process.env, { override, managedKeys: readManagedRepoEnvKeys() });
   return values;
 }
 

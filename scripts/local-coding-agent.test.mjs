@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  applyRepoEnvValues,
   chooseManagedTunnelKeeper,
   hashDirectoryTree,
   isManagedTunnelArgv,
@@ -130,6 +131,39 @@ test("dotenv parser preserves Coolify tokens containing shell metacharacters", (
   const key = ["COOLIFY", "MCP", "AUTH", "TOKEN"].join("_");
   const opaqueValue = "prefix$segment;tail&more";
   assert.deepEqual(parseDotEnv(`${key}=${opaqueValue}\n`), { [key]: opaqueValue });
+});
+
+test("repo-managed dotenv values override inherited process values", () => {
+  const environment = {
+    FIGMA_REMOTE_ENABLED: "1",
+    CUSTOM_PARENT_VALUE: "from-parent"
+  };
+
+  applyRepoEnvValues(
+    {
+      FIGMA_REMOTE_ENABLED: "0",
+      CUSTOM_PARENT_VALUE: "from-local",
+      LOCAL_ONLY_VALUE: "from-local"
+    },
+    environment,
+    { managedKeys: new Set(["FIGMA_REMOTE_ENABLED"]) }
+  );
+
+  assert.deepEqual(environment, {
+    FIGMA_REMOTE_ENABLED: "0",
+    CUSTOM_PARENT_VALUE: "from-parent",
+    LOCAL_ONLY_VALUE: "from-local"
+  });
+});
+
+test("explicit dotenv override still replaces custom inherited values", () => {
+  const environment = { CUSTOM_PARENT_VALUE: "from-parent" };
+  applyRepoEnvValues(
+    { CUSTOM_PARENT_VALUE: "from-local" },
+    environment,
+    { override: true }
+  );
+  assert.equal(environment.CUSTOM_PARENT_VALUE, "from-local");
 });
 
 test("selects ripgrep install command by platform", () => {
