@@ -4,7 +4,7 @@
 
 Local Coding Agent is a trusted local MCP execution engine for ChatGPT. The model-facing surface is always the compact fifteen-tool facade. The complete implementation remains behind an internal in-memory backend and must never be exposed as a second public legacy surface.
 
-`workspace_context` is the default first call for coding tasks. It must always query filesystem search, CodeGraph, and AgentMemory in parallel, then return a coverage receipt. A provider may return zero hits, but it must not be silently skipped.
+`workspace_context` is the default first call for coding tasks. It must always query filesystem search, native semantic analysis, CodeGraph, and AgentMemory in parallel, then return a coverage receipt. CodeGraph and AgentMemory are required; semantic capability may report `unavailable` explicitly when its language backend is not registered or healthy. No lane may be silently skipped.
 
 Project roots are discovery and relative-path defaults, not authorization boundaries. Absolute paths and direct file, command, process, Git, Bruno, and Figma operations are supported without policy or approval round-trips.
 
@@ -69,4 +69,4 @@ Run the complete release gate from `server/`:
 npm run test:all
 ```
 
-The gate covers TypeScript, mandatory dual-source context, persistent MCP clients, all three desktop bridges, compact surface and schema budgets, Pro behavior, trusted-runtime semantics, transport hardening, and end-to-end evals.
+The gate covers TypeScript plus native Dart/Java semantic adapters, four-lane context orchestration, CodeGraph routing/cache behavior, persistent MCP/LSP clients, desktop bridges, compact surface and schema budgets, Pro behavior, trusted-runtime semantics, transport hardening, and end-to-end evals.

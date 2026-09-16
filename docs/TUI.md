@@ -25,7 +25,7 @@ Requirements:
 | Projects | Add, remove, promote a primary project, and open a project in Files |
 | Files | Clickable directory browser and text-file reader with absolute-path support |
 | Search | ripgrep-backed workspace search with direct jump to matching lines |
-| Context | Mandatory filesystem + CodeGraph + AgentMemory context and coverage receipt |
+| Context | Filesystem + native semantic + CodeGraph + AgentMemory context and coverage receipt |
 | Git | Status, per-file diff, staged diff, log, branches, and repository switching |
 | Commands | Bounded foreground command runner with history and selectable working directory |
 | Processes | Start, inspect, and stop managed background processes |

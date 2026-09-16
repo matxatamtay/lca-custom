@@ -15,13 +15,37 @@ function evidence(provider: ContextEvidence["provider"], id: string, content = i
   };
 }
 
-test("queries filesystem, CodeGraph, and AgentMemory for every task context", async () => {
+function semanticProvider(items: readonly ContextEvidence[] = []) {
+  return {
+    async context() {
+      return {
+        evidence: items,
+        language: "typescript" as const,
+        engine: "test-semantic",
+        available: true
+      };
+    }
+  };
+}
+
+test("queries filesystem, semantic analysis, CodeGraph, and AgentMemory for every task context", async () => {
   const calls: string[] = [];
   const useCase = new BuildTaskContext({
     filesystem: {
       async search() {
         calls.push("filesystem");
         return [evidence("filesystem", "file-hit")];
+      }
+    },
+    semantic: {
+      async context() {
+        calls.push("semantic");
+        return {
+          evidence: [evidence("semantic", "semantic-hit")],
+          language: "typescript" as const,
+          engine: "test-semantic",
+          available: true
+        };
       }
     },
     codegraph: {
@@ -49,18 +73,22 @@ test("queries filesystem, CodeGraph, and AgentMemory for every task context", as
     "agentmemory",
     "codegraph.context",
     "codegraph.ensureIndexed",
-    "filesystem"
+    "filesystem",
+    "semantic"
   ]);
   assert.equal(result.contextId, "ctx-test");
   assert.equal(result.coverage.filesystem.queried, true);
+  assert.equal(result.coverage.semantic.queried, true);
+  assert.equal(result.coverage.semantic.status, "ok");
   assert.equal(result.coverage.codegraph.queried, true);
   assert.equal(result.coverage.agentmemory.queried, true);
-  assert.equal(result.evidence.length, 3);
+  assert.equal(result.evidence.length, 4);
 });
 
 test("records AgentMemory coverage even when memory has no hits", async () => {
   const useCase = new BuildTaskContext({
     filesystem: { async search() { return []; } },
+    semantic: semanticProvider(),
     codegraph: {
       async ensureIndexed() {},
       async context() { return []; }
@@ -83,6 +111,7 @@ test("fails loudly when a required provider is unavailable while still starting 
         return [];
       }
     },
+    semantic: semanticProvider(),
     codegraph: {
       async ensureIndexed() {
         calls.push("codegraph.ensureIndexed");
@@ -120,6 +149,7 @@ test("keeps evidence from every provider and ranks current filesystem evidence f
         return [evidence("filesystem", "current", duplicateContent)];
       }
     },
+    semantic: semanticProvider([evidence("semantic", "semantic")]),
     codegraph: {
       async ensureIndexed() {},
       async context() {
@@ -135,9 +165,10 @@ test("keeps evidence from every provider and ranks current filesystem evidence f
 
   const result = await useCase.execute({ task: "Find statistics endpoint", root: "/repo" });
 
-  assert.equal(result.evidence.length, 3);
+  assert.equal(result.evidence.length, 4);
   assert.deepEqual(result.evidence.map((item) => item.provider), [
     "filesystem",
+    "semantic",
     "codegraph",
     "agentmemory"
   ]);
@@ -147,6 +178,7 @@ test("keeps provider evidence even when providers reuse the same external id", a
   const sharedId = "shared-id";
   const useCase = new BuildTaskContext({
     filesystem: { async search() { return [evidence("filesystem", sharedId, "file")]; } },
+    semantic: semanticProvider([evidence("semantic", sharedId, "semantic")]),
     codegraph: {
       async ensureIndexed() {},
       async context() { return [evidence("codegraph", sharedId, "graph")]; }
@@ -156,7 +188,7 @@ test("keeps provider evidence even when providers reuse the same external id", a
 
   const result = await useCase.execute({ task: "shared ids", root: "/repo" });
 
-  assert.equal(result.evidence.length, 3);
+  assert.equal(result.evidence.length, 4);
 });
 
 test("reserves one result per provider before filling the remaining budget", async () => {
@@ -169,6 +201,7 @@ test("reserves one result per provider before filling the remaining budget", asy
         }));
       }
     },
+    semantic: semanticProvider([evidence("semantic", "semantic")]),
     codegraph: {
       async ensureIndexed() {},
       async context() { return [evidence("codegraph", "graph")]; }
@@ -186,6 +219,36 @@ test("reserves one result per provider before filling the remaining budget", asy
 
   assert.equal(result.evidence.length, 5);
   assert.ok(result.evidence.some((item) => item.provider === "filesystem"));
+  assert.ok(result.evidence.some((item) => item.provider === "semantic"));
   assert.ok(result.evidence.some((item) => item.provider === "codegraph"));
   assert.ok(result.evidence.some((item) => item.provider === "agentmemory"));
+});
+
+test("keeps semantic capability failure visible without blocking required providers", async () => {
+  const useCase = new BuildTaskContext({
+    filesystem: { async search() { return [evidence("filesystem", "file")]; } },
+    semantic: {
+      async context() {
+        return {
+          evidence: [],
+          language: "java" as const,
+          engine: null,
+          available: false,
+          reason: "java semantic engine is not registered yet."
+        };
+      }
+    },
+    codegraph: {
+      async ensureIndexed() {},
+      async context() { return [evidence("codegraph", "graph")]; }
+    },
+    agentmemory: { async recall() { return []; } }
+  });
+
+  const result = await useCase.execute({ task: "Trace Java service", root: "/repo" });
+
+  assert.equal(result.coverage.semantic.status, "unavailable");
+  assert.equal(result.coverage.semantic.details?.language, "java");
+  assert.match(String(result.coverage.semantic.details?.reason), /not registered/);
+  assert.ok(result.evidence.some((item) => item.provider === "codegraph"));
 });

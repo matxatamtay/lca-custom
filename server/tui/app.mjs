@@ -1129,7 +1129,7 @@ export class LcaTuiApp {
     ]);
     if (!this.lastContext) {
       this.setRows([], null, "Evidence");
-      this.setDetail("Mandatory task context", "Every build queries filesystem search, CodeGraph, and AgentMemory in parallel.\n\nClick Build Context and describe the task. Coverage and provider evidence appear here.", { raw: true });
+      this.setDetail("Mandatory task context", "Every build queries filesystem search, native semantic analysis, CodeGraph, and AgentMemory in parallel.\n\nClick Build Context and describe the task. Coverage and provider evidence appear here.", { raw: true });
       return;
     }
     this.renderContext(this.lastContext);

@@ -22,7 +22,7 @@ coolify
 lca_input
 ```
 
-Use `workspace_context` first for coding tasks. It always fans out to current filesystem search, CodeGraph, and AgentMemory and returns per-provider coverage. Use `action=discover` on a facade only when its exact backend actions are needed.
+Use `workspace_context` first for coding tasks. It always fans out to current filesystem search, native semantic analysis, CodeGraph, and AgentMemory and returns per-provider coverage. Use `action=discover` on a facade only when its exact backend actions are needed.
 
 Actions execute directly without mode, policy, or approval turns. Project roots support discovery and relative paths; absolute paths are accepted. LCA is not an OS sandbox.
 
@@ -57,11 +57,13 @@ npm start
 
 ## Code intelligence and memory
 
-CodeGraph `1.5.0` is pinned in the core server dependency tree. Its MCP stdio connection is lazy, persistent, single-flight, and automatically indexes or synchronizes each project.
+TypeScript/JavaScript semantic context uses a persistent TypeScript 7 native API/tsgo session. Dart/Flutter uses a persistent Dart Analysis Server LSP session discovered from the project FVM/Dart SDK. Java uses persistent Eclipse JDT LS with per-project workspace data under `server/data/semantic/jdtls`; the pinned isolated runtime is provisioned with `node ../scripts/jdtls-runtime.mjs install`. Dart and Java cold indexing happens in the background and reports `warming` until exact-symbol evidence can be served safely.
+
+CodeGraph `1.5.0` is pinned in the core server dependency tree. Its MCP stdio connection is lazy and persistent, with internal narrow search/callers/callees/impact tools enabled behind the LCA adapter. Normal symbol tasks avoid source-heavy exploration; deep architecture/flow tasks still use `codegraph_explore`. Evidence is cached by graph revision and invalidated by changed-file refreshes.
 
 AgentMemory `0.9.28` is installed as a separate managed companion runtime under `runtime/agentmemory`. LCA owns health checks, startup, stale-session reconciliation, observations, summaries, decisions, export, and import. The lean default install omits optional ONNX packages and uses local BM25 search without an external LLM key.
 
-Neither dependency is exposed as a separate ChatGPT tool surface. The application layer requires both on every `workspace_context` call.
+None of these context engines is exposed as a separate ChatGPT tool surface. The application layer keeps CodeGraph and AgentMemory mandatory while semantic capability is reported explicitly when unavailable.
 
 ## MCP integrations
 

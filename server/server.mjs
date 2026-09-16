@@ -1680,7 +1680,7 @@ const WORKFLOW_COMMANDS = [
     command: "/context",
     label: "Context pack",
     description: "Gather a compact workspace context pack before deciding what to do.",
-    prompt: "Call workspace_context with the concrete task first so filesystem, CodeGraph, and AgentMemory are all searched, then ask only for genuinely missing information."
+    prompt: "Call workspace_context with the concrete task first so filesystem, native semantic analysis, CodeGraph, and AgentMemory are all searched, then ask only for genuinely missing information."
   }
 ];
 
@@ -2213,7 +2213,7 @@ async function composeLcaPrompt(input, rootDirs, { mode, selectedContext = [], i
     lines.push("Use LCA workspace tools when useful.");
   }
   if (includeContextPack) {
-    lines.push("Start by calling workspace_context with this task so filesystem, CodeGraph, and AgentMemory are all searched; do not ask me to copy file paths unless the @ context is ambiguous.");
+    lines.push("Start by calling workspace_context with this task so filesystem, native semantic analysis, CodeGraph, and AgentMemory are all searched; do not ask me to copy file paths unless the @ context is ambiguous.");
   }
   if (skillTokens.length) {
     lines.push("", "Requested skills:");
@@ -4903,7 +4903,7 @@ function registerRepoIntelTools(mcp) {
     "workspace_context",
     {
       title: "Workspace task context",
-      description: "Build task context by always querying current filesystem search, CodeGraph, and AgentMemory in parallel. Use this first for coding tasks so graph relationships and prior project decisions are never skipped.",
+      description: "Build task context by always querying current filesystem search, native semantic analysis, CodeGraph, and AgentMemory in parallel. Use this first for coding tasks so semantic references, graph relationships, and prior project decisions are never skipped.",
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question to investigate."),
@@ -4941,6 +4941,7 @@ function registerRepoIntelTools(mcp) {
       const summary = [
         `Context ready: ${context.evidence.length} evidence item(s).`,
         `filesystem=${coverage.filesystem.hits}`,
+        `Semantic=${coverage.semantic.status}:${coverage.semantic.hits}`,
         `CodeGraph=${coverage.codegraph.hits}`,
         `AgentMemory=${coverage.agentmemory.hits}`
       ].join(" ");

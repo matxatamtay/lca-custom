@@ -8,9 +8,10 @@ import path from "node:path";
 import { AgentMemoryHttpAdapter } from "../adapters/agentmemory/agentmemory-http-adapter.js";
 import { createDefaultCodeGraphAdapter } from "../adapters/codegraph/codegraph-adapter.js";
 import { RipgrepFilesystemContextAdapter } from "../adapters/filesystem/ripgrep-filesystem-context-adapter.js";
+import { createDefaultSemanticContextAdapter } from "../adapters/semantic/semantic-context-adapter.js";
 import { BuildTaskContext } from "../application/context/build-task-context.js";
 
-test("builds one context pack from filesystem, live CodeGraph, and AgentMemory", async () => {
+test("builds one context pack from filesystem, semantic analysis, live CodeGraph, and AgentMemory", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "lca-context-integration-"));
   const memoryServer = http.createServer((request, response) => {
     if (request.url === "/agentmemory/smart-search" && request.method === "POST") {
@@ -33,9 +34,19 @@ test("builds one context pack from filesystem, live CodeGraph, and AgentMemory",
   assert.ok(address && typeof address === "object");
 
   const codegraph = createDefaultCodeGraphAdapter();
+  const semantic = createDefaultSemanticContextAdapter();
   try {
     await mkdir(path.join(root, "src"), { recursive: true });
     await writeFile(path.join(root, "package.json"), JSON.stringify({ name: "context-fixture", type: "module" }), "utf8");
+    await writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        target: "ES2022",
+        module: "NodeNext",
+        moduleResolution: "NodeNext",
+        strict: true
+      },
+      include: ["src/**/*.ts"]
+    }), "utf8");
     await writeFile(path.join(root, "src", "payment.ts"), [
       "export function legacyRetryPolicy(attempt: number): boolean {",
       "  return attempt < 3;",
@@ -48,6 +59,7 @@ test("builds one context pack from filesystem, live CodeGraph, and AgentMemory",
 
     const useCase = new BuildTaskContext({
       filesystem: new RipgrepFilesystemContextAdapter(),
+      semantic,
       codegraph,
       agentmemory: new AgentMemoryHttpAdapter({
         baseUrl: `http://127.0.0.1:${address.port}`,
@@ -62,13 +74,17 @@ test("builds one context pack from filesystem, live CodeGraph, and AgentMemory",
     });
 
     assert.equal(context.coverage.filesystem.queried, true);
+    assert.equal(context.coverage.semantic.queried, true);
+    assert.equal(context.coverage.semantic.status, "ok");
     assert.equal(context.coverage.codegraph.queried, true);
     assert.equal(context.coverage.agentmemory.queried, true);
     assert.ok(context.evidence.some((item) => item.provider === "filesystem"));
+    assert.ok(context.evidence.some((item) => item.provider === "semantic"));
     assert.ok(context.evidence.some((item) => item.provider === "codegraph"));
     assert.ok(context.evidence.some((item) => item.provider === "agentmemory"));
     assert.match(context.evidence.find((item) => item.provider === "agentmemory")?.content ?? "", /duplicate webhooks/);
   } finally {
+    await semantic.close();
     await codegraph.close();
     await new Promise<void>((resolve, reject) => memoryServer.close((error) => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });

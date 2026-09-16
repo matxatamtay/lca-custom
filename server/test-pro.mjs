@@ -206,7 +206,7 @@ try {
   check("workspace_status facade is listed", Boolean(workspaceStatusTool), JSON.stringify(toolNames));
   check("legacy lca alias is hidden from the model", !toolNames.includes("lca"), JSON.stringify(toolNames));
   check("workspace_context tool is listed", Boolean(workspaceContextTool), JSON.stringify(toolNames));
-  check("workspace_context requires CodeGraph and AgentMemory", /CodeGraph/.test(workspaceContextTool?.description || "") && /AgentMemory/.test(workspaceContextTool?.description || "") && /always/i.test(workspaceContextTool?.description || ""), workspaceContextTool?.description || "missing");
+  check("workspace_context includes semantic analysis, CodeGraph, and AgentMemory", /semantic/i.test(workspaceContextTool?.description || "") && /CodeGraph/.test(workspaceContextTool?.description || "") && /AgentMemory/.test(workspaceContextTool?.description || "") && /always/i.test(workspaceContextTool?.description || ""), workspaceContextTool?.description || "missing");
   check("lca alias returns workspace info", lcaInfo.primary_root === info.primary_root && lcaInfo.version === info.version, JSON.stringify(lcaInfo));
   const openCompanionTool = tools.tools?.find((t) => t.name === "open_companion");
   const lcaInputTool = tools.tools?.find((t) => t.name === "lca_input");

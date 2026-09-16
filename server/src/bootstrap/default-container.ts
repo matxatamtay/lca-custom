@@ -2,6 +2,10 @@ import { AgentMemoryHttpAdapter } from "../adapters/agentmemory/agentmemory-http
 import { createDefaultCodeGraphAdapter, type CodeGraphAdapter } from "../adapters/codegraph/codegraph-adapter.js";
 import { RipgrepFilesystemContextAdapter } from "../adapters/filesystem/ripgrep-filesystem-context-adapter.js";
 import {
+  createDefaultSemanticContextAdapter,
+  type SemanticContextAdapter
+} from "../adapters/semantic/semantic-context-adapter.js";
+import {
   AgentMemoryCliController,
   AgentMemorySupervisor,
   HttpAgentMemoryHealthProbe
@@ -31,6 +35,7 @@ export function createDefaultApplicationContainer(
   options: DefaultContainerOptions = {}
 ): ManagedApplicationContainer {
   const codegraph: CodeGraphAdapter = createDefaultCodeGraphAdapter();
+  const semantic: SemanticContextAdapter = createDefaultSemanticContextAdapter();
   const agentMemoryUrl = options.agentMemoryUrl ?? "http://127.0.0.1:3111";
   let memorySessions: AgentMemorySessionManager | undefined;
   const agentmemory = new AgentMemoryHttpAdapter({
@@ -70,6 +75,7 @@ export function createDefaultApplicationContainer(
   return {
     application: createApplicationContainer({
       filesystem: new RipgrepFilesystemContextAdapter(),
+      semantic,
       codegraph,
       agentmemory: memoryPort
     }),
@@ -77,6 +83,7 @@ export function createDefaultApplicationContainer(
     async close() {
       const errors: unknown[] = [];
       try { await memorySessions.close(); } catch (error) { errors.push(error); }
+      try { await semantic.close(); } catch (error) { errors.push(error); }
       try { await codegraph.close(); } catch (error) { errors.push(error); }
       try { await supervisor.close(); } catch (error) { errors.push(error); }
       if (errors.length > 0) throw new AggregateError(errors, "Managed application close failed.");

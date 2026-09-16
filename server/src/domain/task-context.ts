@@ -1,4 +1,4 @@
-export const CONTEXT_PROVIDER_NAMES = ["filesystem", "codegraph", "agentmemory"] as const;
+export const CONTEXT_PROVIDER_NAMES = ["filesystem", "semantic", "codegraph", "agentmemory"] as const;
 
 export type ContextProviderName = (typeof CONTEXT_PROVIDER_NAMES)[number];
 
@@ -31,9 +31,10 @@ export interface ContextEvidence {
 
 export interface ProviderCoverage {
   queried: true;
-  status: "ok";
+  status: "ok" | "warming" | "unavailable";
   hits: number;
   latencyMs: number;
+  details?: Readonly<Record<string, unknown>>;
 }
 
 export type ContextCoverage = Readonly<Record<ContextProviderName, ProviderCoverage>>;

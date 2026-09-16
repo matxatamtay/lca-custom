@@ -12,17 +12,21 @@ import {
 import type {
   CodeIntelligencePort,
   FilesystemContextPort,
-  MemoryPort
+  MemoryPort,
+  SemanticContextPort
 } from "../../ports/context-providers.js";
 
 interface ProviderResult {
   provider: ContextProviderName;
   evidence: readonly ContextEvidence[];
   latencyMs: number;
+  status: ProviderCoverage["status"];
+  details?: Readonly<Record<string, unknown>>;
 }
 
 export interface BuildTaskContextDependencies {
   filesystem: FilesystemContextPort;
+  semantic: SemanticContextPort;
   codegraph: CodeIntelligencePort;
   agentmemory: MemoryPort;
   now?: () => Date;
@@ -30,7 +34,8 @@ export interface BuildTaskContextDependencies {
 }
 
 const PROVIDER_PRIORITY: Readonly<Record<ContextProviderName, number>> = {
-  filesystem: 3,
+  filesystem: 4,
+  semantic: 3,
   codegraph: 2,
   agentmemory: 1
 };
@@ -44,22 +49,55 @@ export class BuildTaskContext {
     this.createId = dependencies.createId ?? randomUUID;
   }
 
+  private async runSemanticProvider(request: TaskContextRequest): Promise<ProviderResult> {
+    const startedAt = performance.now();
+    try {
+      const result = await this.dependencies.semantic.context(request);
+      const semanticState = result.state ?? (result.available ? "ready" : "unavailable");
+      return {
+        provider: "semantic",
+        evidence: result.evidence,
+        latencyMs: Math.max(0, Math.round((performance.now() - startedAt) * 100) / 100),
+        status: semanticState === "ready" ? "ok" : semanticState,
+        details: {
+          language: result.language,
+          engine: result.engine,
+          available: result.available,
+          state: semanticState,
+          ...(result.reason ? { reason: result.reason } : {})
+        }
+      };
+    } catch (error) {
+      return {
+        provider: "semantic",
+        evidence: [],
+        latencyMs: Math.max(0, Math.round((performance.now() - startedAt) * 100) / 100),
+        status: "unavailable",
+        details: {
+          available: false,
+          reason: error instanceof Error ? error.message : String(error)
+        }
+      };
+    }
+  }
+
   async execute(request: TaskContextRequest): Promise<TaskContext> {
     const task = request.task.trim();
     if (!task) throw new Error("Task context requires a non-empty task.");
 
     const normalizedRequest: TaskContextRequest = { ...request, task };
 
-    const [filesystem, codegraph, agentmemory] = await Promise.all([
+    const [filesystem, semantic, codegraph, agentmemory] = await Promise.all([
       this.runProvider("filesystem", () => this.dependencies.filesystem.search(normalizedRequest)),
+      this.runSemanticProvider(normalizedRequest),
       this.runProvider("codegraph", async () => {
-        await this.dependencies.codegraph.ensureIndexed(normalizedRequest.root);
+        await this.dependencies.codegraph.ensureIndexed(normalizedRequest.root, normalizedRequest.changedFiles ?? []);
         return this.dependencies.codegraph.context(normalizedRequest);
       }),
       this.runProvider("agentmemory", () => this.dependencies.agentmemory.recall(normalizedRequest))
     ]);
 
-    const providerResults = [filesystem, codegraph, agentmemory] as const;
+    const providerResults = [filesystem, semantic, codegraph, agentmemory] as const;
     const coverage = Object.fromEntries(
       providerResults.map((result) => [result.provider, this.toCoverage(result)])
     ) as ContextCoverage;
@@ -84,7 +122,8 @@ export class BuildTaskContext {
       return {
         provider,
         evidence,
-        latencyMs: Math.max(0, Math.round((performance.now() - startedAt) * 100) / 100)
+        latencyMs: Math.max(0, Math.round((performance.now() - startedAt) * 100) / 100),
+        status: "ok"
       };
     } catch (error) {
       throw new ContextProviderUnavailableError(provider, error);
@@ -94,9 +133,10 @@ export class BuildTaskContext {
   private toCoverage(result: ProviderResult): ProviderCoverage {
     return {
       queried: true,
-      status: "ok",
+      status: result.status,
       hits: result.evidence.length,
-      latencyMs: result.latencyMs
+      latencyMs: result.latencyMs,
+      ...(result.details ? { details: result.details } : {})
     };
   }
 }

@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-09-16T03:34:14.141Z",
-  "gitHead": "37ccbefca083082952dfbc9b5af93e6f0a1529d8",
+  "generatedAt": "2026-09-16T07:42:03.824Z",
+  "gitHead": "f68e8876b21071ee92036dd17e16dbba370b2103",
   "surface": "compact",
   "runtime": {
     "node": "v26.3.1",
@@ -9,40 +9,40 @@
   },
   "toolSurface": {
     "count": 15,
-    "jsonBytes": 10785,
+    "jsonBytes": 10811,
     "nameChars": 185,
-    "descriptionChars": 2578,
+    "descriptionChars": 2604,
     "schemaChars": 5901
   },
   "instructions": {
-    "chars": 789,
-    "bytes": 789,
+    "chars": 815,
+    "bytes": 815,
     "lines": 5
   },
   "latencyMs": {
     "listTools": {
       "runs": 8,
-      "min": 2.87,
+      "min": 3.09,
       "median": 3.73,
-      "max": 3.92
+      "max": 4.14
     },
     "workspaceStatusWarm": {
       "runs": 8,
-      "min": 2.9,
-      "median": 3.67,
-      "max": 4.04
+      "min": 1.73,
+      "median": 3.27,
+      "max": 3.62
     },
     "workspaceReadWarm": {
       "runs": 8,
-      "min": 1.92,
-      "median": 3.23,
-      "max": 6.46
+      "min": 1.59,
+      "median": 3.27,
+      "max": 3.52
     }
   },
   "improvementVsBaselinePercent": {
     "toolCount": 89.51,
-    "toolSurfaceBytes": 88.2,
-    "instructionChars": 82.3
+    "toolSurfaceBytes": 88.17,
+    "instructionChars": 81.72
   },
   "targets": {
     "toolCountMax": 16,

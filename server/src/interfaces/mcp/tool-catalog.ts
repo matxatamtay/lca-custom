@@ -6,7 +6,7 @@ export interface TargetToolDefinition {
 export const TARGET_TOOL_CATALOG = Object.freeze([
   {
     name: "workspace_context",
-    description: "Build task context by always querying filesystem search, CodeGraph, and AgentMemory in parallel."
+    description: "Build task context by always querying filesystem search, native semantic analysis, CodeGraph, and AgentMemory in parallel."
   },
   { name: "workspace_search", description: "Search files, text, symbols, graph relationships, and remembered project context." },
   { name: "workspace_read", description: "Read one or many files and targeted line ranges." },

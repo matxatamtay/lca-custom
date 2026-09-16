@@ -4,7 +4,7 @@ import { z } from "zod";
 import { TARGET_TOOL_CATALOG } from "./tool-catalog.js";
 
 export const COMPACT_SERVER_INSTRUCTIONS = [
-  "For every coding task call workspace_context first. It always queries current files, CodeGraph, and AgentMemory and returns a coverage receipt.",
+  "For every coding task call workspace_context first. It always queries current files, native semantic analysis, CodeGraph, and AgentMemory and returns a coverage receipt.",
   "Use the compact facade tools. Each facade accepts a short action alias or an exact hidden backend tool name plus an arguments object. Call action=discover only when you need facade action discovery.",
   "Actions execute directly in the trusted local runtime without policy or approval round-trips. Project roots are discovery defaults, not authorization boundaries.",
   "Batch work, keep outputs bounded, and avoid repeating reads or commands. Use workspace_verify before declaring code changes complete.",
@@ -191,7 +191,7 @@ export function registerCompactMcpTools(
     "workspace_context",
     {
       title: "Workspace context",
-      description: "Build task context by always querying current filesystem search, CodeGraph, and AgentMemory in parallel. Use this first for coding tasks.",
+      description: "Build task context by always querying current filesystem search, native semantic analysis, CodeGraph, and AgentMemory in parallel. Use this first for coding tasks.",
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question."),

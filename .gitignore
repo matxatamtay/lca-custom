@@ -18,6 +18,7 @@ node_modules/
 .codegraph/
 server/data/
 runtime/agentmemory/data/
+runtime/jdtls/
 .agent/state/
 server/dist/
 server/*.log

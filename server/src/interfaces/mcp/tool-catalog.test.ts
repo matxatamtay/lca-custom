@@ -10,10 +10,11 @@ test("target MCP surface stays compact and uniquely named", () => {
   assert.equal(new Set(names).size, names.length, "tool names must be unique");
 });
 
-test("workspace_context explicitly requires CodeGraph and AgentMemory", () => {
+test("workspace_context explicitly includes native semantic analysis, CodeGraph, and AgentMemory", () => {
   const tool = TARGET_TOOL_CATALOG.find((candidate) => candidate.name === "workspace_context");
 
   assert.ok(tool);
+  assert.match(tool.description, /semantic/i);
   assert.match(tool.description, /CodeGraph/);
   assert.match(tool.description, /AgentMemory/);
   assert.match(tool.description, /always/i);

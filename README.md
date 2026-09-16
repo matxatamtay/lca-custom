@@ -4,7 +4,7 @@
 
 # Local Coding Agent
 
-Trusted local MCP execution engine for ChatGPT with mandatory CodeGraph and AgentMemory context.
+Trusted local MCP execution engine for ChatGPT with native semantic analysis, CodeGraph, and AgentMemory context.
 
 </div>
 
@@ -21,13 +21,14 @@ workspace_status   workspace_skill   figma            dbeaver
 bruno              coolify           lca_input
 ```
 
-`workspace_context` is the default first call for coding tasks. Every call queries three required providers in parallel:
+`workspace_context` is the default first call for coding tasks. Every call queries four context lanes in parallel:
 
 1. current files and ripgrep search
-2. CodeGraph structure and impact context
-3. AgentMemory project history and decisions
+2. language-native semantic analysis for exact symbols and references
+3. CodeGraph structure and impact context
+4. AgentMemory project history and decisions
 
-The response includes a coverage receipt so neither graph nor memory can be silently skipped.
+The response includes a coverage receipt for all four lanes. CodeGraph and AgentMemory remain required; semantic analysis reports `unavailable` explicitly when a language backend is not ready.
 
 Actions execute directly without mode, policy, or approval turns. Project roots help discovery and relative-path routing; absolute paths are supported and roots are not authorization boundaries.
 
@@ -96,7 +97,9 @@ Detailed connector instructions: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WE
 
 The model-facing MCP server dispatches into an internal in-memory backend containing 144 implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
 
-CodeGraph runs through a lazy persistent stdio MCP connection. AgentMemory runs as a separately pinned companion service with automatic health checking, startup, session lifecycle, observations, decision memories, export, and import. Its default lean install uses BM25 without requiring an external LLM key.
+Language-native semantic analysis runs in parallel with CodeGraph. TypeScript/JavaScript uses a persistent TypeScript 7 native API/tsgo session. Dart/Flutter uses the project Dart Analysis Server over persistent LSP with background cold prewarming, so the first context call reports `warming` instead of blocking. Java uses a persistent Eclipse JDT LS session with project-isolated workspace metadata; the checksum-pinned JDT runtime lives under ignored `runtime/jdtls/` and can be provisioned with `node scripts/jdtls-runtime.mjs install`. All three return compact definition/reference locations instead of duplicating source bodies.
+
+CodeGraph remains required but is routed by intent: ordinary symbol tasks use location-only graph search, callers/callees and refactors use narrow relationship tools, and full source-bearing exploration is reserved for architecture/flow work. Results are cached by project + graph revision + normalized query, while changed files force graph refresh/invalidation. AgentMemory remains the separately pinned companion service with managed health, lifecycle, observations, decisions, export, and import.
 
 Figma Desktop, Figma Remote, DBeaver, Bruno, and the remote Coolify MCP use persistent Streamable HTTP connections with cached `tools/list` and graceful close. Figma Remote adds OAuth PKCE with local `0600` token storage and a fail-closed write guard.
 

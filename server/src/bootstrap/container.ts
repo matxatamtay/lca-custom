@@ -2,11 +2,13 @@ import { BuildTaskContext } from "../application/context/build-task-context.js";
 import type {
   CodeIntelligencePort,
   FilesystemContextPort,
-  MemoryPort
+  MemoryPort,
+  SemanticContextPort
 } from "../ports/context-providers.js";
 
 export interface ApplicationDependencies {
   filesystem: FilesystemContextPort;
+  semantic: SemanticContextPort;
   codegraph: CodeIntelligencePort;
   agentmemory: MemoryPort;
 }
