@@ -18,7 +18,7 @@
     "test:hardening": "node test-hardening.mjs",
     "test:pro": "node test-pro.mjs",
     "eval": "node ../evals/run.mjs",
-    "test:figma": "node test-figma-desktop.mjs",
+    "test:figma": "node test-figma-desktop.mjs && node test-figma-remote.mjs",
     "test:dbeaver": "node test-dbeaver-desktop.mjs",
     "test:bruno": "node test-bruno-desktop.mjs",
     "test:coolify": "node --test test-coolify-mcp.mjs",

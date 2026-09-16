@@ -124,7 +124,16 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   },
   figma: {
     defaultAction: "figma_status",
-    aliases: { status: "figma_status", actions: "figma_list_tools", call: "figma_call_tool" },
+    aliases: {
+      status: "figma_status",
+      actions: "figma_list_tools",
+      call: "figma_call_tool",
+      remote_status: "figma_remote_status",
+      remote_actions: "figma_remote_list_tools",
+      remote_call: "figma_remote_call_tool",
+      auth: "figma_remote_auth_start",
+      reset_auth: "figma_remote_auth_reset"
+    },
     prefix: "figma_"
   },
   dbeaver: {
@@ -154,7 +163,7 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, and session-report gates.",
   workspace_status: "Inspect workspace, trusted runtime, project profile, dependency health, and readiness state.",
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
-  figma: "Use the persistent Figma Desktop integration. Common actions: status, actions, call, or an exact figma_* backend action.",
+  figma: "Use Figma Remote MCP with OAuth and guarded canvas writes, plus the persistent Desktop fallback. Common actions: status, actions, call, auth, remote_status, remote_actions, remote_call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",
   bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action.",
   coolify: "Use the configured remote Coolify MCP integration. Common actions: status, actions, call, or an exact coolify_* backend action."

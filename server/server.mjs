@@ -37,6 +37,17 @@ import {
   parseFigmaNodeReference
 } from "./figma-desktop.mjs";
 import {
+  DEFAULT_FIGMA_REMOTE_MCP_URL,
+  DEFAULT_FIGMA_REMOTE_TOKEN_PATH,
+  callFigmaRemoteTool,
+  closeFigmaRemoteClients,
+  figmaRemoteStatus,
+  finishFigmaRemoteAuthorization,
+  listFigmaRemoteTools,
+  resetFigmaRemoteAuthorization,
+  startFigmaRemoteAuthorization
+} from "./figma-remote.mjs";
+import {
   DEFAULT_DBEAVER_DESKTOP_MCP_URL,
   callDBeaverDesktopTool,
   callReadOnlyDBeaverDesktopTool,
@@ -167,6 +178,17 @@ const HTTP_LOG = process.env.AGENT_HTTP_LOG === "1";
 // LCA acts as an MCP client and forwards results without managing Figma tokens.
 const FIGMA_DESKTOP_MCP_URL = String(process.env.FIGMA_DESKTOP_MCP_URL || DEFAULT_FIGMA_DESKTOP_MCP_URL).trim();
 const FIGMA_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.FIGMA_DESKTOP_TIMEOUT_MS, 30_000, 1_000, 120_000);
+const FIGMA_REMOTE_ENABLED = process.env.FIGMA_REMOTE_ENABLED === "1";
+const FIGMA_REMOTE_MCP_URL = String(process.env.FIGMA_REMOTE_MCP_URL || DEFAULT_FIGMA_REMOTE_MCP_URL).trim();
+const FIGMA_REMOTE_TIMEOUT_MS = boundedNumber(process.env.FIGMA_REMOTE_TIMEOUT_MS, 60_000, 1_000, 300_000);
+const FIGMA_REMOTE_AUTH_TOKEN = String(process.env.FIGMA_REMOTE_AUTH_TOKEN || "").trim();
+const FIGMA_REMOTE_CLIENT_ID = String(process.env.FIGMA_REMOTE_CLIENT_ID || "").trim();
+const FIGMA_REMOTE_CLIENT_SECRET = String(process.env.FIGMA_REMOTE_CLIENT_SECRET || "").trim();
+const FIGMA_REMOTE_ALLOW_WRITE = process.env.FIGMA_REMOTE_ALLOW_WRITE === "1";
+const FIGMA_REMOTE_TOKEN_PATH = String(process.env.FIGMA_REMOTE_TOKEN_PATH || DEFAULT_FIGMA_REMOTE_TOKEN_PATH).trim();
+const FIGMA_REMOTE_CALLBACK_URL = String(
+  process.env.FIGMA_REMOTE_CALLBACK_URL || `http://127.0.0.1:${PORT}/integrations/figma/oauth/callback`
+).trim();
 const DBEAVER_DESKTOP_MCP_URL = String(process.env.DBEAVER_DESKTOP_MCP_URL || DEFAULT_DBEAVER_DESKTOP_MCP_URL).trim();
 const DBEAVER_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.DBEAVER_DESKTOP_TIMEOUT_MS, 45_000, 1_000, 300_000);
 const DBEAVER_DESKTOP_AUTH_TOKEN = String(process.env.DBEAVER_DESKTOP_AUTH_TOKEN || "").trim();
@@ -192,6 +214,19 @@ const FIGMA_DESKTOP_READ_ONLY_TOOLS = new Set([
   "list_shader_effects",
   "list_shader_fills"
 ]);
+
+function figmaRemoteBridgeOptions() {
+  return {
+    endpoint: FIGMA_REMOTE_MCP_URL,
+    timeoutMs: FIGMA_REMOTE_TIMEOUT_MS,
+    authToken: FIGMA_REMOTE_AUTH_TOKEN,
+    clientId: FIGMA_REMOTE_CLIENT_ID,
+    clientSecret: FIGMA_REMOTE_CLIENT_SECRET,
+    allowWrite: FIGMA_REMOTE_ALLOW_WRITE,
+    callbackUrl: FIGMA_REMOTE_CALLBACK_URL,
+    tokenPath: FIGMA_REMOTE_TOKEN_PATH
+  };
+}
 
 // v2.1 Repo index cache
 const INDEX_PATH = path.resolve(WORKSPACE_DATA_DIR, "index.json");
@@ -343,6 +378,9 @@ const httpServer = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/.well-known/oauth-protected-resource") {
       return sendJson(res, 200, oauthProtectedResourceMetadata());
     }
+    if (req.method === "GET" && url.pathname === "/integrations/figma/oauth/callback") {
+      return await handleFigmaRemoteOAuthCallback(url, res);
+    }
     if (url.pathname === "/mcp") {
       if (!checkAuth(req, url)) {
         return sendJson(res, 401, {
@@ -398,6 +436,7 @@ async function gracefulExit(signal) {
     await closeLegacyBackendRuntime();
     await Promise.all([
       closeFigmaDesktopClients(),
+      closeFigmaRemoteClients(),
       closeDBeaverDesktopClients(),
       closeBrunoDesktopClients(),
       closeCoolifyMcpClients()
@@ -427,6 +466,37 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b));
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+async function handleFigmaRemoteOAuthCallback(url, res) {
+  const oauthError = String(url.searchParams.get("error") || "").trim();
+  const oauthDescription = String(url.searchParams.get("error_description") || "").trim();
+  try {
+    if (!FIGMA_REMOTE_ENABLED) throw new Error("Figma Remote MCP is not enabled in LCA.");
+    if (oauthError) throw new Error(oauthDescription || oauthError);
+    const result = await finishFigmaRemoteAuthorization(
+      {
+        code: url.searchParams.get("code"),
+        state: url.searchParams.get("state")
+      },
+      figmaRemoteBridgeOptions()
+    );
+    return sendFigmaOAuthPage(res, 200, "Figma connected", `LCA is connected to Figma Remote MCP with ${result.tool_count || 0} tools. You can close this tab.`);
+  } catch (error) {
+    return sendFigmaOAuthPage(res, 400, "Figma connection failed", error?.message || String(error));
+  }
+}
+
+function sendFigmaOAuthPage(res, statusCode, title, message) {
+  const escapeHtml = (value) => String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><style>body{font-family:system-ui,-apple-system,sans-serif;max-width:680px;margin:12vh auto;padding:24px;color:#18181b}main{border:1px solid #e4e4e7;border-radius:18px;padding:28px;box-shadow:0 12px 40px #00000012}h1{margin:0 0 12px;font-size:24px}p{line-height:1.55;color:#52525b}</style></head><body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main></body></html>`;
+  res.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(html);
 }
 
 async function handleMcp(req, res) {
@@ -545,12 +615,36 @@ function registerFigmaDesktopTools(mcp) {
     mcp,
     "figma_status",
     {
-      title: "Figma Desktop status",
-      description: "Check whether the official Figma Desktop MCP server is enabled and list its available tools.",
+      title: "Figma integration status",
+      description: "Check the official Figma Remote MCP and the Figma Desktop MCP fallback, including OAuth and write readiness.",
       annotations: readOnly,
       inputSchema: {}
     },
-    async () => jsonResult(await figmaDesktopStatus({ endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS }))
+    async () => {
+      const desktop = await figmaDesktopStatus({ endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS });
+      const remote = FIGMA_REMOTE_ENABLED
+        ? await figmaRemoteStatus(figmaRemoteBridgeOptions())
+        : {
+            connected: false,
+            enabled: false,
+            endpoint: FIGMA_REMOTE_MCP_URL,
+            authorization_required: false,
+            write_enabled: FIGMA_REMOTE_ALLOW_WRITE,
+            tool_count: 0,
+            tools: []
+          };
+      const preferred = remote.connected ? "remote" : desktop.connected ? "desktop" : "none";
+      const active = preferred === "remote" ? remote : desktop;
+      return jsonResult({
+        connected: Boolean(active.connected),
+        source: preferred,
+        endpoint: active.endpoint,
+        tool_count: active.tool_count || 0,
+        tools: active.tools || [],
+        remote,
+        desktop
+      });
+    }
   );
 
   reg(
@@ -572,15 +666,102 @@ function registerFigmaDesktopTools(mcp) {
     mcp,
     "figma_call_tool",
     {
-      title: "Call Figma Desktop tool",
-      description: "Forward a call to any tool currently exposed by Figma Desktop MCP. Use figma_list_tools first for its exact schema.",
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: false },
+      title: "Call Figma tool",
+      description: "Forward a call to Figma Remote MCP or the Desktop fallback. Remote write tools require FIGMA_REMOTE_ALLOW_WRITE=1.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
       inputSchema: {
         tool: z.string().min(1).describe("Exact upstream Figma MCP tool name."),
+        source: z.enum(["auto", "remote", "desktop"]).optional().describe("Upstream source. Auto prefers Remote when enabled and the tool exists."),
         arguments: z.record(z.any()).optional().describe("Arguments matching the upstream tool JSON schema.")
       }
     },
-    async ({ tool, arguments: args = {} }) => callFigmaDesktopTool(tool, args, { endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS })
+    async ({ tool, source = "auto", arguments: args = {} }) => callConfiguredFigmaTool(tool, args, source)
+  );
+
+  reg(
+    mcp,
+    "figma_remote_status",
+    {
+      title: "Figma Remote status",
+      description: "Check hosted Figma MCP connectivity, OAuth readiness, available tools, and whether write calls are enabled.",
+      annotations: readOnly,
+      inputSchema: {}
+    },
+    async () => jsonResult(
+      FIGMA_REMOTE_ENABLED
+        ? await figmaRemoteStatus(figmaRemoteBridgeOptions())
+        : {
+            connected: false,
+            enabled: false,
+            endpoint: FIGMA_REMOTE_MCP_URL,
+            write_enabled: FIGMA_REMOTE_ALLOW_WRITE,
+            error: "Set FIGMA_REMOTE_ENABLED=1 and restart LCA."
+          }
+    )
+  );
+
+  reg(
+    mcp,
+    "figma_remote_auth_start",
+    {
+      title: "Start Figma OAuth",
+      description: "Start the official Figma Remote MCP OAuth PKCE flow and return the authorization URL. Open that URL in a browser.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      inputSchema: {}
+    },
+    async () => {
+      if (!FIGMA_REMOTE_ENABLED) throw new Error("Set FIGMA_REMOTE_ENABLED=1 and restart LCA first.");
+      return jsonResult(await startFigmaRemoteAuthorization(figmaRemoteBridgeOptions()));
+    }
+  );
+
+  reg(
+    mcp,
+    "figma_remote_auth_reset",
+    {
+      title: "Reset Figma OAuth",
+      description: "Delete LCA's locally stored Figma OAuth client registration and tokens, then require a fresh authorization.",
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: true },
+      inputSchema: {}
+    },
+    async () => {
+      if (!FIGMA_REMOTE_ENABLED) throw new Error("Figma Remote MCP is not enabled.");
+      return jsonResult(await resetFigmaRemoteAuthorization(figmaRemoteBridgeOptions()));
+    }
+  );
+
+  reg(
+    mcp,
+    "figma_remote_list_tools",
+    {
+      title: "List Figma Remote tools",
+      description: "List live hosted Figma MCP tools, schemas, and annotations after OAuth authentication.",
+      annotations: readOnly,
+      inputSchema: { refresh: z.boolean().optional() }
+    },
+    async ({ refresh = false }) => {
+      if (!FIGMA_REMOTE_ENABLED) throw new Error("Set FIGMA_REMOTE_ENABLED=1 and restart LCA first.");
+      const result = await listFigmaRemoteTools({ ...figmaRemoteBridgeOptions(), refresh });
+      return jsonResult({ endpoint: FIGMA_REMOTE_MCP_URL, count: result.tools.length, tools: result.tools });
+    }
+  );
+
+  reg(
+    mcp,
+    "figma_remote_call_tool",
+    {
+      title: "Call Figma Remote tool",
+      description: "Call any live hosted Figma MCP tool. Unknown or write-capable tools are blocked unless FIGMA_REMOTE_ALLOW_WRITE=1.",
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      inputSchema: {
+        tool: z.string().min(1),
+        arguments: z.record(z.any()).optional()
+      }
+    },
+    async ({ tool, arguments: args = {} }) => {
+      if (!FIGMA_REMOTE_ENABLED) throw new Error("Set FIGMA_REMOTE_ENABLED=1 and restart LCA first.");
+      return callFigmaRemoteTool(tool, args, figmaRemoteBridgeOptions());
+    }
   );
 
   registerFigmaReadWrapper(mcp, "figma_get_design_context", "get_design_context", "Get implementation-oriented design context for a Figma URL, node ID, or the current desktop selection.");
@@ -589,6 +770,44 @@ function registerFigmaDesktopTools(mcp) {
   registerFigmaReadWrapper(mcp, "figma_get_variable_defs", "get_variable_defs", "Get variables and styles used by a Figma URL, node ID, or current selection.");
   registerFigmaReadWrapper(mcp, "figma_get_code_connect_map", "get_code_connect_map", "Get Code Connect mappings for a Figma URL, node ID, or current selection.");
   registerFigmaReadWrapper(mcp, "figma_get_figjam", "get_figjam", "Get XML context for a FigJam URL, node ID, or current selection.");
+}
+
+async function callConfiguredFigmaTool(tool, args, source = "auto") {
+  if (source === "remote") {
+    if (!FIGMA_REMOTE_ENABLED) throw new Error("Set FIGMA_REMOTE_ENABLED=1 and restart LCA first.");
+    return callFigmaRemoteTool(tool, args, figmaRemoteBridgeOptions());
+  }
+  if (source === "desktop") {
+    return callFigmaDesktopTool(tool, args, { endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS });
+  }
+  if (FIGMA_REMOTE_ENABLED) {
+    try {
+      const listed = await listFigmaRemoteTools(figmaRemoteBridgeOptions());
+      if (listed.tools?.some((candidate) => candidate.name === tool)) {
+        return callFigmaRemoteTool(tool, args, figmaRemoteBridgeOptions());
+      }
+    } catch (error) {
+      if (!FIGMA_DESKTOP_READ_ONLY_TOOLS.has(tool)) throw error;
+    }
+  }
+  return callFigmaDesktopTool(tool, args, { endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS });
+}
+
+async function callConfiguredFigmaReadTool(upstreamName, input, source) {
+  if (source === "remote") {
+    return callConfiguredFigmaTool(upstreamName, buildFigmaRemoteArguments(input), "remote");
+  }
+  if (source === "desktop") {
+    return callConfiguredFigmaTool(upstreamName, buildFigmaDesktopArguments(input), "desktop");
+  }
+  if (FIGMA_REMOTE_ENABLED && input?.url) {
+    try {
+      return await callConfiguredFigmaTool(upstreamName, buildFigmaRemoteArguments(input), "remote");
+    } catch {
+      // URL-based remote reads gracefully fall back to the current desktop bridge.
+    }
+  }
+  return callConfiguredFigmaTool(upstreamName, buildFigmaDesktopArguments(input), "desktop");
 }
 
 function registerFigmaReadWrapper(mcp, lcaName, upstreamName, description) {
@@ -606,13 +825,11 @@ function registerFigmaReadWrapper(mcp, lcaName, upstreamName, description) {
         client_frameworks: z.array(z.string()).optional().describe("Frameworks or Code Connect labels, forwarded as clientFrameworks."),
         force_code: z.boolean().optional().describe("Forwarded as forceCode when supported by the upstream tool."),
         enable_base64_response: z.boolean().optional().describe("Forwarded as enableBase64Response when supported, mainly for screenshots."),
+        source: z.enum(["auto", "remote", "desktop"]).optional().describe("Auto prefers Remote for URL-based reads and falls back to Desktop."),
         arguments: z.record(z.any()).optional().describe("Additional or overriding upstream arguments for forward compatibility.")
       }
     },
-    async (input) => {
-      const args = buildFigmaDesktopArguments(input);
-      return callFigmaDesktopTool(upstreamName, args, { endpoint: FIGMA_DESKTOP_MCP_URL, timeoutMs: FIGMA_DESKTOP_TIMEOUT_MS });
-    }
+    async (input) => callConfiguredFigmaReadTool(upstreamName, input, input?.source || "auto")
   );
 }
 
@@ -632,6 +849,13 @@ function buildFigmaDesktopArguments({
   if (client_frameworks?.length && args.clientFrameworks === undefined) args.clientFrameworks = client_frameworks;
   if (force_code !== undefined && args.forceCode === undefined) args.forceCode = force_code;
   if (enable_base64_response !== undefined && args.enableBase64Response === undefined) args.enableBase64Response = enable_base64_response;
+  return args;
+}
+
+function buildFigmaRemoteArguments(input = {}) {
+  const args = buildFigmaDesktopArguments(input);
+  const reference = parseFigmaNodeReference(input.url || input.node_id || "");
+  if (reference.fileKey && args.fileKey === undefined) args.fileKey = reference.fileKey;
   return args;
 }
 

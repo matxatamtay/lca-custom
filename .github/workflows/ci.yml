@@ -46,9 +46,11 @@ jobs:
           node --check persistent-http-mcp-client.mjs
           node --check test-persistent-http-mcp-client.mjs
           node --check figma-desktop.mjs
+          node --check figma-remote.mjs
           node --check dbeaver-desktop.mjs
           node --check bruno-desktop.mjs
           node --check test-figma-desktop.mjs
+          node --check test-figma-remote.mjs
           node --check test-dbeaver-desktop.mjs
           node --check test-bruno-desktop.mjs
           node --check test-compact-surface.mjs

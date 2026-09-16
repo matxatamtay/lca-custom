@@ -106,7 +106,14 @@ More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITE
 
 ### Figma
 
-Enable the official Figma Desktop MCP server in Dev Mode. LCA defaults to `http://127.0.0.1:3845/mcp` and exposes it through the single `figma` facade.
+LCA supports both official Figma MCP transports through the single `figma` facade:
+
+- Remote, preferred: `https://mcp.figma.com/mcp`, OAuth PKCE, link-based reads, and guarded write-to-canvas tools such as `use_figma`.
+- Desktop fallback: `http://127.0.0.1:3845/mcp`, using the current Figma Desktop selection in Dev Mode.
+
+Enable Remote in `.env.local` with `FIGMA_REMOTE_ENABLED=1`. Canvas writes remain blocked unless `FIGMA_REMOTE_ALLOW_WRITE=1`. Start authorization with the `figma` facade action `auth`, open the returned URL, and let Figma redirect to LCA's loopback callback. OAuth tokens and PKCE state are stored outside the repository with file mode `0600`.
+
+Figma currently limits its hosted MCP endpoint to clients in the Figma MCP Catalog. The bridge reports that restriction plainly if Figma rejects LCA's client registration; it never impersonates another supported client.
 
 ### Bruno
 
