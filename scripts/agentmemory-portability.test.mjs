@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -183,6 +183,55 @@ test("managed portability service reuses a healthy daemon", async () => {
     const health = await service.ensureReady();
     assert.equal(health.ready, true);
     assert.equal(spawns, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("managed portability service defaults to native AgentMemory startup", () => {
+  const { root, paths } = fixture();
+  const previousUseDocker = process.env.AGENTMEMORY_USE_DOCKER;
+  try {
+    delete process.env.AGENTMEMORY_USE_DOCKER;
+    mkdirSync(paths.configDirectory, { recursive: true });
+    let spawnOptions;
+    const service = new ManagedAgentMemoryService({
+      paths,
+      spawn: (_command, _args, options) => {
+        spawnOptions = options;
+        return { unref() {} };
+      }
+    });
+
+    service.startDetached();
+
+    assert.equal(spawnOptions.env.AGENTMEMORY_USE_DOCKER, undefined);
+    assert.equal(spawnOptions.env.CI, "1");
+  } finally {
+    if (previousUseDocker === undefined) delete process.env.AGENTMEMORY_USE_DOCKER;
+    else process.env.AGENTMEMORY_USE_DOCKER = previousUseDocker;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed portability service supports explicit Docker startup", () => {
+  const { root, paths } = fixture();
+  try {
+    mkdirSync(paths.configDirectory, { recursive: true });
+    let spawnOptions;
+    const service = new ManagedAgentMemoryService({
+      paths,
+      useDocker: true,
+      spawn: (_command, _args, options) => {
+        spawnOptions = options;
+        return { unref() {} };
+      }
+    });
+
+    service.startDetached();
+
+    assert.equal(spawnOptions.env.AGENTMEMORY_USE_DOCKER, "1");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -17,6 +17,7 @@ tools/
 node_modules/
 .codegraph/
 server/data/
+runtime/agentmemory/data/
 .agent/state/
 server/dist/
 server/*.log

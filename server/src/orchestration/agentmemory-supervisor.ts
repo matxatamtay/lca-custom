@@ -17,6 +17,7 @@ export interface AgentMemoryHealthProbe {
 export interface AgentMemoryRuntimeController {
   start(): Promise<void>;
   close(): Promise<void>;
+  startupFailure?(): Error | undefined;
 }
 
 export interface AgentMemorySupervisorOptions {
@@ -56,8 +57,20 @@ export class AgentMemorySupervisor {
   private async startAndWait(): Promise<void> {
     await this.options.runtime.start();
     for (let attempt = 0; attempt < this.attempts; attempt++) {
+      const startupFailure = this.options.runtime.startupFailure?.();
+      if (startupFailure) {
+        throw new Error(`AgentMemory failed during automatic startup: ${startupFailure.message}`, {
+          cause: startupFailure
+        });
+      }
       if (await this.options.probe.isReady()) return;
-      await this.sleep(this.retryDelayMs);
+      if (attempt + 1 < this.attempts) await this.sleep(this.retryDelayMs);
+    }
+    const startupFailure = this.options.runtime.startupFailure?.();
+    if (startupFailure) {
+      throw new Error(`AgentMemory failed during automatic startup: ${startupFailure.message}`, {
+        cause: startupFailure
+      });
     }
     throw new Error("AgentMemory did not become ready after an automatic start attempt.");
   }
@@ -122,6 +135,10 @@ export interface AgentMemoryCliControllerOptions {
 export class AgentMemoryCliController implements AgentMemoryRuntimeController {
   private child: ChildProcess | undefined;
   private ownsRuntime = false;
+  private closing = false;
+  private startupFailureValue: Error | undefined;
+  private stdoutTail = "";
+  private stderrTail = "";
   private readonly cliPath: string;
   private readonly runtimeDirectory: string;
   private readonly enginePort: number;
@@ -141,6 +158,10 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
 
   async start(): Promise<void> {
     if (this.child && this.child.exitCode === null && !this.child.killed) return;
+    this.startupFailureValue = undefined;
+    this.stdoutTail = "";
+    this.stderrTail = "";
+    this.closing = false;
     await this.ensureInstalled();
     await this.options.prepareRuntime?.(this.runtimeDirectory);
     await this.ensureInitialized();
@@ -148,23 +169,36 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
 
     const child = spawn(process.execPath, [this.cliPath], {
       cwd: this.runtimeDirectory,
-      env: {
-        ...process.env,
-        CI: "1",
-        AGENTMEMORY_USE_DOCKER: this.options.useDocker === false ? "0" : "1",
-        ...(this.options.env ?? {})
-      },
+      env: this.runtimeEnvironment(),
       windowsHide: true,
-      stdio: ["ignore", "ignore", "ignore"]
+      stdio: ["ignore", "pipe", "pipe"]
     });
     this.child = child;
     this.ownsRuntime = true;
-    child.once("exit", () => {
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      this.stdoutTail = appendOutputTail(this.stdoutTail, chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      this.stderrTail = appendOutputTail(this.stderrTail, chunk);
+    });
+    child.once("error", (error) => {
+      if (!this.closing) this.startupFailureValue = error;
+      if (this.child === child) this.child = undefined;
+    });
+    child.once("exit", (code, signal) => {
+      if (!this.closing) {
+        this.startupFailureValue = new Error(this.formatProcessExit(code, signal));
+      }
       if (this.child === child) this.child = undefined;
     });
   }
 
+  startupFailure(): Error | undefined {
+    return this.startupFailureValue;
+  }
+
   async close(): Promise<void> {
+    this.closing = true;
     const child = this.child;
     this.child = undefined;
     if (child && child.exitCode === null && !child.killed) {
@@ -174,6 +208,31 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
     if (!this.ownsRuntime) return;
     this.ownsRuntime = false;
     await this.stopRuntime().catch(() => undefined);
+  }
+
+  private runtimeEnvironment(): NodeJS.ProcessEnv {
+    const environment: NodeJS.ProcessEnv = {
+      ...process.env,
+      CI: "1",
+      ...(this.options.env ?? {})
+    };
+    if (this.options.useDocker !== undefined) {
+      environment.AGENTMEMORY_USE_DOCKER = this.options.useDocker ? "1" : "0";
+    }
+    return environment;
+  }
+
+  private formatProcessExit(code: number | null, signal: NodeJS.Signals | null): string {
+    const reason = signal
+      ? `was terminated by ${signal}`
+      : `exited with code ${code ?? "unknown"}`;
+    const diagnostics = [
+      this.stderrTail.trim() ? `stderr:\n${this.stderrTail.trim()}` : "",
+      this.stdoutTail.trim() ? `stdout:\n${this.stdoutTail.trim()}` : ""
+    ].filter(Boolean).join("\n");
+    return diagnostics
+      ? `AgentMemory process ${reason}.\n${diagnostics}`
+      : `AgentMemory process ${reason} without producing diagnostic output.`;
   }
 
   private async ensureInstalled(): Promise<void> {
@@ -245,17 +304,21 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
   private async stopRuntime(): Promise<void> {
     await execFileAsync(process.execPath, [this.cliPath, "stop", "--force"], {
       cwd: this.runtimeDirectory,
-      env: {
-        ...process.env,
-        CI: "1",
-        AGENTMEMORY_USE_DOCKER: this.options.useDocker === false ? "0" : "1",
-        ...(this.options.env ?? {})
-      },
+      env: this.runtimeEnvironment(),
       timeout: 120_000,
       maxBuffer: 2 * 1024 * 1024,
       windowsHide: true
     });
   }
+}
+
+const MAX_PROCESS_OUTPUT_CHARS = 16 * 1024;
+
+function appendOutputTail(current: string, chunk: Buffer | string): string {
+  const next = current + chunk.toString();
+  return next.length <= MAX_PROCESS_OUTPUT_CHARS
+    ? next
+    : next.slice(next.length - MAX_PROCESS_OUTPUT_CHARS);
 }
 
 function isWithin(parent: string, child: string): boolean {

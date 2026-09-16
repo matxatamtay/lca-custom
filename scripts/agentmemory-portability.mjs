@@ -258,6 +258,8 @@ export class ManagedAgentMemoryService {
     this.spawnImpl = options.spawn ?? spawn;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.pollMs = options.pollMs ?? 250;
+    this.useDocker = options.useDocker;
+    this.env = options.env ?? {};
   }
 
   async health() {
@@ -318,7 +320,7 @@ export class ManagedAgentMemoryService {
     try {
       const child = this.spawnImpl(process.execPath, [this.paths.memoryCliPath], {
         cwd: this.paths.memoryDirectory,
-        env: { ...process.env, CI: "1", AGENTMEMORY_USE_DOCKER: "1" },
+        env: this.runtimeEnvironment(),
         detached: true,
         windowsHide: true,
         stdio: ["ignore", fd, fd]
@@ -327,6 +329,18 @@ export class ManagedAgentMemoryService {
     } finally {
       closeSync(fd);
     }
+  }
+
+  runtimeEnvironment() {
+    const environment = {
+      ...process.env,
+      CI: "1",
+      ...this.env
+    };
+    if (this.useDocker !== undefined) {
+      environment.AGENTMEMORY_USE_DOCKER = this.useDocker ? "1" : "0";
+    }
+    return environment;
   }
 
   async waitForReady() {
