@@ -2,15 +2,15 @@ import { z } from "zod";
 import { callCoolifyMcpTool, coolifyMcpStatus, listCoolifyMcpTools } from "../coolify-mcp.mjs";
 
 export function createCoolifyToolRegistrar(options) {
-  const { reg, jsonResult, COOLIFY_MCP_URL, COOLIFY_MCP_TIMEOUT_MS, COOLIFY_MCP_AUTH_TOKEN } = options;
+  const { reg, jsonResult, COOLIFY_BASE_URL, COOLIFY_MCP_TIMEOUT_MS, COOLIFY_ACCESS_TOKEN } = options;
 
   function registerCoolifyMcpTools(mcp) {
     const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true };
     const mutation = { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false };
     const bridgeOptions = {
-      endpoint: COOLIFY_MCP_URL,
+      baseUrl: COOLIFY_BASE_URL,
       timeoutMs: COOLIFY_MCP_TIMEOUT_MS,
-      authToken: COOLIFY_MCP_AUTH_TOKEN
+      accessToken: COOLIFY_ACCESS_TOKEN
     };
 
     reg(
@@ -36,7 +36,7 @@ export function createCoolifyToolRegistrar(options) {
       },
       async () => {
         const result = await listCoolifyMcpTools(bridgeOptions);
-        return jsonResult({ endpoint: COOLIFY_MCP_URL, count: result.tools.length, tools: result.tools });
+        return jsonResult({ base_url: COOLIFY_BASE_URL, count: result.tools.length, tools: result.tools });
       }
     );
 

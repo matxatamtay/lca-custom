@@ -2,27 +2,37 @@ import { z } from "zod";
 
 export function createCompanionMcp(options) {
   const {
-    COMPANION_QUICK_ACTIONS, COMPANION_WIDGET_RESOURCE, COMPANION_WIDGET_URI,
+    COMPANION_QUICK_ACTIONS, COMPANION_WIDGET_LEGACY_URI, COMPANION_WIDGET_RESOURCE, COMPANION_WIDGET_URI,
     DBEAVER_SQL_ARTIFACT_LEGACY_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, DBEAVER_SQL_ARTIFACT_URI,
-    PRIMARY_ROOT, ROOTS, WORKFLOW_COMMANDS, composeLcaPrompt, reg, resolvePath, slashCommandData,
-    structuredJsonResult, workspaceSearchData
+    NOTION_PAGE_WIDGET_LEGACY_URI, NOTION_PAGE_WIDGET_MIME_TYPE, NOTION_PAGE_WIDGET_RESOURCE, NOTION_PAGE_WIDGET_URI,
+    CONVERSATION_RUNTIME, PRIMARY_ROOT, ROOTS, WORKFLOW_COMMANDS, activeDiscoveryRoots,
+    composeLcaPrompt, reg, resolvePath, slashCommandData, structuredJsonResult, workspaceSearchData
   } = options;
 
-  function widgetResourcePayload(uri, resource, description) {
+  function widgetResourcePayload(uri, resource, description, {
+    mimeType = "text/html;profile=mcp-app",
+    redirectDomains = [],
+    resourceDomains = []
+  } = {}) {
+    const legacyCsp = {
+      connect_domains: [],
+      resource_domains: resourceDomains,
+      ...(redirectDomains.length ? { redirect_domains: redirectDomains } : {})
+    };
     return {
       contents: [
         {
           uri,
-          mimeType: "text/html;profile=mcp-app",
+          mimeType,
           text: resource.text,
           _meta: {
             ui: {
               prefersBorder: true,
-              csp: { connectDomains: [], resourceDomains: [] }
+              csp: { connectDomains: [], resourceDomains }
             },
             "openai/widgetDescription": description,
             "openai/widgetPrefersBorder": true,
-            "openai/widgetCSP": { connect_domains: [], resource_domains: [] }
+            "openai/widgetCSP": legacyCsp
           }
         }
       ]
@@ -32,11 +42,18 @@ export function createCompanionMcp(options) {
   function registerCompanionAppResources(mcp) {
     const companionDescription = "Compact LCA input composer for PiP: one low-height prompt box with @ context, / workflow autocomplete, Enter-to-send, and token highlights.";
     const sqlArtifactDescription = "Interactive SQL artifact for DBeaver with Open, native-confirmed Run, Explain, and Save Snippet actions.";
+    const notionPageDescription = "Interactive Notion page viewer/editor with search, safe Markdown save, staged AI edit proposals, side-by-side synchronized diff review, explicit Apply approval, block/text selection, Add to ChatGPT, PiP, and fullscreen mode.";
     mcp.registerResource(
       "lca-companion-widget",
       COMPANION_WIDGET_URI,
       {},
       async () => widgetResourcePayload(COMPANION_WIDGET_URI, COMPANION_WIDGET_RESOURCE, companionDescription)
+    );
+    mcp.registerResource(
+      "lca-companion-widget-legacy",
+      COMPANION_WIDGET_LEGACY_URI,
+      {},
+      async () => widgetResourcePayload(COMPANION_WIDGET_LEGACY_URI, COMPANION_WIDGET_RESOURCE, companionDescription)
     );
     mcp.registerResource(
       "dbeaver-sql-artifact-widget",
@@ -49,6 +66,28 @@ export function createCompanionMcp(options) {
       DBEAVER_SQL_ARTIFACT_LEGACY_URI,
       {},
       async () => widgetResourcePayload(DBEAVER_SQL_ARTIFACT_LEGACY_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, sqlArtifactDescription)
+    );
+    const notionResourceOptions = {
+      mimeType: NOTION_PAGE_WIDGET_MIME_TYPE,
+      redirectDomains: ["https://app.notion.com"],
+      resourceDomains: [
+        "https://s3-us-west-2.amazonaws.com",
+        "https://prod-files-secure.s3.us-west-2.amazonaws.com",
+        "https://file.notion.so",
+        "https://www.notion.so"
+      ]
+    };
+    mcp.registerResource(
+      "notion-page-widget",
+      NOTION_PAGE_WIDGET_URI,
+      {},
+      async () => widgetResourcePayload(NOTION_PAGE_WIDGET_URI, NOTION_PAGE_WIDGET_RESOURCE, notionPageDescription, notionResourceOptions)
+    );
+    mcp.registerResource(
+      "notion-page-widget-legacy",
+      NOTION_PAGE_WIDGET_LEGACY_URI,
+      {},
+      async () => widgetResourcePayload(NOTION_PAGE_WIDGET_LEGACY_URI, NOTION_PAGE_WIDGET_RESOURCE, notionPageDescription, notionResourceOptions)
     );
   }
 
@@ -68,7 +107,7 @@ export function createCompanionMcp(options) {
         }
       },
       async ({ query = "", path: rel, include, limit = 30 }) => {
-        const rootDirs = rel ? [resolvePath(rel)] : ROOTS;
+        const rootDirs = rel ? [resolvePath(rel)] : activeDiscoveryRoots();
         const result = await workspaceSearchData(rootDirs, query, { include, limit });
         return structuredJsonResult(result);
       }
@@ -109,8 +148,14 @@ export function createCompanionMcp(options) {
         }
       },
       async ({ input, path: rel, mode, selected_context = [], include_context_pack = true }) => {
-        const rootDirs = rel ? [resolvePath(rel)] : ROOTS;
-        const result = await composeLcaPrompt(input, rootDirs, { mode, selectedContext: selected_context, includeContextPack: include_context_pack });
+        const conversationPrimary = rel ? resolvePath(rel) : CONVERSATION_RUNTIME.scopedPrimaryRoot();
+        const rootDirs = rel ? [conversationPrimary] : activeDiscoveryRoots();
+        const result = await composeLcaPrompt(input, rootDirs, {
+          mode,
+          selectedContext: selected_context,
+          includeContextPack: include_context_pack,
+          conversationPrimary
+        });
         return structuredJsonResult(result);
       }
     );
@@ -127,7 +172,8 @@ export function createCompanionMcp(options) {
         description,
         annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
         inputSchema: {
-          initial_input: z.string().optional().describe("Optional text to prefill in the companion composer.")
+          initial_input: z.string().optional().describe("Optional text to prefill in the companion composer."),
+          primary_project: z.string().optional().describe("Optional project or nested folder to preselect for this rendered conversation input. This never changes the global LCA primary project.")
         },
         _meta: {
           ui: { resourceUri: COMPANION_WIDGET_URI, visibility: ["model", "app"] },
@@ -137,10 +183,14 @@ export function createCompanionMcp(options) {
           "openai/toolInvocation/invoked": "LCA input ready."
         }
       },
-      async ({ initial_input = "" }) => {
+      async ({ initial_input = "", primary_project }) => {
+        const primaryProject = CONVERSATION_RUNTIME.normalize(primary_project);
         const payload = {
           initial_input,
           workspace: PRIMARY_ROOT,
+          global_primary: PRIMARY_ROOT,
+          primary_project: primaryProject || null,
+          scope_mode: primaryProject ? "conversation-project" : "all-projects",
           projects: ROOTS,
           shortcuts: WORKFLOW_COMMANDS
             .filter(({ name }) => COMPANION_QUICK_ACTIONS.has(name))
@@ -148,7 +198,11 @@ export function createCompanionMcp(options) {
         };
         return {
           structuredContent: payload,
-          content: [{ type: "text", text: "LCA input is ready. Request PiP to keep it visible when supported, use @ for context, / for workflows or skills, or the Plan quick action." }]
+          content: [{ type: "text", text: "LCA input is ready. Choose a conversation project to scope relative paths and default discovery, or keep All projects for normal multi-project surf. The global LCA primary is unchanged." }],
+          _meta: {
+            ui: { resourceUri: COMPANION_WIDGET_URI },
+            "openai/outputTemplate": COMPANION_WIDGET_URI
+          }
         };
       }
     );

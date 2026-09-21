@@ -108,7 +108,7 @@ export class BuildTaskContext {
       root: normalizedRequest.root,
       generatedAt: this.now().toISOString(),
       coverage,
-      evidence: mergeEvidence(reranked.results, normalizedRequest.budget?.maxItems ?? 50),
+      evidence: mergeEvidence(reranked.results, normalizedRequest),
       ...(reranked.ranking ? { ranking: reranked.ranking } : {})
     };
   }
@@ -226,7 +226,12 @@ function isConfidentJevNoise(evidence: ContextEvidence): boolean {
   return score === 0 && Number.isFinite(confidence) && confidence >= 0 && confidence <= 1;
 }
 
-function mergeEvidence(results: readonly ProviderResult[], maxItems: number): readonly ContextEvidence[] {
+function mergeEvidence(results: readonly ProviderResult[], request: TaskContextRequest): readonly ContextEvidence[] {
+  const maxItems = Math.max(1, request.budget?.maxItems ?? 50);
+  const maxChars = Math.max(1_000, request.budget?.maxChars ?? 100_000);
+  const taskTerms = extractTaskTerms(request.task);
+  const graphHints = buildGraphHints(results);
+  const changedFiles = new Set((request.changedFiles ?? []).map(normalizePath));
   const deduplicated = new Map<string, ContextEvidence>();
 
   for (const result of results) {
@@ -361,6 +366,7 @@ function extractTaskTerms(task: string): readonly string[] {
 function providerItemCaps(maxItems: number): Readonly<Record<ContextProviderName, number>> {
   return {
     filesystem: Math.max(1, Math.ceil(maxItems * 0.5)),
+    semantic: Math.max(1, Math.ceil(maxItems * 0.35)),
     codegraph: Math.max(1, Math.ceil(maxItems * 0.35)),
     agentmemory: Math.max(1, Math.ceil(maxItems * 0.2))
   };

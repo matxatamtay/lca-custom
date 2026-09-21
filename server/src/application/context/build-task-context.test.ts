@@ -172,12 +172,11 @@ test("keeps evidence from every provider and ranks current filesystem evidence f
   const result = await useCase.execute({ task: "Find statistics endpoint", root: "/repo" });
 
   assert.equal(result.evidence.length, 4);
-  assert.deepEqual(result.evidence.map((item) => item.provider), [
-    "filesystem",
-    "semantic",
-    "codegraph",
-    "agentmemory"
-  ]);
+  assert.equal(result.evidence[0]?.provider, "filesystem");
+  assert.deepEqual(
+    new Set(result.evidence.map((item) => item.provider)),
+    new Set(["filesystem", "semantic", "codegraph", "agentmemory"])
+  );
 });
 
 test("keeps provider evidence even when providers reuse the same external id", async () => {

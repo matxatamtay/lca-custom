@@ -148,23 +148,60 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       summary: "change_summary",
       session: "session_report"
     },
-    exact: new Set(["detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
+    exact: new Set(["verification_plan", "detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
+  },
+  workspace_agent: {
+    defaultAction: "agent_list",
+    aliases: {
+      capabilities: "agent_capabilities",
+      spawn: "agent_spawn",
+      parallel: "agent_spawn_parallel",
+      list: "agent_list",
+      collect: "agent_collect",
+      stop: "agent_stop",
+      merge: "agent_merge",
+      cleanup: "agent_cleanup",
+      recover: "agent_recover",
+      resume: "agent_resume",
+      followup: "agent_followup",
+      interrupt: "agent_interrupt",
+      dag: "agent_dag",
+      dag_collect: "agent_dag_collect",
+      dag_stop: "agent_dag_stop"
+    },
+    prefix: "agent_"
+  },
+  workspace_ui: {
+    defaultAction: "ui_status",
+    aliases: {
+      status: "ui_status",
+      browser_actions: "ui_browser_actions",
+      browser_call: "ui_browser_call",
+      devices: "ui_android_devices",
+      adb: "ui_android_adb",
+      screenshot: "ui_android_screenshot",
+      hierarchy: "ui_android_hierarchy",
+      input: "ui_android_input",
+      logcat: "ui_android_logcat",
+      record: "ui_android_record"
+    },
+    prefix: "ui_"
   },
   workspace_status: {
     defaultAction: "workspace_info",
     aliases: {
       info: "workspace_info",
       performance: "performance_follow",
+      performance_profile: "performance_profile",
+      trace: "tool_trace",
       doctor: "workspace_doctor",
       snapshot: "workspace_snapshot",
       profile: "project_profile",
       loaded_profile: "profile_status",
       reload_profile: "reload_profile",
-      ping: "ping",
-      performance: "performance_profile",
-      trace: "tool_trace"
+      ping: "ping"
     },
-    exact: new Set(["ping", "workspace_info", "performance_follow", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
+    exact: new Set(["ping", "workspace_info", "performance_follow", "performance_profile", "tool_trace", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
   },
   workspace_skill: {
     defaultAction: "list_skills",
@@ -246,6 +283,8 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   workspace_process: "Start, list, inspect output from, and stop managed background processes.",
   workspace_git: "Run Git commands, compact status/diffs, and LCA-managed isolated worktrees for parallel tasks.",
   workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, and session-report gates.",
+  workspace_agent: "Run delegated model agents, parallel/DAG execution, isolated worktrees, collection, merge, recovery, and cleanup actions.",
+  workspace_ui: "Inspect and control trusted-local browser tabs and connected Android devices.",
   workspace_status: "Inspect workspace, trusted runtime, project profile, dependency health, readiness state, and long-lived performance follow metrics.",
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
   figma: "Use Figma Remote MCP with OAuth and guarded canvas writes, plus the persistent Desktop fallback. Common actions: status, actions, call, auth, remote_status, remote_actions, remote_call, or an exact figma_* backend action.",
@@ -282,6 +321,7 @@ export function registerCompactMcpTools(
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question."),
+        project: z.string().optional().describe("Conversation-scoped primary project or folder selected in lca_input."),
         path: z.string().optional().describe("Root or subdirectory to inspect. When omitted, the backend may select a uniquely mentioned configured project from the task."),
         intent: z.enum(["understand", "debug", "implement", "refactor", "review"]).optional(),
         changed_files: z.array(z.string()).optional(),
@@ -381,9 +421,10 @@ export function compactDefinitionContains(definition: CompactGroupDefinition, to
 }
 
 export function facadeNames(): readonly CompactFacadeName[] {
+  const excluded = new Set<string>(["workspace_context", "lca_input", "notion_page"]);
   return TARGET_TOOL_CATALOG
     .map((tool) => tool.name)
-    .filter((name): name is CompactFacadeName => name !== "workspace_context" && name !== "lca_input" && name !== "notion_page");
+    .filter((name) => !excluded.has(name)) as readonly CompactFacadeName[];
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

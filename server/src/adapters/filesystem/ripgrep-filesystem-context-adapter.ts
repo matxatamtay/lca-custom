@@ -313,7 +313,6 @@ function parseRipgrepJson(
   changedFiles: readonly string[]
 ): readonly ContextEvidence[] {
   const evidence: ContextEvidence[] = [];
-  const changed = new Set((changedFiles ?? []).map((value) => normalizePathForMatch(path.resolve(root, value))));
   for (const line of stdout.split("\n")) {
     if (!line.trim()) continue;
     let event: unknown;
@@ -329,9 +328,6 @@ function parseRipgrepJson(
     const lineText = textValue(asRecord(data.lines))?.trimEnd() ?? "";
     const lineNumber = typeof data.line_number === "number" ? data.line_number : undefined;
     if (!relativePath || !lineText) continue;
-    const absolutePath = path.resolve(root, relativePath);
-    const score = filesystemEvidenceScore(relativePath, lineText, terms, changed.has(normalizePathForMatch(absolutePath)));
-
     const rerank = scoreFilesystemMatch(relativePath, lineText, search, changedFiles);
     evidence.push({
       id: `filesystem-${relativePath}:${lineNumber ?? 0}`,

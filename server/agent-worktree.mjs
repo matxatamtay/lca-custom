@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import { access, copyFile, lstat, mkdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -13,7 +13,7 @@ const DEFAULT_DIRTY_BYTES_LIMIT = 100 * 1024 * 1024;
 const OUTPUT_LIMIT = 200_000;
 
 export async function createAgentWorktree(input = {}) {
-  const cwd = path.resolve(String(input.cwd || process.cwd()));
+  const cwd = canonicalPath(input.cwd || process.cwd());
   const jobId = safeId(input.jobId || `job-${Date.now()}`);
   const sourceRoot = await gitRoot(cwd);
   const cwdRelative = safeRelative(sourceRoot, cwd, "Agent cwd");
@@ -216,7 +216,7 @@ async function gitRoot(cwd) {
   const result = await git(cwd, ["rev-parse", "--show-toplevel"]);
   const root = result.stdout.trim();
   if (!root) throw new Error(`No git repository found for delegated worktree cwd ${cwd}.`);
-  return path.resolve(root);
+  return canonicalPath(root);
 }
 
 async function removeWorktree(sourceRoot, worktreeRoot) {
@@ -265,10 +265,27 @@ function run(command, args, cwd, timeoutMs) {
 }
 
 function safeRelative(root, candidate, label) {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  const relative = path.relative(canonicalPath(root), canonicalPath(candidate));
   if (relative === "") return "";
   if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`${label} is outside git root: ${candidate}`);
   return relative;
+}
+
+function canonicalPath(value) {
+  const resolved = path.resolve(String(value));
+  let probe = resolved;
+  const suffix = [];
+  while (true) {
+    try {
+      const canonical = realpathSync.native ? realpathSync.native(probe) : realpathSync(probe);
+      return suffix.length ? path.join(canonical, ...suffix.reverse()) : canonical;
+    } catch {
+      const parent = path.dirname(probe);
+      if (parent === probe) return resolved;
+      suffix.push(path.basename(probe));
+      probe = parent;
+    }
+  }
 }
 
 function sameOrContains(scope, candidate) {
