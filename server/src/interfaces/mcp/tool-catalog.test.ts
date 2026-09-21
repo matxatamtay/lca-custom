@@ -6,7 +6,7 @@ import { TARGET_TOOL_CATALOG } from "./tool-catalog.js";
 test("target MCP surface stays compact and uniquely named", () => {
   const names = TARGET_TOOL_CATALOG.map((tool) => tool.name);
 
-  assert.ok(names.length <= 16, `expected at most 16 tools, received ${names.length}`);
+  assert.ok(names.length <= 20, `expected at most 20 tools, received ${names.length}`);
   assert.equal(new Set(names).size, names.length, "tool names must be unique");
 });
 

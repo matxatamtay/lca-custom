@@ -30,7 +30,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
     { name: "Local Browser Agent", version: VERSION },
     {
       instructions:
-        "Chromium visual review, Cheerio scraping, and control agent. Start with browser_status and browser_list_tabs. Use browser_review for screenshot, HTML, DOM, computed CSS, layout, console, network, performance, accessibility, and DevTools state. Use browser_scrape to query the live page markup with Cheerio selectors, and browser_click_match to select the Nth Cheerio match and click it with trusted CDP input when available. Use browser_navigate and browser_interact only on a tab explicitly approved for full control. Read browser://capture/{captureId}/{artifact} resources or call browser_capture_read for large artifacts. Default results redact common secrets and omit historical request/response bodies."
+        "Chromium visual review, Cheerio scraping, and control agent for a trusted local runtime. Start with browser_status and browser_list_tabs. Use browser_review for screenshot, HTML, DOM, computed CSS, layout, console, network, performance, accessibility, and DevTools state. Use browser_scrape to query the live page markup with Cheerio selectors, and browser_click_match to select the Nth Cheerio match and click it with trusted CDP input when available. Ordinary HTTP/HTTPS tabs are directly controllable without a per-tab approval round-trip. Read browser://capture/{captureId}/{artifact} resources or call browser_capture_read for large artifacts."
     }
   );
 
@@ -63,7 +63,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
     capturePolicy: {
       readOnly: false,
       fullTabControl: true,
-      approvalScope: "approved tab until expiry or tab close",
+      approvalScope: "trusted-local automatic HTTP/HTTPS tab control",
       bodiesDefault: "none",
       redactionDefault: true,
       incognitoDefault: false
@@ -72,7 +72,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
 
   register(mcp, "browser_list_tabs", {
     title: "List browser tabs",
-    description: "List tabs explicitly approved for visual capture and browser control.",
+    description: "List HTTP/HTTPS tabs available for visual capture and browser control in trusted-local mode.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     inputSchema: {}
   }, async () => await bridge.sendCommand("listTabs"));
@@ -127,7 +127,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
 
   register(mcp, "browser_scrape", {
     title: "Scrape page with Cheerio",
-    description: "Capture sanitized live HTML from an approved tab, query it with a Cheerio CSS selector, optionally filter by text, and return stable selectors plus extracted text, HTML, attributes, links, and sources.",
+    description: "Capture live HTML from a controllable HTTP/HTTPS tab, query it with a Cheerio CSS selector, optionally filter by text, and return stable selectors plus extracted text, HTML, attributes, links, and sources.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: false },
     inputSchema: {
       target: TabTargetSchema.optional(),
@@ -243,7 +243,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
 
   register(mcp, "browser_navigate", {
     title: "Navigate browser tab",
-    description: "Navigate an approved tab to an HTTP or HTTPS URL, wait for page readiness, collect navigation debug signals, and optionally capture the resulting screen.",
+    description: "Navigate a controllable tab to an HTTP or HTTPS URL, wait for page readiness, collect navigation debug signals, and optionally capture the resulting screen.",
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
     inputSchema: {
       target: TabTargetSchema.optional(),
@@ -263,7 +263,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
 
   register(mcp, "browser_interact", {
     title: "Interact with browser tab",
-    description: "Inspect, click, hover, focus, type, press keys, scroll, select options, or wait in an approved tab. By default it captures the resulting screen and debug context.",
+    description: "Inspect, click, hover, focus, type, press keys, scroll, select options, or wait in a controllable HTTP/HTTPS tab. By default it captures the resulting screen and debug context.",
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
     inputSchema: {
       target: TabTargetSchema.optional(),

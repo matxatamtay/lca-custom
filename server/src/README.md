@@ -17,6 +17,6 @@ Core rules:
 2. CodeGraph and AgentMemory remain mandatory context providers; native semantic analysis runs alongside them and degrades explicitly when a language backend is unavailable.
 3. `workspace_context` must produce a coverage receipt proving filesystem, semantic analysis, CodeGraph, and AgentMemory were queried.
 4. Provider failures are surfaced explicitly. There is no silent fallback that pretends context is complete.
-5. The target ChatGPT-facing MCP surface stays at sixteen tools or fewer.
+5. The target ChatGPT-facing MCP surface stays at twenty tools or fewer.
 
 `BuildTaskContext` combines current filesystem evidence, language-native semantic evidence, CodeGraph relationships, and AgentMemory. TypeScript/JavaScript uses the persistent TypeScript 7 native API, Dart/Flutter uses a persistent Dart Analysis Server LSP session with background prewarming, and Java uses persistent Eclipse JDT LS with project-isolated workspace data. Semantic cold starts report `warming` rather than blocking the required context lanes.

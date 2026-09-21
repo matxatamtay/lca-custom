@@ -42,9 +42,23 @@ await call("apply_patch", {
     { op: "update", path: "demo/hello.js", edits: [{ old_text: "hi from", new_text: "greetings from" }] }
   ]
 });
+const shorthandPatch = JSON.parse(await call("apply_patch", {
+  operations: [{ op: "update", path: "demo/hello.js", old_text: "greetings from", new_text: "shorthand from" }]
+}));
+if (shorthandPatch.ok !== true || shorthandPatch.results?.[0]?.replacements !== 1) {
+  fail++;
+  console.log("[FAIL] structured update shorthand must apply exactly one replacement");
+}
+const emptyUpdate = JSON.parse(await call("apply_patch", {
+  operations: [{ op: "update", path: "demo/hello.js" }]
+}));
+if (emptyUpdate.ok !== false || emptyUpdate.results?.[0]?.ok !== false) {
+  fail++;
+  console.log("[FAIL] structured update without edits must fail instead of returning replacements=0");
+}
 await call("make_dir", { path: "demo/newdir" });
 await call("stat_path", { path: "demo/hello.js" });
-await call("search_text", { query: "greetings", path: "demo" });
+await call("search_text", { query: "shorthand", path: "demo" });
 await call("list_files", { path: "demo", recursive: true });
 await call("read_many", { paths: ["demo/hello.js", "demo/pkg/util.js", "demo/does-not-exist.js"] });
 await call("read_many", {
@@ -79,13 +93,16 @@ const startText = await call("proc_start", {
   name: "ticker"
 });
 const id = JSON.parse(startText).id;
-await new Promise((r) => setTimeout(r, 700));
+await call("proc_wait", { id, condition: "stdout_regex", pattern: "tick", timeout_ms: 5000 });
 await call("proc_list", {});
 await call("proc_output", { id });
 await call("proc_stop", { id });
 
 // git (exercise; --version always works)
 await call("git", { args: ["--version"] });
+await call("verification_plan", { cwd: "." });
+await call("performance_profile", {});
+await call("tool_trace", { limit: 10 });
 
 // Trusted runtime: absolute paths outside configured projects are supported.
 const absoluteFile = path.join(os.tmpdir(), `lca-absolute-${process.pid}.txt`);

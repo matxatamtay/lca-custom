@@ -13,6 +13,8 @@ workspace_exec
 workspace_process
 workspace_git
 workspace_verify
+workspace_agent
+workspace_ui
 workspace_status
 workspace_skill
 figma
@@ -20,11 +22,15 @@ dbeaver
 bruno
 coolify
 lca_input
+notion_page
 ```
 
 Use `workspace_context` first for coding tasks. It always fans out to current filesystem search, native semantic analysis, CodeGraph, and AgentMemory and returns per-provider coverage. The default context pack is intentionally compact (10 items / ~12k chars), includes bounded source slices plus `execution_hints.likely_reads`, and can attach a cached changed-file verification hint. Use `action=discover` on a facade only when its exact backend actions are needed.
 
 Actions execute directly without mode, policy, or approval turns. Project roots support discovery and relative paths; absolute paths are accepted. LCA is not an OS sandbox.
+
+
+`lca_input` can select a conversation-scoped primary project. The widget persists that selection for its rendered chat UI, and compact tools accept a top-level `project` envelope field. Scoped calls resolve relative paths and default discovery from that folder while explicit absolute paths can still reach another configured project. Omitting `project` preserves the existing multi-root behavior and never changes the daemon/TUI global primary root.
 
 ## Terminal UI
 
@@ -75,7 +81,13 @@ None of these context engines is exposed as a separate ChatGPT tool surface. The
 
 ## MCP integrations
 
-Figma, DBeaver, Bruno, and the remote Coolify MCP use persistent Streamable HTTP clients. Connections and `tools/list` responses are reused, concurrent connects are deduplicated, retryable transport failures reconnect once, and all clients close during graceful server exit. Coolify transport credentials come only from `COOLIFY_MCP_AUTH_TOKEN` and are never returned in status results.
+Figma, DBeaver, Bruno, and Penpot use persistent MCP clients. Coolify runs the pinned `@masonator/coolify-mcp` package as a persistent local stdio child process. Notion uses the official REST API through `NOTION_API_KEY` and exposes both the compact `notion` facade and the direct `notion_page` Apps SDK widget. Penpot and Coolify execute directly in trusted-local mode; DBeaver, Bruno, and Notion preserve their integration-specific protection semantics. Notion full-page Markdown replacement keeps optimistic conflict detection and child-content deletion disabled unless explicitly requested.
+
+## Runtime trajectory and delegated agents
+
+Every backend action runs through `ActionExecutionPipeline`. The append-only runtime source of truth is `data/workspaces/<id>/runtime/events.jsonl`; ToolMetrics, AgentMemory observations, the `workspace_status action=trace` trajectory, and optional OTLP export are consumers of that event stream. Delegated Codex work defaults to `danger-full-access` with network access enabled inside isolated Git worktrees, while merge remains conflict-checked. Agent/DAG descriptors are persisted so a restart reconstructs completed, recoverable, or orphaned work instead of losing lifecycle state.
+
+`workspace_exec action=code` runs a TypeScript orchestration program in a fresh bounded worker. Its curated LCA bindings re-enter the ordinary hidden backend pipeline, so nested reads, edits, commands, verification, agents, and UI actions keep normal tracing and correctness checks.
 
 ### DBeaver SQL flow
 
@@ -105,11 +117,15 @@ Direct model-style preparation or execution without the widget capability is rej
 | `AGENT_READ_DEFAULT` | `30000` | Default per-file response budget. |
 | `AGENT_MAX_BATCH_READ_CHARS` | `500000` | Combined `read_many` budget. |
 | `AGENT_CMD_OUTPUT_DEFAULT` | `20000` | Default foreground command output budget. |
+| `AGENT_MEMORY_VAULT` | platform data directory | Obsidian-compatible persistent vault containing global, project, and task notes. |
 | `AGENTMEMORY_URL` | `http://127.0.0.1:3111` | Managed AgentMemory endpoint. |
 | `AGENTMEMORY_RECORD_SESSIONS` | `1` | Set `0` for isolated tests or stateless runs. |
 | `FIGMA_DESKTOP_MCP_URL` | `http://127.0.0.1:3845/mcp` | Figma Desktop MCP. |
 | `DBEAVER_DESKTOP_MCP_URL` | `http://127.0.0.1:3846/mcp` | DBeaver Desktop MCP. |
 | `BRUNO_DESKTOP_MCP_URL` | `http://127.0.0.1:3847/mcp` | Bruno Desktop MCP. |
+| `PENPOT_MCP_URL` | `http://127.0.0.1:9001/mcp/stream` | Local Penpot MCP endpoint without credentials. |
+| `PENPOT_USER_TOKEN` | empty | Generated Penpot MCP user token; store only in `.env.local`. |
+| `PENPOT_MCP_TIMEOUT_MS` | `120000` | Penpot tool timeout. |
 
 ## Tests
 
@@ -117,4 +133,4 @@ Direct model-style preparation or execution without the widget capability is rej
 npm run test:all
 ```
 
-Focused gates include `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
+Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:penpot`, `test:coolify`, `test:notion`, `test:notion:widget`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.

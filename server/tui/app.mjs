@@ -7,7 +7,16 @@ import path from "node:path";
 
 import blessed from "neo-blessed";
 
+import { readClipboardText } from "./clipboard.mjs";
 import { directoryPickerRows, nextPickerDirectory } from "./folder-picker.mjs";
+import {
+  isSecretEnvKey,
+  isValidEnvKey,
+  maskedEnvValue,
+  readEnvConfig,
+  removeEnvKeys,
+  updateEnvConfig
+} from "./env-config.mjs";
 import { fuzzyFilter } from "./palette.mjs";
 import { THEME } from "./theme.mjs";
 import {
@@ -67,6 +76,7 @@ export class LcaTuiApp {
     this.version = options.version || "4.4.0-pro";
     this.repoRoot = path.resolve(options.repoRoot);
     this.configPath = path.resolve(options.configPath);
+    this.envPath = path.resolve(options.envPath || path.join(this.repoRoot, ".env.local"));
     this.statePath = path.resolve(options.statePath || defaultTuiStatePath(this.configPath));
     this.logPaths = options.logPaths || {};
     this.primaryRoot = path.resolve(options.workspace || this.repoRoot);

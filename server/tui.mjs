@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { runLcaTui } from "./tui/app.mjs";
 import { LcaTuiClient } from "./tui/client.mjs";
+import { loadEnvFileValues } from "./tui/env-config.mjs";
 import { LauncherBridge } from "./tui/launcher-bridge.mjs";
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +19,8 @@ const CLI_SCRIPT = process.env.LCA_TUI_CLI_SCRIPT || path.join(REPO_ROOT, "scrip
 const ENDPOINT = process.env.LCA_TUI_ENDPOINT || "http://127.0.0.1:8790/mcp";
 const WORKSPACE = process.env.LCA_TUI_WORKSPACE || REPO_ROOT;
 const SERVER_DATA = process.env.LCA_TUI_SERVER_DATA || path.join(APP_DIR, "data");
+const ENV_PATH = process.env.LCA_TUI_ENV_PATH || path.join(REPO_ROOT, ".env.local");
+const INITIAL_ENV_KEYS = Object.keys(await loadEnvFileValues(ENV_PATH).catch(() => ({})));
 
 if (!process.stdin.isTTY || !process.stdout.isTTY) {
   console.error("ERROR: lca-custom tui requires an interactive terminal.");
@@ -33,7 +36,9 @@ const client = new LcaTuiClient({
 const launcher = new LauncherBridge({
   scriptPath: CLI_SCRIPT,
   cwd: REPO_ROOT,
-  configPath: CONFIG_PATH
+  configPath: CONFIG_PATH,
+  envPath: ENV_PATH,
+  managedEnvKeys: INITIAL_ENV_KEYS
 });
 
 try {
@@ -44,6 +49,7 @@ try {
     repoRoot: REPO_ROOT,
     configPath: CONFIG_PATH || path.join(REPO_ROOT, "cli-config.json"),
     workspace: WORKSPACE,
+    envPath: ENV_PATH,
     logPaths: {
       launcher: process.env.LCA_TUI_LAUNCHER_LOG || "",
       lifecycle: path.join(SERVER_DATA, "lifecycle.log"),

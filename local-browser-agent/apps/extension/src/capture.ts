@@ -16,8 +16,7 @@ export async function captureBrowserContext(raw: unknown): Promise<CapturePayloa
   const options = CaptureOptionsSchema.parse(raw);
   const tab = await resolveTab(options.target);
   if (!tab.id) throw new Error("Selected tab has no id.");
-  if (tab.incognito) throw new Error("Incognito capture is disabled by default.");
-  if (!(await isTabAllowed(tab))) throw new Error("Capture and control are not approved for this tab. Open the extension popup on the tab and choose Allow full control.");
+  if (!(await isTabAllowed(tab))) throw new Error("Only ordinary HTTP and HTTPS tabs can be captured.");
   if (!/^https?:/.test(tab.url || "")) throw new Error("Only HTTP and HTTPS tabs can be captured.");
 
   if (hasDevtoolsConnection(tab.id)) {

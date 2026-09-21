@@ -29,7 +29,7 @@ interface CompactGroupDefinition {
 
 export type CompactFacadeName = Exclude<
   (typeof TARGET_TOOL_CATALOG)[number]["name"],
-  "workspace_context" | "lca_input"
+  "workspace_context" | "lca_input" | "notion_page"
 >;
 
 export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, CompactGroupDefinition>> = Object.freeze({
@@ -44,14 +44,38 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       overview: "repo_overview",
       important: "important_files",
       index: "index_status",
-      todos: "todo_scan"
+      todos: "todo_scan",
+      definition: "code_definition",
+      references: "code_references",
+      diagnostics: "code_diagnostics",
+      rename: "code_rename_symbol",
+      organize_imports: "code_organize_imports"
     },
-    exact: new Set(["workspace_search", "search_text", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan"])
+    exact: new Set([
+      "workspace_search", "search_text", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan",
+      "code_definition", "code_references", "code_diagnostics", "code_rename_symbol", "code_organize_imports"
+    ])
   },
   workspace_read: {
     defaultAction: "read_many",
-    aliases: { one: "read_file", many: "read_many", stat: "stat_path", list: "list_files", notes: "list_notes", resume: "resume" },
-    exact: new Set(["read_file", "read_many", "stat_path", "list_files", "list_notes", "resume"])
+    aliases: {
+      one: "read_file",
+      many: "read_many",
+      stat: "stat_path",
+      list: "list_files",
+      notes: "list_notes",
+      resume: "resume",
+      memory: "memory_status",
+      contexts: "context_list",
+      context: "context_explain",
+      brief: "task_brief_get",
+      intent: "intent_check",
+      handoff: "handoff_packet"
+    },
+    exact: new Set([
+      "read_file", "read_many", "stat_path", "list_files", "list_notes", "resume",
+      "memory_status", "context_list", "context_explain", "task_brief_get", "intent_check", "handoff_packet"
+    ])
   },
   workspace_edit: {
     defaultAction: "apply_patch",
@@ -70,18 +94,27 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       checkpoint: "checkpoint",
       decision: "decision_log",
       plan: "task_plan",
-      state: "task_state"
+      state: "task_state",
+      pin_context: "context_pin",
+      remove_context: "context_remove",
+      brief: "task_brief",
+      scope: "scope_guard",
+      knowledge: "knowledge_state"
     },
-    exact: new Set(["apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file", "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state"])
+    exact: new Set([
+      "apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file",
+      "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state",
+      "context_pin", "context_remove", "task_brief", "scope_guard", "knowledge_state"
+    ])
   },
   workspace_exec: {
     defaultAction: "run_commands",
-    aliases: { one: "run_command", many: "run_commands" },
-    exact: new Set(["run_command", "run_commands"])
+    aliases: { one: "run_command", many: "run_commands", parallel: "parallel_tasks", code: "run_code" },
+    exact: new Set(["run_command", "run_commands", "parallel_tasks", "run_code"])
   },
   workspace_process: {
     defaultAction: "proc_list",
-    aliases: { start: "proc_start", list: "proc_list", output: "proc_output", stop: "proc_stop" },
+    aliases: { start: "proc_start", list: "proc_list", output: "proc_output", wait: "proc_wait", stop: "proc_stop" },
     prefix: "proc_"
   },
   workspace_git: {
@@ -102,6 +135,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   workspace_verify: {
     defaultAction: "quality_gate",
     aliases: {
+      plan: "verification_plan",
       detect: "detect_test_commands",
       gate: "quality_gate",
       tests: "run_tests",
@@ -126,7 +160,9 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       profile: "project_profile",
       loaded_profile: "profile_status",
       reload_profile: "reload_profile",
-      ping: "ping"
+      ping: "ping",
+      performance: "performance_profile",
+      trace: "tool_trace"
     },
     exact: new Set(["ping", "workspace_info", "performance_follow", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
   },
@@ -159,10 +195,46 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
     aliases: { status: "bruno_status", actions: "bruno_list_tools", call: "bruno_call_tool", run: "bruno_run_request" },
     prefix: "bruno_"
   },
+  penpot: {
+    defaultAction: "penpot_status",
+    aliases: {
+      status: "penpot_status",
+      actions: "penpot_list_tools",
+      call: "penpot_call_tool",
+      read: "penpot_read_tool",
+      inspect: "penpot_inspect_page",
+      selection: "penpot_inspect_selection",
+      export: "penpot_export_shape",
+      mutate: "penpot_execute_code",
+      destructive: "penpot_execute_destructive_code"
+    },
+    prefix: "penpot_"
+  },
   coolify: {
     defaultAction: "coolify_status",
-    aliases: { status: "coolify_status", actions: "coolify_list_tools", call: "coolify_call_tool" },
+    aliases: {
+      status: "coolify_status",
+      actions: "coolify_list_tools",
+      call: "coolify_call_tool",
+      read: "coolify_read_tool",
+      mutate: "coolify_mutate_tool",
+      destructive: "coolify_destructive_tool"
+    },
     prefix: "coolify_"
+  },
+  notion: {
+    defaultAction: "notion_status",
+    aliases: {
+      status: "notion_status",
+      actions: "notion_capabilities",
+      search: "notion_search",
+      fetch: "notion_fetch_page",
+      create: "notion_create_page",
+      update: "notion_update_markdown",
+      replace: "notion_replace_markdown",
+      call: "notion_call"
+    },
+    prefix: "notion_"
   }
 });
 
@@ -179,7 +251,9 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   figma: "Use Figma Remote MCP with OAuth and guarded canvas writes, plus the persistent Desktop fallback. Common actions: status, actions, call, auth, remote_status, remote_actions, remote_call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",
   bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action.",
-  coolify: "Use the configured remote Coolify MCP integration. Common actions: status, actions, call, or an exact coolify_* backend action."
+  penpot: "Use the local Penpot MCP integration. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.",
+  coolify: "Use the pinned local Coolify MCP stdio integration. Common actions: status, actions, read, mutate, destructive, call, or an exact coolify_* backend action.",
+  notion: "Use the Notion REST API integration. Common actions: status, actions, search, fetch, create, update, replace, call, or an exact notion_* backend action. AI-generated edits must be staged through notion_page for preview and explicit Apply approval before update/replace is used."
 });
 
 export interface CompactMcpInterfaceDependencies {
@@ -189,7 +263,7 @@ export interface CompactMcpInterfaceDependencies {
     definition: Record<string, unknown>,
     handler: (args: Record<string, unknown>, extra?: unknown) => unknown | Promise<unknown>
   ): void;
-  callBackendTool(name: string, args?: Record<string, unknown>): Promise<unknown>;
+  callBackendTool(name: string, args?: Record<string, unknown>, project?: string): Promise<unknown>;
   listBackendTools(): Promise<readonly BackendToolDefinition[]>;
   registerLcaInputTool(mcp: McpServer, name: string, title: string, description: string): void;
   structuredJsonResult(value: unknown): unknown;
@@ -215,7 +289,10 @@ export function registerCompactMcpTools(
         max_chars: z.number().int().min(1000).max(100000).optional()
       }
     },
-    async (args) => dependencies.callBackendTool("workspace_context", args)
+    async (rawArgs) => {
+      const { project, ...args } = rawArgs;
+      return dependencies.callBackendTool("workspace_context", args, nonEmptyString(project));
+    }
   );
 
   for (const facade of facadeNames()) {
@@ -228,6 +305,7 @@ export function registerCompactMcpTools(
         description: `${COMPACT_TOOL_DESCRIPTIONS[facade]} Use action=discover to list exact backend actions and their input keys.`,
         inputSchema: {
           action: z.string().optional().describe(`Short alias or exact backend tool name. Default: ${definition.defaultAction}. Use discover for available actions.`),
+          project: z.string().optional().describe("Conversation-scoped primary project or folder selected in lca_input. Relative paths and default discovery use it only for this tool call."),
           arguments: z.record(z.any()).optional().describe("Arguments forwarded unchanged to the selected backend tool.")
         }
       },
@@ -240,7 +318,7 @@ export function registerCompactMcpTools(
           );
         }
         const hiddenTool = resolveCompactAction(facade, action, await dependencies.listBackendTools());
-        return dependencies.callBackendTool(hiddenTool, forwardedArguments);
+        return dependencies.callBackendTool(hiddenTool, forwardedArguments, nonEmptyString(rawArgs.project));
       }
     );
   }
@@ -305,7 +383,7 @@ export function compactDefinitionContains(definition: CompactGroupDefinition, to
 export function facadeNames(): readonly CompactFacadeName[] {
   return TARGET_TOOL_CATALOG
     .map((tool) => tool.name)
-    .filter((name): name is CompactFacadeName => name !== "workspace_context" && name !== "lca_input");
+    .filter((name): name is CompactFacadeName => name !== "workspace_context" && name !== "lca_input" && name !== "notion_page");
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

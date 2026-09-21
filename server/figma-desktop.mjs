@@ -23,10 +23,6 @@ export function normalizeFigmaDesktopEndpoint(value = process.env.FIGMA_DESKTOP_
   if (!["http:", "https:"].includes(url.protocol)) {
     throw new Error("FIGMA_DESKTOP_MCP_URL must use http or https.");
   }
-  const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(url.hostname);
-  if (!loopback && process.env.FIGMA_DESKTOP_ALLOW_REMOTE !== "1") {
-    throw new Error("Figma Desktop MCP must use a loopback address unless FIGMA_DESKTOP_ALLOW_REMOTE=1.");
-  }
   return url.toString();
 }
 

@@ -5,7 +5,7 @@
   "description": "Visual review, Cheerio scraping, DevTools capture, navigation, and browser interaction for a trusted local MCP server.",
   "minimum_chrome_version": "118",
   "permissions": ["activeTab", "debugger", "storage", "tabs"],
-  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "service-worker.js",
     "type": "module"

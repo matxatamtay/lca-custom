@@ -32,6 +32,21 @@ The response includes a coverage receipt for all four lanes. CodeGraph and Agent
 
 Actions execute directly without mode, policy, or approval turns. Project roots help discovery and relative-path routing; absolute paths are supported and roots are not authorization boundaries.
 
+## Accelerated coding workflow
+
+The compact workspace facades now cover the full edit-and-run loop without forcing repeated model-side polling or manual app testing:
+
+- **Context Retrieval V2** filters generated/vendor/license noise, reranks filesystem hits with changed-file and CodeGraph hints, balances providers, semantically deduplicates results, and enforces a global character budget.
+- **`workspace_agent`** delegates coding work to a runner-neutral agent layer. Codex is the first adapter and supports single jobs, parallel jobs, dependency DAGs, cancellation, structured collection, and explicit cleanup.
+- Writable delegated jobs default to **detached git worktrees**. The worktree inherits the current tracked and bounded untracked working-tree state into an ephemeral baseline, then emits only the delegated delta. `agent_merge` runs scope validation and `git apply --check` before touching the source tree; conflicts leave it unchanged.
+- **`workspace_ui`** bridges approved Chromium tabs through Local Browser Agent and connected Android devices through ADB for screenshots, UI hierarchy, input, logcat, app launch/stop, and short screen recordings.
+- **`workspace_process.wait`** waits server-side for process exit, output regexes, TCP ports, HTTP health, or file events instead of consuming repeated MCP polling turns.
+- **Compiler-native code intelligence** uses TypeScript 7 LSP for definitions, references, semantic rename, and organize-imports, plus the native compiler API for structured diagnostics. Other languages retain bounded text fallbacks where a semantic provider is unavailable.
+- **Verification intelligence** builds a changed-file/risk/affected-test plan, runs dependency-aware targeted tests where possible, and parses compiler/test output into structured file/line diagnostics.
+- **Performance profiling** records only tool name, facade/backend surface, success, latency, and input/output character counts. `workspace_status` exposes recent trace metadata and aggregated p50/p95/failure/payload signals without retaining tool arguments or output content.
+
+`parallel_tasks` remains the lightweight shell DAG. Use `workspace_agent` when independent work benefits from actual model agents and isolated writable worktrees.
+
 ## Quick setup
 
 Requirements:
@@ -105,6 +120,27 @@ Figma Desktop, Figma Remote, DBeaver, Bruno, and the remote Coolify MCP use pers
 
 More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITECTURE.md).
 
+## Persistent memory and task protocol
+
+LCA includes an Obsidian-compatible Markdown vault for durable project context and structured task handoffs. Backend actions include `context_pin`, `context_list`, `context_explain`, `context_remove`, `task_brief`, `intent_check`, `scope_guard`, `knowledge_state`, `parallel_tasks`, `handoff_packet`, `checkpoint`, and `resume`.
+
+`parallel_tasks` runs bounded dependency-aware command lanes; it coordinates shell work and does not spawn additional model agents. `workspace_agent` is the separate model-agent orchestration layer. Scope guards are opt-in per task, and command/write results include compact result digests. See [Persistent Memory and Shared Task Protocol](docs/PERSISTENT_MEMORY_AND_TASK_PROTOCOL.md).
+
+## Delegated agent providers and fallback
+
+`workspace_agent` can run Codex against server-side OpenAI-compatible provider credentials. The MCP call never accepts raw API keys: configure provider metadata in `LCA_AGENT_PROVIDERS_JSON`, point `api_key_env` at a separate secret variable, then define the normal order in `LCA_AGENT_PROVIDER_CHAIN`.
+
+```dotenv
+LCA_AGENT_PROVIDERS_JSON=[{"name":"primary","base_url":"https://provider-a.example/v1","api_key_env":"AGENT_PRIMARY_API_KEY","model":"model-a"},{"name":"backup","base_url":"https://provider-b.example/v1","api_key_env":"AGENT_BACKUP_API_KEY","model":"model-b"}]
+LCA_AGENT_PROVIDER_CHAIN=primary,backup,codex
+AGENT_PRIMARY_API_KEY=...
+AGENT_BACKUP_API_KEY=...
+```
+
+The reserved `codex` provider preserves the existing Codex authentication/endpoint behavior and can be placed anywhere in the chain. You can also override routing for one task with `provider: "backup"` or `provider_chain: ["backup", "codex"]`. Automatic fallback happens for exhausted credit/quota, HTTP 429/rate limiting, timeouts/network failures, and provider 5xx/overload errors. Authentication failures, bad requests, and unknown models stay visible instead of silently routing elsewhere. Retryable failures put that provider on an in-memory cooldown so later jobs skip it temporarily; explicitly selecting one provider bypasses cooldown.
+
+OpenAI-compatible delegated providers must support the Responses API used by the bundled Codex CLI. A gateway that only exposes Chat Completions is not treated as compatible. Set `output_schema: false` for gateways that support Responses but not JSON-schema structured output. Use `lca-custom tui` → **Config** → **Add** to store these variables locally; key-like variable names are masked and `.env.local` is written with restricted permissions. Restart LCA after changing provider configuration.
+
 ## Desktop integrations
 
 ### Figma
@@ -122,9 +158,23 @@ Figma currently limits its hosted MCP endpoint to clients in the Figma MCP Catal
 
 Enable Bruno Desktop MCP and configure its local bearer token. LCA exposes collection, folder, request, environment, dotenv, preparation, execution, and retained-result capabilities through the single `bruno` facade.
 
+### Penpot
+
+Run the Penpot stack, open the target design file, and connect MCP from Penpot. Keep the endpoint token-free in `PENPOT_MCP_URL` and store the generated credential separately in `PENPOT_USER_TOKEN`. The single `penpot` facade provides page/selection inspection, Plugin API lookup, PNG/SVG export, and direct drawing/edit/delete execution in trusted-local mode. Read/mutate/destructive aliases remain compatibility labels, not LCA permission gates.
+
 ### Coolify
 
-Set `COOLIFY_MCP_URL` and `COOLIFY_MCP_AUTH_TOKEN` in `.env.local`. LCA exposes the upstream server through the single `coolify` facade; future upstream tools become callable through `coolify_call_tool` without adding another model-facing tool.
+Set `COOLIFY_BASE_URL` and `COOLIFY_ACCESS_TOKEN` in `.env.local`. LCA starts the pinned `@masonator/coolify-mcp` package over local stdio and exposes it through the single `coolify` facade. All live upstream operations can execute directly in trusted-local mode; `read`, `mutate`, and `destructive` remain compatibility aliases and classification metadata rather than LCA approval barriers. Upstream Coolify roles/scopes still apply normally.
+
+## Runtime trajectory, recovery, and Code Mode
+
+LCA records an append-only runtime event stream under its local workspace data directory. `workspace_status action=trace` projects that stream into a correlation-grouped trajectory, and `lca_input` can display the same trace tree. Tool metrics and AgentMemory observations consume the shared action pipeline instead of instrumenting separate execution paths. Optional OTLP/HTTP export is enabled with `OTEL_EXPORTER_OTLP_ENDPOINT`; JSONL remains the local source of truth.
+
+Delegated Codex jobs default to `danger-full-access`, network enabled, and isolated worktrees. Job/DAG descriptors are persisted for restart reconstruction, with active pre-crash work reported honestly as recoverable or orphaned. `workspace_exec action=code` can combine multiple LCA backend actions in one TypeScript worker program; every nested binding still re-enters the ordinary backend pipeline and correctness checks.
+
+### Notion
+
+Open `lca-custom tui` → **Integrations** → **Notion Key**, paste the Notion integration token, then restart LCA. The single `notion` facade supports status, search, enhanced-Markdown fetch, create, targeted update, conflict-checked replacement, and allow-listed forward-compatible API calls. `notion_page` renders an interactive page app inside ChatGPT with search, read/edit, fullscreen, **Add to ChatGPT**, **Ask ChatGPT**, and selected block/text context. `lca_input` also supports lazy `@notion:<query>` autocomplete. See [docs/NOTION.md](docs/NOTION.md).
 
 ### DBeaver
 
@@ -161,8 +211,8 @@ Historical baseline versus the compact runtime:
 
 | Metric | Before | Current target |
 |---|---:|---:|
-| Model-facing tools | 143 | 14 |
-| `tools/list` bytes | 91,420 | under 20,000 |
+| Model-facing tools | 143 | 20 |
+| `tools/list` bytes | 91,420 | under 24,000 |
 | Server instruction chars | 4,458 | under 1,000 |
 
 ## License

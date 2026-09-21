@@ -598,6 +598,7 @@ function configId(opts) {
   const figmaBridgePath = join(SERVER_DIR, "figma-desktop.mjs");
   const dbeaverBridgePath = join(SERVER_DIR, "dbeaver-desktop.mjs");
   const brunoBridgePath = join(SERVER_DIR, "bruno-desktop.mjs");
+  const penpotBridgePath = join(SERVER_DIR, "penpot-desktop.mjs");
   const coolifyBridgePath = join(SERVER_DIR, "coolify-mcp.mjs");
   const persistentHttpBridgePath = join(
     SERVER_DIR,

@@ -215,8 +215,8 @@ try {
   }
   check("node parser rejects non-Figma URLs", rejectedNonFigma);
 
-  const remoteStatus = await figmaDesktopStatus({ endpoint: "https://example.com/mcp" });
-  check("bridge rejects non-loopback endpoints by default", remoteStatus.connected === false && /loopback/.test(remoteStatus.error || ""), JSON.stringify(remoteStatus));
+  const remoteStatus = await figmaDesktopStatus({ endpoint: "https://example.com/mcp", timeoutMs: 1000 });
+  check("bridge accepts remote HTTP(S) endpoints and reports upstream connectivity errors", remoteStatus.connected === false && !/loopback/.test(remoteStatus.error || ""), JSON.stringify(remoteStatus));
 
   const status = await figmaDesktopStatus({ endpoint: mock.endpoint });
   check("module status connects to mock desktop MCP", status.connected && status.tools.includes("get_design_context"), JSON.stringify(status));

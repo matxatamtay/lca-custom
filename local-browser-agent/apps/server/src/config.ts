@@ -3,7 +3,7 @@ import path from "node:path";
 
 export const VERSION = "0.3.0";
 export const HOST = "127.0.0.1";
-export const PORT = boundedNumber(process.env.LBA_PORT, 8790, 1024, 65535);
+export const PORT = boundedNumber(process.env.LBA_PORT, 8791, 1024, 65535);
 export const MCP_AUTH_TOKEN = process.env.LBA_MCP_AUTH_TOKEN || "";
 export const DATA_DIR = path.resolve(
   process.env.LBA_DATA_DIR || path.join(os.homedir(), ".local-browser-agent")

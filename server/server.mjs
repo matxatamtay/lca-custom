@@ -25,6 +25,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { ConversationRuntimeContext } from "./dist/orchestration/conversation-runtime-context.js";
+import { ActionExecutionPipeline } from "./dist/runtime/action-execution-pipeline.js";
+import { RuntimeEventStore } from "./dist/runtime/runtime-event-store.js";
+import { RuntimeOtelExporter } from "./dist/runtime/runtime-otel-exporter.js";
+import { RuntimePluginHost } from "./dist/runtime/runtime-plugin.js";
 import { summarizeArgs } from "./core/redaction.mjs";
 import {
   appendLimited, boundedNumber, comparePath, dedupe, firstText, hasCommand, isoNow,
@@ -86,8 +91,23 @@ import {
   listBrunoDesktopTools
 } from "./bruno-desktop.mjs";
 import {
-  DEFAULT_COOLIFY_MCP_URL,
+  DEFAULT_PENPOT_MCP_URL,
+  callDestructivePenpotTool,
+  callMutatingPenpotTool,
+  callPenpotTool,
+  callReadOnlyPenpotTool,
+  closePenpotClients,
+  inspectPenpotPage,
+  inspectPenpotSelection,
+  listPenpotTools,
+  penpotStatus
+} from "./penpot-desktop.mjs";
+import {
+  DEFAULT_COOLIFY_BASE_URL,
   callCoolifyMcpTool,
+  callDestructiveCoolifyMcpTool,
+  callMutatingCoolifyMcpTool,
+  callReadOnlyCoolifyMcpTool,
   closeCoolifyMcpClients,
   coolifyMcpStatus,
   listCoolifyMcpTools
@@ -117,6 +137,7 @@ import { createPatchEngineToolRegistrar } from "./tools/patch-engine-tools.mjs";
 // ----------------------------------------------------------------------------
 const VERSION = "4.4.0-pro";
 const PRODUCT_TIER = "pro";
+const TOOL_METRICS = new ToolMetrics({ recentLimit: 500 });
 const PORT = Number(process.env.PORT || 8790);
 // Bind to loopback by default. The local OpenAI tunnel-client forwards to this,
 // so we never need to listen on 0.0.0.0 (which would expose a shell to the LAN).
@@ -178,12 +199,19 @@ async function closeNextApplicationRuntime() {
   await lifecycleLog("next runtime close completed");
 }
 const COMPANION_WIDGET_PATH = path.join(APP_DIR, "lca-compact-input-v2.html");
-const COMPANION_WIDGET_URI = "ui://widget/lca-compact-input-v2.html";
+const COMPANION_WIDGET_LEGACY_URI = "ui://widget/lca-compact-input-v2.html";
 const DBEAVER_SQL_ARTIFACT_PATH = path.join(APP_DIR, "dbeaver-sql-artifact.html");
+const NOTION_PAGE_WIDGET_PATH = path.join(APP_DIR, "notion-page.html");
+const NOTION_PAGE_WIDGET_LEGACY_URI = "ui://widget/lca-notion-page.html";
+const NOTION_PAGE_WIDGET_MIME_TYPE = "text/html;profile=mcp-app";
+const NOTION_PAGE_WIDGET_RUNTIME_KEY = "mcp-app-v1";
 const COMPANION_WIDGET_RESOURCE = loadRequiredHtmlResource(COMPANION_WIDGET_PATH, "LCA companion widget");
+const COMPANION_WIDGET_URI = `ui://widget/lca-compact-input-v2-${COMPANION_WIDGET_RESOURCE.sha256.slice(0, 12)}.html`;
 const DBEAVER_SQL_ARTIFACT_RESOURCE = loadRequiredHtmlResource(DBEAVER_SQL_ARTIFACT_PATH, "DBeaver SQL artifact");
 const DBEAVER_SQL_ARTIFACT_URI = `ui://widget/dbeaver-sql-artifact-${DBEAVER_SQL_ARTIFACT_RESOURCE.sha256.slice(0, 12)}.html`;
 const DBEAVER_SQL_ARTIFACT_LEGACY_URI = "ui://widget/dbeaver-sql-artifact.html";
+const NOTION_PAGE_WIDGET_RESOURCE = loadRequiredHtmlResource(NOTION_PAGE_WIDGET_PATH, "Notion page widget");
+const NOTION_PAGE_WIDGET_URI = `ui://widget/lca-notion-page-${NOTION_PAGE_WIDGET_RESOURCE.sha256.slice(0, 12)}-${NOTION_PAGE_WIDGET_RUNTIME_KEY}.html`;
 const DEFAULT_WORKSPACE = path.resolve(APP_DIR, "..", "agent-workspace");
 const PRIMARY_ROOT = path.resolve(process.env.AGENT_WORKSPACE || DEFAULT_WORKSPACE);
 const STARTUP_PROFILE = (() => {
@@ -195,6 +223,21 @@ const STARTUP_PROFILE = (() => {
 })();
 const EXTRA_ROOTS = parseExtraRoots(STARTUP_PROFILE);
 const ROOTS = dedupe([PRIMARY_ROOT, ...EXTRA_ROOTS]);
+const CONVERSATION_RUNTIME = new ConversationRuntimeContext({
+  primaryRoot: PRIMARY_ROOT,
+  roots: ROOTS,
+  runner: "codex",
+  isolation: "worktree",
+  networkAccess: true
+});
+
+function activePrimaryRoot() {
+  return CONVERSATION_RUNTIME.primaryRoot();
+}
+
+function activeDiscoveryRoots() {
+  return CONVERSATION_RUNTIME.discoveryRoots();
+}
 
 // LCA is a trusted local execution engine. Project roots drive discovery and
 // relative-path routing; they are not authorization boundaries.
@@ -217,6 +260,37 @@ const WORKTREE_BASE_DIR = path.resolve(DATA_DIR, "worktrees");
 const LIFECYCLE_LOG_PATH = path.join(DATA_DIR, "lifecycle.log");
 const WORKSPACE_ID = createHash("sha256").update(comparePath(PRIMARY_ROOT)).digest("hex").slice(0, 16);
 const WORKSPACE_DATA_DIR = path.join(DATA_DIR, "workspaces", WORKSPACE_ID);
+const RUNTIME_EVENT_PATH = path.join(WORKSPACE_DATA_DIR, "runtime", "events.jsonl");
+const RUNTIME_EVENTS = new RuntimeEventStore({ path: RUNTIME_EVENT_PATH, maxInMemory: 30_000 });
+await RUNTIME_EVENTS.init();
+const ACTION_PIPELINE = new ActionExecutionPipeline(RUNTIME_EVENTS);
+ACTION_PIPELINE.subscribe(consumeActionObservation);
+const OTEL_EXPORTER = new RuntimeOtelExporter({
+  endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+  serviceName: process.env.OTEL_SERVICE_NAME || "local-coding-agent"
+});
+ACTION_PIPELINE.subscribe((observation) => OTEL_EXPORTER.observe(observation));
+const RUNTIME_PLUGIN_HOST = new RuntimePluginHost({
+  runtime: CONVERSATION_RUNTIME,
+  events: RUNTIME_EVENTS
+});
+await RUNTIME_PLUGIN_HOST.mount({
+  name: "integration-clients",
+  start: () => ({
+    dispose: async () => {
+      await closeNextApplicationRuntime();
+      await closeLegacyBackendRuntime();
+      await Promise.all([
+        closeFigmaDesktopClients(),
+        closeDBeaverDesktopClients(),
+        closeBrunoDesktopClients(),
+        closePenpotClients(),
+        closeCoolifyMcpClients(),
+        closeBrowserAgentClient()
+      ]);
+    }
+  })
+});
 const NOTES_PATH = path.resolve(WORKSPACE_DATA_DIR, "notes.json");
 const CHECKPOINT_PATH = path.resolve(WORKSPACE_DATA_DIR, "checkpoint.json");
 const TRANSACTION_JOURNAL_PATH = path.resolve(WORKSPACE_DATA_DIR, "transaction-journal.json");
@@ -249,9 +323,16 @@ const DBEAVER_RUN_INTENT_TTL_MS = boundedNumber(process.env.DBEAVER_RUN_INTENT_T
 const BRUNO_DESKTOP_MCP_URL = String(process.env.BRUNO_DESKTOP_MCP_URL || DEFAULT_BRUNO_DESKTOP_MCP_URL).trim();
 const BRUNO_DESKTOP_TIMEOUT_MS = boundedNumber(process.env.BRUNO_DESKTOP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const BRUNO_DESKTOP_AUTH_TOKEN = String(process.env.BRUNO_DESKTOP_AUTH_TOKEN || "").trim();
-const COOLIFY_MCP_URL = String(process.env.COOLIFY_MCP_URL || DEFAULT_COOLIFY_MCP_URL).trim();
+const PENPOT_MCP_URL = String(process.env.PENPOT_MCP_URL || DEFAULT_PENPOT_MCP_URL).trim();
+const PENPOT_MCP_TIMEOUT_MS = boundedNumber(process.env.PENPOT_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
+const PENPOT_USER_TOKEN = String(process.env.PENPOT_USER_TOKEN || "").trim();
+const COOLIFY_BASE_URL = String(process.env.COOLIFY_BASE_URL || DEFAULT_COOLIFY_BASE_URL).trim();
 const COOLIFY_MCP_TIMEOUT_MS = boundedNumber(process.env.COOLIFY_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
-const COOLIFY_MCP_AUTH_TOKEN = String(process.env.COOLIFY_MCP_AUTH_TOKEN || "").trim();
+const COOLIFY_ACCESS_TOKEN = String(process.env.COOLIFY_ACCESS_TOKEN || "").trim();
+const NOTION_API_BASE = String(process.env.NOTION_API_BASE || DEFAULT_NOTION_API_BASE).trim();
+const NOTION_VERSION = String(process.env.NOTION_VERSION || DEFAULT_NOTION_VERSION).trim();
+const NOTION_API_KEY = String(process.env.NOTION_API_KEY || "").trim();
+const NOTION_TIMEOUT_MS = boundedNumber(process.env.NOTION_TIMEOUT_MS, 30_000, 1_000, 120_000);
 
 
 
@@ -292,10 +373,54 @@ const REPO_INDEX_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const PATCH_HISTORY_PATH = path.resolve(WORKSPACE_DATA_DIR, "patch-history.json");
 const BACKUPS_DIR = path.resolve(WORKSPACE_DATA_DIR, "backups");
 
+function activePatchDataDir() {
+  const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
+  if (!scopedRoot) return WORKSPACE_DATA_DIR;
+  const scopeId = createHash("sha256").update(comparePath(scopedRoot)).digest("hex").slice(0, 16);
+  return path.join(WORKSPACE_DATA_DIR, "conversation-projects", scopeId);
+}
+
+function activePatchHistoryPath() {
+  return CONVERSATION_RUNTIME.isScoped()
+    ? path.join(activePatchDataDir(), "patch-history.json")
+    : PATCH_HISTORY_PATH;
+}
+
+function activeBackupsDir() {
+  return CONVERSATION_RUNTIME.isScoped()
+    ? path.join(activePatchDataDir(), "backups")
+    : BACKUPS_DIR;
+}
+
 // v2.5 Planner state
 const AGENT_STATE_DIR = path.join(PRIMARY_ROOT, ".agent", "state");
 const TASK_PLAN_PATH = path.join(AGENT_STATE_DIR, "current-task.json");
 const DECISIONS_PATH = path.join(AGENT_STATE_DIR, "decisions.md");
+const MEMORY_VAULT_PATH = defaultMemoryVault();
+const WORKSPACE_PROTOCOL = new WorkspaceProtocol({
+  primaryRoot: PRIMARY_ROOT,
+  projectId: WORKSPACE_ID,
+  stateDir: AGENT_STATE_DIR,
+  vaultDir: MEMORY_VAULT_PATH
+});
+
+function activeAgentStateDir() {
+  const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
+  return scopedRoot ? path.join(scopedRoot, ".agent", "state") : AGENT_STATE_DIR;
+}
+
+function activeTaskPlanPath() {
+  return path.join(activeAgentStateDir(), "current-task.json");
+}
+
+function activeDecisionsPath() {
+  return path.join(activeAgentStateDir(), "decisions.md");
+}
+
+function activeCheckpointPath() {
+  const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
+  return scopedRoot ? path.join(scopedRoot, ".agent", "state", "checkpoint.json") : CHECKPOINT_PATH;
+}
 
 // v2.8 Profile
 
@@ -542,6 +667,8 @@ await loadWorkspaceProfile();
 // Detect ripgrep once at startup — the fastest search engine when present.
 const RG_BIN = await detectRg();
 if (RG_BIN) console.log("ripgrep detected: search_text/find_files will use rg");
+const ADB_BIN = detectAdbBinary();
+if (ADB_BIN) console.log(`adb detected: ${ADB_BIN}`);
 
 const {
   attachContext, buildTree, buildTreeFast, findFiles, gitGrep, listEntries, listRepoFilesFast,
@@ -606,6 +733,22 @@ function detectRg() {
   });
 }
 
+function detectAdbBinary() {
+  const executable = process.platform === "win32" ? "adb.exe" : "adb";
+  const candidates = [
+    process.env.ADB,
+    process.env.ANDROID_ADB,
+    process.env.ANDROID_HOME ? path.join(process.env.ANDROID_HOME, "platform-tools", executable) : null,
+    process.env.ANDROID_SDK_ROOT ? path.join(process.env.ANDROID_SDK_ROOT, "platform-tools", executable) : null,
+    path.join(os.homedir(), "Android", "Sdk", "platform-tools", executable),
+    path.join(os.homedir(), "Android", "sdk", "platform-tools", executable)
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return hasCommand("adb") ? "adb" : null;
+}
+
 const compactMcpInterface = await import("./dist/interfaces/mcp/compact-mcp-interface.js").catch((error) => {
   throw new Error(`Compiled compact MCP interface is unavailable. Run npm run build:next. ${error?.message || error}`);
 });
@@ -620,15 +763,24 @@ function createMcpServer() {
   );
   registerCompanionAppResources(mcp);
   registerCompactTools(mcp);
+  registerNotionPageTool(mcp);
   return mcp;
 }
 
 function registerBackendTools(mcp) {
   registerBasicTools(mcp);
+  registerSharedWorkspaceTools(mcp);
   registerFigmaDesktopTools(mcp);
   registerDBeaverDesktopTools(mcp);
   registerBrunoDesktopTools(mcp);
+  registerPenpotMcpTools(mcp);
   registerCoolifyMcpTools(mcp);
+  registerNotionTools(mcp, {
+    registerTool: reg,
+    jsonResult,
+    apiOptions: notionApiOptions(),
+    apiVersion: NOTION_VERSION
+  });
   registerFsReadTools(mcp);
   registerFsWriteTools(mcp);
   registerExecTools(mcp);
@@ -636,10 +788,13 @@ function registerBackendTools(mcp) {
   registerGitTool(mcp);
   registerSkillTools(mcp);
   registerRepoIntelTools(mcp);    // v2.1
+  registerCodeIntelligenceTools(mcp); // v4.5 — LSP/compiler-native navigation + refactor
   registerCompanionTools(mcp);    // v2.9 — @ context + / workflow UI helpers
   registerPatchEngineTools(mcp);  // v2.2
   registerTestRunnerTools(mcp);   // v2.3
   registerReviewTools(mcp);       // v2.4
+  registerAgentTools(mcp);        // v4.5 — delegated model agents
+  registerUiTools(mcp);           // v4.5 — browser + Android automation
   registerPlannerTools(mcp);      // v2.5
   registerProfileTools(mcp);      // v2.8
 }
@@ -647,7 +802,13 @@ function registerBackendTools(mcp) {
 function registerCompactTools(mcp) {
   compactMcpInterface.registerCompactMcpTools(mcp, {
     registerTool: reg,
-    callBackendTool: callLegacyTool,
+    callBackendTool: (name, args, project) =>
+      project
+        ? CONVERSATION_RUNTIME.run({
+          primaryRoot: project,
+          correlationId: ACTION_PIPELINE.currentCorrelationId() || randomUUID()
+        }, () => callLegacyTool(name, args))
+        : callLegacyTool(name, args),
     listBackendTools: async () => (await getLegacyBackendRuntime()).tools,
     registerLcaInputTool,
     structuredJsonResult
@@ -809,14 +970,17 @@ function reg(mcp, name, def, handler) {
     let inChars = 0;
     try { inChars = JSON.stringify(args ?? {}).length; } catch { inChars = argSummary.length; }
     let result;
-    let ok = true;
     try {
-      result = await handler(args ?? {}, extra);
+      result = await ACTION_PIPELINE.execute({
+        name,
+        surface: modelFacing ? "facade" : "backend",
+        args: args ?? {},
+        resultIsError: (value) => Boolean(value?.isError)
+      }, () => handler(args ?? {}, extra));
     } catch (err) {
-      ok = false;
       result = { content: [{ type: "text", text: `ERROR: ${err?.message || err}` }], isError: true };
     }
-    const success = ok && !result?.isError;
+    const success = !result?.isError;
     const outChars = resultLen(result);
     const modelOutBytes = modelVisibleResultBytes(result);
     const durationMs = Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10);
@@ -872,11 +1036,18 @@ function workspaceInfoPayload() {
     auth: AUTH_TOKEN ? "bearer" : "none",
     roots: ROOTS,
     primary_root: PRIMARY_ROOT,
+    conversation_primary_root: CONVERSATION_RUNTIME.scopedPrimaryRoot() || null,
+    effective_primary_root: activePrimaryRoot(),
+    discovery_roots: activeDiscoveryRoots(),
     host: { platform: os.platform(), release: os.release(), hostname: os.hostname(), cwd: process.cwd(), node: process.version },
     limits: {
       max_read_chars: MAX_READ_CHARS,
       max_batch_read_chars: MAX_BATCH_READ_CHARS,
       max_command_output: MAX_COMMAND_OUTPUT,
+      max_parallel_tasks: MAX_PARALLEL_TASKS,
+      max_task_steps: MAX_TASK_STEPS,
+      max_parallel_steps: MAX_PARALLEL_STEPS,
+      max_task_concurrency: MAX_TASK_CONCURRENCY,
       max_procs: MAX_PROCS
     },
     running_processes: [...processes.values()].filter((p) => p.status === "running").length,
@@ -1062,8 +1233,9 @@ function isWithinRoots(p, roots = ROOTS) {
 // resolvePath(), so changing display paths is unnecessary and would break
 // companion search consumers that already understand absolute peer paths.
 function toRel(abs) {
-  if (comparePath(abs) === comparePath(PRIMARY_ROOT)) return ".";
-  const withSep = PRIMARY_ROOT.endsWith(path.sep) ? PRIMARY_ROOT : PRIMARY_ROOT + path.sep;
+  const primaryRoot = activePrimaryRoot();
+  if (comparePath(abs) === comparePath(primaryRoot)) return ".";
+  const withSep = primaryRoot.endsWith(path.sep) ? primaryRoot : primaryRoot + path.sep;
   if (comparePath(abs).startsWith(comparePath(withSep))) return abs.slice(withSep.length).split(path.sep).join("/");
   return abs;
 }
@@ -1145,6 +1317,12 @@ const registerTestRunnerTools = createTestRunnerToolRegistrar({
   workspaceStateRegistry, projectRootForPath,
   changeAwareVerification, resolveActiveProjectRoot: discoverActiveProjectRoot
 });
+
+function shellQuoteForCommand(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(text)) return text;
+  return `'${text.replaceAll("'", `'"'"'`)}'`;
+}
 
 // ============================================================================
 // v2.4 — Review Mode

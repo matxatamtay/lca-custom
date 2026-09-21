@@ -55,6 +55,9 @@ def main():
     config_dir = workspace / "config"
     config_dir.mkdir(parents=True)
     config_path = config_dir / "cli-config.json"
+    env_path = workspace / ".env.local"
+    env_path.write_text("BRUNO_DESKTOP_MCP_URL=http://127.0.0.1:3847/mcp\nBRUNO_DESKTOP_AUTH_TOKEN=pty-secret-value\n", encoding="utf-8")
+    os.chmod(env_path, 0o600)
     port = free_port()
     config_path.write_text(json.dumps({
         "workspace": str(workspace),
@@ -94,6 +97,7 @@ def main():
             "COLORTERM": "truecolor",
             "LCA_TUI_ENDPOINT": f"http://127.0.0.1:{port}/mcp",
             "LCA_TUI_CONFIG_PATH": str(config_path),
+            "LCA_TUI_ENV_PATH": str(env_path),
             "LCA_TUI_CLI_SCRIPT": str(REPO_ROOT / "scripts" / "local-coding-agent.mjs"),
             "LCA_TUI_WORKSPACE": str(workspace),
             "LCA_TUI_REPO_ROOT": str(REPO_ROOT),
@@ -123,8 +127,9 @@ def main():
         pane_resized = False
         palette_opened = False
         palette_closed = False
+        config_opened = False
         quit_sent = False
-        while time.time() - started < 26:
+        while time.time() - started < 29:
             readable, _, _ = select.select([master], [], [], 0.15)
             if readable:
                 try:
@@ -164,7 +169,10 @@ def main():
                 time.sleep(0.25)
                 os.write(master, b"\x1b")
                 palette_closed = True
-            if elapsed > 23 and not quit_sent:
+            if elapsed > 22 and palette_closed and not config_opened:
+                os.write(master, b"e")
+                config_opened = True
+            if elapsed > 26 and not quit_sent:
                 os.write(master, b"q")
                 quit_sent = True
             if tui.poll() is not None:
@@ -192,7 +200,9 @@ def main():
             "resource_tabs": "Workspaces / Files" in plain and len(state.get("resource_tabs", [])) >= 1,
             "pane_resize": state.get("pane_split_percent", 40) > 40,
             "fuzzy_palette": ("Command palette" in plain or "Commandpalette" in plain) and ("fuzzy search" in plain or "fuzzysearch" in plain) and "Results" in plain,
-            "state_saved": state.get("active_view") == "files" and state.get("schema") == 2,
+            "config_screen": "Runtime configuration" in plain and "BRUNO_DESKTOP_AUTH_TOKEN" in plain and "pty-secret-value" not in plain,
+            "secret_masked": "••••••" in plain and "pty-secret-value" not in plain,
+            "state_saved": state.get("active_view") == "config" and state.get("schema") == 2,
             "workspace": str(workspace) in plain,
             "error": "ERROR:" in plain,
             "rendered_bytes": len(buffer)
@@ -207,6 +217,8 @@ def main():
             receipt["resource_tabs"],
             receipt["pane_resize"],
             receipt["fuzzy_palette"],
+            receipt["config_screen"],
+            receipt["secret_masked"],
             receipt["state_saved"],
             receipt["workspace"],
             not receipt["error"]
