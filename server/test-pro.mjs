@@ -125,11 +125,11 @@ try {
   client = await connect(server.port);
 
   await callJson(client, "write_file", {
-    path: "package.json",
+    path: "primary-project/package.json",
     content: JSON.stringify({ scripts: { test: "node --version", build: "node --version", lint: "node --version", typecheck: "node --version" }, dependencies: { express: "^4.0.0" } }, null, 2)
   });
-  await callJson(client, "write_file", { path: "README.md", content: "# Pro workspace\n" });
-  await callJson(client, "write_file", { path: "src/index.js", content: "export function hello(){ return 'pro'; }\n" });
+  await callJson(client, "write_file", { path: "primary-project/README.md", content: "# Pro workspace\n" });
+  await callJson(client, "write_file", { path: "primary-project/src/index.js", content: "export function hello(){ return 'pro'; }\n" });
 
   const info = await callJson(client, "workspace_info");
   check("workspace_info exposes pro tier", info.tier === "pro", `tier=${info.tier}`);
@@ -171,6 +171,39 @@ try {
   check("workspace_search path restricts search to one project", !restrictedSearch.results?.some((r) => r.path === secondaryFile), JSON.stringify(restrictedSearch.results));
   const projectRoots = await callJson(client, "workspace_search", { query: "@", include: ["folder"], limit: 20 });
   check("workspace_search exposes every project root", projectRoots.results?.some((r) => r.project === "primary-project" && r.path === ".") && projectRoots.results?.some((r) => r.project === "secondary-project" && r.path === extraRoot), JSON.stringify(projectRoots.results));
+
+  const peerRead = await callJson(client, "read_file", { path: "lib/secondary.js" });
+  check("relative reads resolve uniquely across peer workspaces", peerRead.path === secondaryFile && /secondaryOnly/.test(peerRead.content || ""), JSON.stringify(peerRead));
+
+  await callJson(client, "write_file", {
+    path: "lib/generated-peer.js",
+    content: "export const generatedPeer = true;\n"
+  });
+  const generatedPeerFile = path.join(extraRoot, "lib", "generated-peer.js");
+  const peerCreate = await callJson(client, "read_file", { path: "secondary-project/lib/generated-peer.js" });
+  check("new relative paths use the workspace with the deepest existing parent", peerCreate.path === generatedPeerFile && /generatedPeer/.test(peerCreate.content || ""), JSON.stringify(peerCreate));
+
+  const peerPatch = await callJson(client, "apply_patch", {
+    diff: [
+      "--- a/lib/secondary.js",
+      "+++ b/lib/secondary.js",
+      "@@",
+      "-export function secondaryOnly(){ return 'secondary'; }",
+      "+export function secondaryOnly(){ return 'secondary-patched'; }"
+    ].join("\n")
+  });
+  const peerPatchedRead = await callJson(client, "read_file", { path: "secondary-project/lib/secondary.js" });
+  check("relative unified diffs patch the uniquely matching peer workspace", peerPatch.ok === true && /secondary-patched/.test(peerPatchedRead.content || ""), JSON.stringify({ peerPatch, peerPatchedRead }));
+
+  await callJson(client, "write_file", { path: "primary-project/shared.txt", content: "primary\n" });
+  await callJson(client, "write_file", { path: "secondary-project/shared.txt", content: "secondary\n" });
+  let ambiguousRead = "";
+  try {
+    await callJson(client, "read_file", { path: "shared.txt" });
+  } catch (error) {
+    ambiguousRead = String(error?.message || error);
+  }
+  check("ambiguous relative paths fail instead of silently choosing primary", /Ambiguous relative path 'shared\.txt'/.test(ambiguousRead) && /project name/.test(ambiguousRead), ambiguousRead);
 
   const slash = await callJson(client, "slash_commands", { query: "/", limit: 20 });
   check("slash_commands omits /plan autocomplete", !slash.commands?.some((c) => c.command === "/plan"), JSON.stringify(slash.commands));

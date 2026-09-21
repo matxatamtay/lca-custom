@@ -4,6 +4,7 @@ import path from "node:path";
 
 import type { ContextEvidence, TaskContextRequest } from "../../domain/task-context.js";
 import type { LspClientLike, StdioLspClientOptions } from "../../infrastructure/lsp/stdio-lsp-client.js";
+import type { SemanticDiagnosticsResult } from "../../ports/context-providers.js";
 import type { SemanticEngine, SemanticEngineResult } from "./semantic-context-adapter.js";
 import { LspSymbolSession } from "./lsp-symbol-session.js";
 
@@ -53,6 +54,21 @@ export class DartSemanticEngine implements SemanticEngine {
     return session.context(request);
   }
 
+  async diagnostics(root: string, changedFiles: readonly string[]): Promise<SemanticDiagnosticsResult> {
+    const normalizedRoot = path.resolve(root);
+    if (!this.sessions.has(normalizedRoot)) {
+      await this.context({ task: "post-edit diagnostics", root: normalizedRoot, changedFiles });
+    }
+    const session = this.sessions.get(normalizedRoot);
+    if (!session) {
+      return {
+        diagnostics: [], language: "dart", engine: ENGINE_NAME, available: false,
+        state: "unavailable", fresh: false, reason: "Dart semantic session is unavailable."
+      };
+    }
+    return session.diagnostics(changedFiles);
+  }
+
   async close(): Promise<void> {
     const settled = await Promise.allSettled([...this.sessions.values()].map((session) => session.close()));
     this.sessions.clear();
@@ -82,12 +98,18 @@ export async function resolveDartExecutable(
   }
 
   const fvmVersion = await readFvmVersion(root);
+  const fvmHomes = [
+    environment.FVM_CACHE_PATH,
+    environment.FVM_HOME,
+    path.join(homeDirectory, "fvm"),
+    path.join(homeDirectory, ".fvm"),
+    path.join(homeDirectory, ".cache", "fvm"),
+    path.join(homeDirectory, "Library", "Application Support", "fvm")
+  ].filter((value): value is string => Boolean(value));
   if (fvmVersion) {
-    add(path.join(homeDirectory, "fvm", "versions", fvmVersion, "bin", executable));
-    add(path.join(homeDirectory, ".fvm", "versions", fvmVersion, "bin", executable));
+    for (const home of fvmHomes) add(path.join(home, "versions", fvmVersion, "bin", executable));
   }
-  add(path.join(homeDirectory, "fvm", "default", "bin", executable));
-  add(path.join(homeDirectory, ".fvm", "default", "bin", executable));
+  for (const home of fvmHomes) add(path.join(home, "default", "bin", executable));
   add(path.join(homeDirectory, "Library", "flutter", "bin", executable));
 
   const seen = new Set<string>();

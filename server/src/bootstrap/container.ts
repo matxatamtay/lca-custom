@@ -1,6 +1,7 @@
 import { BuildTaskContext } from "../application/context/build-task-context.js";
 import type {
   CodeIntelligencePort,
+  ContextRerankerPort,
   FilesystemContextPort,
   MemoryPort,
   SemanticContextPort
@@ -11,14 +12,17 @@ export interface ApplicationDependencies {
   semantic: SemanticContextPort;
   codegraph: CodeIntelligencePort;
   agentmemory: MemoryPort;
+  reranker?: ContextRerankerPort;
 }
 
 export interface ApplicationContainer {
   buildTaskContext: BuildTaskContext;
+  semantic: SemanticContextPort;
 }
 
 export function createApplicationContainer(dependencies: ApplicationDependencies): ApplicationContainer {
   return {
-    buildTaskContext: new BuildTaskContext(dependencies)
+    buildTaskContext: new BuildTaskContext(dependencies),
+    semantic: dependencies.semantic
   };
 }

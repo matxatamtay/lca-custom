@@ -55,6 +55,9 @@ test("queries filesystem, semantic analysis, CodeGraph, and AgentMemory for ever
       async context() {
         calls.push("codegraph.context");
         return [evidence("codegraph", "graph-hit")];
+      },
+      telemetry() {
+        return { index_ms: 3, query_ms: 4, cache_hit: true, route: "search" };
       }
     },
     agentmemory: {
@@ -81,6 +84,9 @@ test("queries filesystem, semantic analysis, CodeGraph, and AgentMemory for ever
   assert.equal(result.coverage.semantic.queried, true);
   assert.equal(result.coverage.semantic.status, "ok");
   assert.equal(result.coverage.codegraph.queried, true);
+  assert.equal(result.coverage.codegraph.details?.index_ms, 3);
+  assert.equal(result.coverage.codegraph.details?.query_ms, 4);
+  assert.equal(result.coverage.codegraph.details?.cache_hit, true);
   assert.equal(result.coverage.agentmemory.queried, true);
   assert.equal(result.evidence.length, 4);
 });
@@ -251,4 +257,148 @@ test("keeps semantic capability failure visible without blocking required provid
   assert.equal(result.coverage.semantic.details?.language, "java");
   assert.match(String(result.coverage.semantic.details?.reason), /not registered/);
   assert.ok(result.evidence.some((item) => item.provider === "codegraph"));
+});
+
+test("optional reranker can improve ordering while preserving provider membership", async () => {
+  const useCase = new BuildTaskContext({
+    filesystem: {
+      async search() {
+        return [{ ...evidence("filesystem", "file"), score: 50 }];
+      }
+    },
+    semantic: semanticProvider([{ ...evidence("semantic", "semantic"), score: 60 }]),
+    codegraph: {
+      async ensureIndexed() {},
+      async context() { return [{ ...evidence("codegraph", "graph"), score: 40 }]; }
+    },
+    agentmemory: {
+      async recall() { return [{ ...evidence("agentmemory", "memory"), score: 30 }]; }
+    },
+    reranker: {
+      async rerank(_request, items) {
+        return {
+          evidence: items.map((item) => item.id === "graph" ? { ...item, score: 100 } : item),
+          ranking: {
+            provider: "jev" as const,
+            status: "applied" as const,
+            latencyMs: 10,
+            model: "jev-latest",
+            candidates: items.length,
+            accepted: 1
+          }
+        };
+      }
+    }
+  });
+
+  const result = await useCase.execute({ task: "Find graph relation", root: "/repo" });
+
+  assert.equal(result.evidence[0]?.id, "graph");
+  assert.equal(result.ranking?.provider, "jev");
+  assert.deepEqual(
+    new Set(result.evidence.map((item) => item.provider)),
+    new Set(["filesystem", "semantic", "codegraph", "agentmemory"])
+  );
+});
+
+test("unexpected reranker errors transparently fall back to existing ranking", async () => {
+  const useCase = new BuildTaskContext({
+    filesystem: { async search() { return [{ ...evidence("filesystem", "file"), score: 50 }]; } },
+    semantic: semanticProvider([{ ...evidence("semantic", "semantic"), score: 40 }]),
+    codegraph: {
+      async ensureIndexed() {},
+      async context() { return [{ ...evidence("codegraph", "graph"), score: 30 }]; }
+    },
+    agentmemory: {
+      async recall() { return [{ ...evidence("agentmemory", "memory"), score: 20 }]; }
+    },
+    reranker: {
+      async rerank() {
+        throw new Error("jev offline");
+      }
+    }
+  });
+
+  const result = await useCase.execute({ task: "Inspect startup", root: "/repo" });
+
+  assert.equal(result.evidence[0]?.id, "file");
+  assert.equal(result.ranking?.provider, "rule");
+  assert.equal(result.ranking?.status, "fallback");
+  assert.equal(result.ranking?.fallbackReason, "reranker-error");
+});
+
+test("prunes only confidently irrelevant Jev evidence after reranking", async () => {
+  const useCase = new BuildTaskContext({
+    filesystem: {
+      async search() {
+        return [
+          { ...evidence("filesystem", "useful-file"), score: 50 },
+          { ...evidence("filesystem", "noise-file"), score: 49 }
+        ];
+      }
+    },
+    semantic: semanticProvider([{ ...evidence("semantic", "uncertain-semantic"), score: 40 }]),
+    codegraph: {
+      async ensureIndexed() {},
+      async context() { return [{ ...evidence("codegraph", "noise-graph"), score: 30 }]; }
+    },
+    agentmemory: {
+      async recall() { return [{ ...evidence("agentmemory", "local-memory"), score: 20 }]; }
+    },
+    reranker: {
+      async rerank(_request, items) {
+        return {
+          evidence: items.map((item) => {
+            if (item.id === "noise-file" || item.id === "noise-graph") {
+              return {
+                ...item,
+                metadata: {
+                  ...(item.metadata ?? {}),
+                  jevRerank: {
+                    model: "jev-latest",
+                    relevance: 0,
+                    score: 0,
+                    confidence: 0.95,
+                    boost: 0
+                  }
+                }
+              };
+            }
+            if (item.id === "useful-file") {
+              return {
+                ...item,
+                metadata: {
+                  ...(item.metadata ?? {}),
+                  jevRerank: {
+                    model: "jev-latest",
+                    relevance: 1,
+                    score: 2,
+                    confidence: 0.9,
+                    boost: 27
+                  }
+                }
+              };
+            }
+            return item;
+          }),
+          ranking: {
+            provider: "jev" as const,
+            status: "applied" as const,
+            latencyMs: 12,
+            candidates: items.length,
+            accepted: 3,
+            sufficiency: "partial" as const,
+            sufficiencyConfidence: 0.8
+          }
+        };
+      }
+    }
+  });
+
+  const result = await useCase.execute({ task: "Trace relevant code", root: "/repo" });
+
+  assert.deepEqual(result.evidence.map((item) => item.id), ["useful-file", "uncertain-semantic", "local-memory"]);
+  assert.equal(result.evidence.some((item) => item.provider === "codegraph"), false);
+  assert.equal(result.ranking?.pruned, 2);
+  assert.equal(result.ranking?.sufficiency, "partial");
 });

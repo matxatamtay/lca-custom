@@ -7,7 +7,7 @@ export const COMPACT_SERVER_INSTRUCTIONS = [
   "For every coding task call workspace_context first. It always queries current files, native semantic analysis, CodeGraph, and AgentMemory and returns a coverage receipt.",
   "Use the compact facade tools. Each facade accepts a short action alias or an exact hidden backend tool name plus an arguments object. Call action=discover only when you need facade action discovery.",
   "Actions execute directly in the trusted local runtime without policy or approval round-trips. Project roots are discovery defaults, not authorization boundaries.",
-  "Batch work, keep outputs bounded, and avoid repeating reads or commands. Use workspace_verify before declaring code changes complete.",
+  "Batch work, keep outputs bounded, and avoid repeating reads, searches, or commands. For related text lookups, use workspace_search action=text with queries[] in one round-trip. For two or more related edits, prefer one workspace_edit action=batch/apply_patch call; replace_in_file also accepts an ordered replacements array for same-file edits. Use workspace_verify before declaring code changes complete.",
   "Use figma, dbeaver, and bruno for desktop integrations, and coolify for the configured remote Coolify MCP. Use lca_input for the ChatGPT companion UI."
 ].join("\n");
 
@@ -57,6 +57,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
     defaultAction: "apply_patch",
     aliases: {
       patch: "apply_patch",
+      batch: "apply_patch",
       preview: "preview_patch",
       validate: "validate_patch",
       undo: "undo_last_patch",
@@ -85,8 +86,18 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   },
   workspace_git: {
     defaultAction: "git_status",
-    aliases: { run: "git", status: "git_status", diff: "git_diff" },
-    exact: new Set(["git", "git_status", "git_diff"])
+    aliases: {
+      run: "git",
+      status: "git_status",
+      diff: "git_diff",
+      worktree_create: "worktree_create",
+      worktree_status: "worktree_status",
+      worktree_diff: "worktree_diff",
+      worktree_check: "worktree_check",
+      worktree_gc: "worktree_gc",
+      worktree_cleanup: "worktree_cleanup"
+    },
+    exact: new Set(["git", "git_status", "git_diff", "worktree_create", "worktree_status", "worktree_diff", "worktree_check", "worktree_gc", "worktree_cleanup"])
   },
   workspace_verify: {
     defaultAction: "quality_gate",
@@ -95,6 +106,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       gate: "quality_gate",
       tests: "run_tests",
       changed: "run_changed_tests",
+      plan_changed: "verify_changed",
       build: "run_build",
       lint: "run_lint",
       review: "review_diff",
@@ -102,12 +114,13 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       summary: "change_summary",
       session: "session_report"
     },
-    exact: new Set(["detect_test_commands", "quality_gate", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
+    exact: new Set(["detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
   },
   workspace_status: {
     defaultAction: "workspace_info",
     aliases: {
       info: "workspace_info",
+      performance: "performance_follow",
       doctor: "workspace_doctor",
       snapshot: "workspace_snapshot",
       profile: "project_profile",
@@ -115,7 +128,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       reload_profile: "reload_profile",
       ping: "ping"
     },
-    exact: new Set(["ping", "workspace_info", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
+    exact: new Set(["ping", "workspace_info", "performance_follow", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
   },
   workspace_skill: {
     defaultAction: "list_skills",
@@ -154,14 +167,14 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
 });
 
 export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, string>> = Object.freeze({
-  workspace_search: "Search files, text, symbols, repository maps, graph-oriented indexes, and TODOs. Common actions: search, text, files, symbols, map, todos.",
+  workspace_search: "Search files, text, symbols, repository maps, graph-oriented indexes, and TODOs. For multiple related text queries, batch them with action=text and arguments.queries[]. Common actions: search, text, files, symbols, map, todos.",
   workspace_read: "Read one or many files, stat paths, list files or notes, and resume checkpoints. Common actions: one, many, stat, list, notes, resume.",
-  workspace_edit: "Apply, preview, validate, and undo patches; write, replace, move, or delete paths; maintain notes and task state.",
+  workspace_edit: "Apply, preview, validate, and undo patches; write, replace, move, or delete paths; maintain notes and task state. Use action=batch/apply_patch for related multi-file edits and replace with replacements[] for same-file batches.",
   workspace_exec: "Run bounded foreground commands. Common actions: one or many.",
   workspace_process: "Start, list, inspect output from, and stop managed background processes.",
-  workspace_git: "Run Git commands and return compact status or diffs.",
+  workspace_git: "Run Git commands, compact status/diffs, and LCA-managed isolated worktrees for parallel tasks.",
   workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, and session-report gates.",
-  workspace_status: "Inspect workspace, trusted runtime, project profile, dependency health, and readiness state.",
+  workspace_status: "Inspect workspace, trusted runtime, project profile, dependency health, readiness state, and long-lived performance follow metrics.",
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
   figma: "Use Figma Remote MCP with OAuth and guarded canvas writes, plus the persistent Desktop fallback. Common actions: status, actions, call, auth, remote_status, remote_actions, remote_call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",

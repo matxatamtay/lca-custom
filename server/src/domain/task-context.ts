@@ -39,6 +39,21 @@ export interface ProviderCoverage {
 
 export type ContextCoverage = Readonly<Record<ContextProviderName, ProviderCoverage>>;
 
+export interface ContextRanking {
+  provider: "rule" | "jev";
+  status: "applied" | "fallback" | "skipped";
+  latencyMs: number;
+  model?: string;
+  candidates?: number;
+  accepted?: number;
+  candidateCap?: number;
+  stateChars?: number;
+  pruned?: number;
+  sufficiency?: "insufficient" | "partial" | "sufficient";
+  sufficiencyConfidence?: number;
+  fallbackReason?: string;
+}
+
 export interface TaskContext {
   contextId: string;
   task: string;
@@ -46,6 +61,7 @@ export interface TaskContext {
   generatedAt: string;
   coverage: ContextCoverage;
   evidence: readonly ContextEvidence[];
+  ranking?: ContextRanking;
 }
 
 export class ContextProviderUnavailableError extends Error {

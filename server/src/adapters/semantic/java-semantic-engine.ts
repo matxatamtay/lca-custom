@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import type { ContextEvidence, TaskContextRequest } from "../../domain/task-context.js";
 import type { LspClientLike, StdioLspClientOptions } from "../../infrastructure/lsp/stdio-lsp-client.js";
+import type { SemanticDiagnosticsResult } from "../../ports/context-providers.js";
 import type { SemanticEngine, SemanticEngineResult } from "./semantic-context-adapter.js";
 import { LspSymbolSession } from "./lsp-symbol-session.js";
 
@@ -56,6 +57,21 @@ export class JavaSemanticEngine implements SemanticEngine {
       this.sessions.set(root, session);
     }
     return session.context(request);
+  }
+
+  async diagnostics(root: string, changedFiles: readonly string[]): Promise<SemanticDiagnosticsResult> {
+    const normalizedRoot = path.resolve(root);
+    if (!this.sessions.has(normalizedRoot)) {
+      await this.context({ task: "post-edit diagnostics", root: normalizedRoot, changedFiles });
+    }
+    const session = this.sessions.get(normalizedRoot);
+    if (!session) {
+      return {
+        diagnostics: [], language: "java", engine: ENGINE_NAME, available: false,
+        state: "unavailable", fresh: false, reason: "Java semantic session is unavailable."
+      };
+    }
+    return session.diagnostics(changedFiles);
   }
 
   async close(): Promise<void> {

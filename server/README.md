@@ -22,7 +22,7 @@ coolify
 lca_input
 ```
 
-Use `workspace_context` first for coding tasks. It always fans out to current filesystem search, native semantic analysis, CodeGraph, and AgentMemory and returns per-provider coverage. Use `action=discover` on a facade only when its exact backend actions are needed.
+Use `workspace_context` first for coding tasks. It always fans out to current filesystem search, native semantic analysis, CodeGraph, and AgentMemory and returns per-provider coverage. The default context pack is intentionally compact (10 items / ~12k chars), includes bounded source slices plus `execution_hints.likely_reads`, and can attach a cached changed-file verification hint. Use `action=discover` on a facade only when its exact backend actions are needed.
 
 Actions execute directly without mode, policy, or approval turns. Project roots support discovery and relative paths; absolute paths are accepted. LCA is not an OS sandbox.
 
@@ -59,9 +59,17 @@ npm start
 
 TypeScript/JavaScript semantic context uses a persistent TypeScript 7 native API/tsgo session. Dart/Flutter uses a persistent Dart Analysis Server LSP session discovered from the project FVM/Dart SDK. Java uses persistent Eclipse JDT LS with per-project workspace data under `server/data/semantic/jdtls`; the pinned isolated runtime is provisioned with `node ../scripts/jdtls-runtime.mjs install`. Dart and Java cold indexing happens in the background and reports `warming` until exact-symbol evidence can be served safely.
 
-CodeGraph `1.5.0` is pinned in the core server dependency tree. Its MCP stdio connection is lazy and persistent, with internal narrow search/callers/callees/impact tools enabled behind the LCA adapter. Normal symbol tasks avoid source-heavy exploration; deep architecture/flow tasks still use `codegraph_explore`. Evidence is cached by graph revision and invalidated by changed-file refreshes.
+CodeGraph `1.5.0` is pinned in the core server dependency tree. Its MCP stdio connection is lazy and persistent, with internal narrow search/callers/callees/impact tools enabled behind the LCA adapter. Normal symbol tasks avoid source-heavy exploration. Cold structural/architecture tasks use staged escalation (`search` -> `callers`/`impact` -> `explore`) so deep exploration only runs when cheaper relationship queries are insufficient; verbatim deep source dumps are stripped from the compact context pack. Evidence is cached by graph revision and invalidated by real changed-file metadata changes. Filesystem and semantic context also use revision-aware hot caches; post-edit processing invalidates affected state and prewarms CodeGraph/semantic work for the next call. Startup also prewarms up to three recent configured workspaces in the background without blocking MCP availability.
 
-AgentMemory `0.9.28` is installed as a separate managed companion runtime under `runtime/agentmemory`. LCA owns health checks, startup, stale-session reconciliation, observations, summaries, decisions, export, and import. The lean default install omits optional ONNX packages and uses local BM25 search without an external LLM key.
+AgentMemory `0.9.28` is installed as a separate managed companion runtime under `runtime/agentmemory`. LCA owns health checks, startup, stale-session reconciliation, observations, summaries, decisions, export, and import. First-session bootstrap overlaps project-scoped recall instead of serializing it, and exact repeated recalls use a short bounded cache with mutation invalidation. The lean default install omits optional ONNX packages and uses local BM25 search without an external LLM key.
+
+Change-aware verification caches impacted-test topology by changed-file and manifest fingerprints. Independent uncached gates can execute concurrently with bounded concurrency, while successful cache writes remain serialized. `workspace_edit` / `apply_patch` remains edit-only by default; callers can opt into `verify: "changed"` to run the cheapest safe changed-file gates in the same model round-trip. Related edits should be batched with `workspace_edit action=batch` / `apply_patch`; `replace_in_file` also supports an ordered `replacements[]` batch for one-file changes.
+
+Model-facing task telemetry is persisted per workspace under `server/data/workspaces/<id>/performance-telemetry.json` and exposed by `workspace_info`, including context/provider latency, round trips, bytes returned to the model, read/edit/verification time, and cache-hit ratios. Telemetry v2 labels user/internal/synthetic workloads, tracks cold/mixed/warm context, reports p50/p95, and age-weights recent user work so benchmarks and LCA self-maintenance do not distort autotuning. `workspace_context` uses that cleaned workspace-scoped history only for bounded recommendations: an adaptive workflow hint selects a short fast/inspect/review path, and conservative autotuning may adjust omitted context budgets between compact (`8/~9k`), baseline (`10/~12k`), or expanded (`12/~15k`) profiles. Explicit caller budgets always override autotuning and all four context providers remain mandatory.
+
+Foreground execution has a conservative toolchain accelerator. Only allowlisted analysis-only commands such as TypeScript typecheck, `flutter analyze`, `dart analyze`, mypy, and pyright can reuse a prior successful result, and only for an identical Git HEAD + dirty/untracked-content revision. Tests, builds, lint scripts, and arbitrary shell commands always execute. Install/setup commands are never persistently cached and are only deduplicated while an identical call is concurrently in flight. `workspace_exec many` also supports bounded dependency DAGs via `id` + `depends_on`, allowing independent checks to run concurrently without starting dependent work early.
+
+A second long-lived performance-follow log is stored at `server/data/workspaces/<id>/performance-follow.json`. It retains a bounded history of timing samples for tools, context providers, and sanitized command families, with p50/p95, total wall-clock bottlenecks, cache efficiency, task classes, and cold/warm context rollups. It intentionally does not persist raw task text, command strings, arguments, patches, stdout/stderr, or secrets. Query it through `workspace_status action=performance` with optional `path`, `window_days`, `task_class`, and `compact` arguments; `workspace_info` also includes a compact 30-day user-work summary.
 
 None of these context engines is exposed as a separate ChatGPT tool surface. The application layer keeps CodeGraph and AgentMemory mandatory while semantic capability is reported explicitly when unavailable.
 
@@ -87,8 +95,8 @@ Direct model-style preparation or execution without the widget capability is rej
 |---|---:|---|
 | `PORT` | `8790` | Local MCP HTTP port. |
 | `AGENT_HOST` | `127.0.0.1` | Bind address. Keep loopback for normal use. |
-| `AGENT_WORKSPACE` | managed config | Primary project for discovery and relative paths. |
-| `AGENT_EXTRA_ROOTS_JSON` | `[]` | Additional project roots for cross-project context. |
+| `AGENT_WORKSPACE` | managed config | Default project when a tool omits its target; configured roots otherwise participate as peer workspaces. |
+| `AGENT_EXTRA_ROOTS_JSON` | `[]` | Additional peer project roots for cross-project read/edit/exec/context routing. |
 | `MCP_AUTH_TOKEN` | empty | Optional bearer token for `/mcp`. Header only. |
 | `MCP_ALLOWED_ORIGINS` | empty | Browser origins allowed to call `/mcp`; empty denies browser-origin calls. |
 | `AGENT_AUDIT` | `1` | Set `0` to disable audit events. |

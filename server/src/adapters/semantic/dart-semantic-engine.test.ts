@@ -73,6 +73,21 @@ test("resolves Dart from a project-local FVM Flutter SDK", async () => {
   }
 });
 
+test("resolves Dart from configured FVM cache using .fvmrc", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "lca-dart-fvm-cache-"));
+  const cache = path.join(root, "cache");
+  const executable = process.platform === "win32" ? "dart.exe" : "dart";
+  const expected = path.join(cache, "versions", "3.38.5", "bin", executable);
+  try {
+    await mkdir(path.dirname(expected), { recursive: true });
+    await writeFile(path.join(root, ".fvmrc"), JSON.stringify({ flutter: "3.38.5" }), "utf8");
+    await writeFile(expected, "fake", "utf8");
+    assert.equal(await resolveDartExecutable(root, { PATH: "", FVM_CACHE_PATH: cache }, path.join(root, "home")), expected);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Dart semantic context warms in background and only queries after analyzer readiness", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "lca-dart-semantic-"));
   const file = path.join(root, "lib", "scan_view_model.dart");

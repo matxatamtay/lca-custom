@@ -1,13 +1,16 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
 import type { ContextEvidence, TaskContextRequest } from "../../domain/task-context.js";
-import type { SemanticContextState } from "../../ports/context-providers.js";
+import type { SemanticContextState, SemanticDiagnostic, SemanticDiagnosticsResult } from "../../ports/context-providers.js";
 import { StdioLspClient, type LspClientLike, type StdioLspClientOptions } from "../../infrastructure/lsp/stdio-lsp-client.js";
 import type { SemanticEngineResult } from "./semantic-context-adapter.js";
+import {
+  compactLocation, displayLanguage, extractQueryTerms, formatLocation, isWithinRoot,
+  locationsFromResult, parseSymbols, selectRelevantSymbols, serverRequestHandler, shortHash,
+  symbolPosition, uniqueLocations, type CompactLocation, type LspSymbol
+} from "./lsp-symbol-utils.js";
 
 export interface LspSymbolSessionOptions {
   language: "dart" | "java";
@@ -28,19 +31,6 @@ export interface LspSymbolSessionOptions {
 
 type SessionState = "cold" | "warming" | "ready" | "failed" | "closed";
 
-interface LspPosition { line: number; character: number }
-interface LspRange { start: LspPosition; end: LspPosition }
-interface LspLocation { uri: string; range: LspRange }
-interface LspSymbol { name: string; kind?: number; location: LspLocation }
-interface CompactLocation { path: string; line: number; column: number }
-
-const STOP_WORDS = new Set([
-  "about", "after", "before", "build", "change", "check", "code", "context", "could", "current",
-  "caller", "callers", "definition", "definitions", "does", "file", "files", "find", "from", "function", "implement", "into", "issue", "make", "need",
-  "project", "refactor", "reference", "references", "remove", "service", "should", "that", "this", "trace", "understand", "what",
-  "when", "where", "which", "with", "without", "would"
-]);
-
 export class LspSymbolSession {
   private state: SessionState = "cold";
   private reason = "Semantic analyzer has not started yet.";
@@ -53,6 +43,8 @@ export class LspSymbolSession {
   private warmupTerm: string | undefined;
   private readonly symbolCache = new Map<string, readonly LspSymbol[]>();
   private readonly evidenceCache = new Map<string, readonly ContextEvidence[]>();
+  private readonly diagnosticsByUri = new Map<string, readonly SemanticDiagnostic[]>();
+  private readonly diagnosticGenerationByUri = new Map<string, number>();
 
   constructor(private readonly options: LspSymbolSessionOptions) {}
 
@@ -68,6 +60,39 @@ export class LspSymbolSession {
       });
     }
     return this.query(request);
+  }
+
+  async diagnostics(changedFiles: readonly string[]): Promise<SemanticDiagnosticsResult> {
+    if (this.state === "cold") this.prewarm();
+    if (this.state !== "ready") {
+      return {
+        diagnostics: [],
+        language: this.options.language,
+        engine: this.options.engineName,
+        available: false,
+        state: this.semanticState(),
+        fresh: false,
+        reason: this.reason
+      };
+    }
+
+    const uris = changedFiles.map((file) => {
+      const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(this.options.root, file);
+      return pathToFileURL(absolute).toString();
+    });
+    const before = new Map(uris.map((uri) => [uri, this.diagnosticGenerationByUri.get(uri) ?? 0]));
+    this.notifyFileChanges(changedFiles);
+    const fresh = await this.waitForDiagnostics(uris, before, 180);
+    const diagnostics = uris.flatMap((uri) => this.diagnosticsByUri.get(uri) ?? []);
+    return {
+      diagnostics: diagnostics.slice(0, 100),
+      language: this.options.language,
+      engine: this.options.engineName,
+      available: true,
+      state: "ready",
+      fresh,
+      ...(fresh ? {} : { reason: "Language server did not publish fresh diagnostics within the post-edit window." })
+    };
   }
 
   prewarm(): void {
@@ -101,6 +126,7 @@ export class LspSymbolSession {
     };
     this.client = this.options.createClient?.(clientOptions) ?? new StdioLspClient(clientOptions);
     this.unsubscribe = this.client.onNotification((method, params) => {
+      if (method === "textDocument/publishDiagnostics") this.captureDiagnostics(params);
       const next = this.options.readiness(method, params);
       if (next === "warming") {
         this.readinessGeneration += 1;
@@ -254,6 +280,51 @@ export class LspSymbolSession {
     try { this.client.notify("workspace/didChangeWatchedFiles", { changes }); } catch { /* analyzer may not register watchers */ }
   }
 
+  private captureDiagnostics(params: unknown): void {
+    const record = params && typeof params === "object" ? params as Record<string, unknown> : {};
+    const uri = typeof record.uri === "string" ? record.uri : "";
+    if (!uri) return;
+    const raw = Array.isArray(record.diagnostics) ? record.diagnostics : [];
+    const diagnostics = raw.flatMap((value): SemanticDiagnostic[] => {
+      if (!value || typeof value !== "object") return [];
+      const item = value as Record<string, unknown>;
+      const range = item.range && typeof item.range === "object" ? item.range as Record<string, unknown> : {};
+      const start = range.start && typeof range.start === "object" ? range.start as Record<string, unknown> : {};
+      let filePath: string | undefined;
+      try {
+        const absolute = fileURLToPath(uri);
+        const relative = path.relative(this.options.root, absolute);
+        filePath = relative && !relative.startsWith("..") ? relative : absolute;
+      } catch {
+        filePath = uri;
+      }
+      return [{
+        ...(filePath ? { path: filePath } : {}),
+        ...(Number.isInteger(start.line) ? { line: Number(start.line) + 1 } : {}),
+        ...(Number.isInteger(start.character) ? { column: Number(start.character) + 1 } : {}),
+        severity: lspDiagnosticSeverity(item.severity),
+        ...(typeof item.code === "string" || typeof item.code === "number" ? { code: item.code } : {}),
+        message: typeof item.message === "string" ? item.message : "Language server diagnostic"
+      }];
+    });
+    this.diagnosticsByUri.set(uri, diagnostics);
+    this.diagnosticGenerationByUri.set(uri, (this.diagnosticGenerationByUri.get(uri) ?? 0) + 1);
+  }
+
+  private async waitForDiagnostics(
+    uris: readonly string[],
+    before: ReadonlyMap<string, number>,
+    timeoutMs: number
+  ): Promise<boolean> {
+    if (uris.length === 0) return true;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (uris.every((uri) => (this.diagnosticGenerationByUri.get(uri) ?? 0) > (before.get(uri) ?? 0))) return true;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    return uris.every((uri) => (this.diagnosticGenerationByUri.get(uri) ?? 0) > (before.get(uri) ?? 0));
+  }
+
   private markReady(): void {
     if (this.state === "closed") return;
     this.state = "ready";
@@ -326,186 +397,9 @@ export class LspSymbolSession {
   }
 }
 
-async function serverRequestHandler(method: string, params: unknown): Promise<unknown> {
-  if (method === "workspace/configuration") {
-    const items = asRecord(params).items;
-    return Array.isArray(items) ? items.map(() => null) : [];
-  }
-  if (method === "window/workDoneProgress/create" || method === "client/registerCapability" || method === "client/unregisterCapability") {
-    return null;
-  }
-  return null;
-}
-
-function extractQueryTerms(task: string, changedFiles: readonly string[], language: "dart" | "java"): string[] {
-  const extension = language === "dart" ? /\.dart$/i : /\.java$/i;
-  const taskTerms = String(task).match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [];
-  const fileTerms = changedFiles.flatMap((file) => path.basename(file).replace(extension, "").match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? []);
-  const seen = new Set<string>();
-  return [...taskTerms, ...fileTerms]
-    .filter((term) => term.length >= 3 && !STOP_WORDS.has(term.toLowerCase()))
-    .sort((left, right) => termPriority(right) - termPriority(left) || right.length - left.length)
-    .filter((term) => {
-      const key = term.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 8);
-}
-
-function termPriority(term: string): number {
-  let score = 0;
-  if (/[A-Z]/.test(term.slice(1))) score += 4;
-  if (/[_$]/.test(term)) score += 2;
-  if (term.length >= 8) score += 1;
-  return score;
-}
-
-function parseSymbol(value: unknown): LspSymbol | null {
-  const record = asRecord(value);
-  const name = typeof record.name === "string" ? record.name : "";
-  const location = parseLocation(record.location);
-  if (!name || !location) return null;
-  return {
-    name,
-    ...(typeof record.kind === "number" ? { kind: record.kind } : {}),
-    location
-  };
-}
-
-function parseSymbols(value: unknown): readonly LspSymbol[] {
-  return Array.isArray(value)
-    ? value.map(parseSymbol).filter((item): item is LspSymbol => item !== null)
-    : [];
-}
-
-function parseLocation(value: unknown): LspLocation | null {
-  const record = asRecord(value);
-  const uri = typeof record.uri === "string" ? record.uri : "";
-  const range = parseRange(record.range);
-  return uri && range ? { uri, range } : null;
-}
-
-function parseRange(value: unknown): LspRange | null {
-  const record = asRecord(value);
-  const start = parsePosition(record.start);
-  const end = parsePosition(record.end);
-  return start && end ? { start, end } : null;
-}
-
-function parsePosition(value: unknown): LspPosition | null {
-  const record = asRecord(value);
-  return typeof record.line === "number" && typeof record.character === "number"
-    ? { line: record.line, character: record.character }
-    : null;
-}
-
-function locationsFromResult(value: unknown): LspLocation[] {
-  const values = Array.isArray(value) ? value : value ? [value] : [];
-  const result: LspLocation[] = [];
-  for (const item of values) {
-    const record = asRecord(item);
-    const direct = parseLocation(record);
-    if (direct) {
-      result.push(direct);
-      continue;
-    }
-    const targetUri = typeof record.targetUri === "string" ? record.targetUri : "";
-    const targetRange = parseRange(record.targetSelectionRange ?? record.targetRange);
-    if (targetUri && targetRange) result.push({ uri: targetUri, range: targetRange });
-  }
-  return result;
-}
-
-async function symbolPosition(symbol: LspSymbol): Promise<LspPosition> {
-  const start = symbol.location.range.start;
-  if (!symbol.location.uri.startsWith("file:")) return start;
-  try {
-    const file = fileURLToPath(symbol.location.uri);
-    const text = await readFile(file, "utf8");
-    const lines = text.split(/\r?\n/);
-    const lastLine = Math.min(symbol.location.range.end.line, start.line + 12, lines.length - 1);
-    const pattern = new RegExp(`(^|[^A-Za-z0-9_$])${escapeRegExp(symbol.name)}([^A-Za-z0-9_$]|$)`);
-    for (let line = Math.max(0, start.line); line <= lastLine; line += 1) {
-      const value = lines[line] ?? "";
-      const match = pattern.exec(value);
-      if (match) return { line, character: match.index + (match[1]?.length ?? 0) };
-    }
-  } catch {
-    // Fall back to the symbol range start.
-  }
-  return start;
-}
-
-function compactLocation(root: string, location: LspLocation): CompactLocation | null {
-  if (!location.uri.startsWith("file:")) return null;
-  try {
-    const file = fileURLToPath(location.uri);
-    if (!isPathWithin(root, file)) return null;
-    const relative = path.relative(root, file);
-    return {
-      path: relative && !relative.startsWith("..") ? relative : file,
-      line: location.range.start.line + 1,
-      column: location.range.start.character + 1
-    };
-  } catch {
-    return null;
-  }
-}
-
-function uniqueLocations(locations: readonly CompactLocation[]): CompactLocation[] {
-  const seen = new Set<string>();
-  return locations.filter((location) => {
-    const key = `${location.path}:${location.line}:${location.column}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function isWithinRoot(root: string, uri: string): boolean {
-  if (!uri.startsWith("file:")) return false;
-  try { return isPathWithin(root, fileURLToPath(uri)); } catch { return false; }
-}
-
-function isPathWithin(root: string, file: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(file));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function symbolRank(name: string, term: string): number {
-  const left = name.toLowerCase();
-  const right = term.toLowerCase();
-  if (left === right) return 4;
-  if (left.startsWith(right)) return 3;
-  if (left.includes(right)) return 2;
-  return 1;
-}
-
-function selectRelevantSymbols(symbols: readonly LspSymbol[], term: string): LspSymbol[] {
-  const ranked = [...symbols].sort((left, right) => symbolRank(right.name, term) - symbolRank(left.name, term));
-  const exact = ranked.filter((symbol) => symbol.name.toLowerCase() === term.toLowerCase());
-  if (exact.length > 0) return exact;
-  return ranked.filter((symbol) => symbolRank(symbol.name, term) >= 2);
-}
-
-function displayLanguage(language: "dart" | "java"): string {
-  return language === "dart" ? "Dart" : "Java";
-}
-
-function formatLocation(location: CompactLocation): string {
-  return `${location.path}:${location.line}:${location.column}`;
-}
-
-function asRecord(value: unknown): Record<string, any> {
-  return value && typeof value === "object" ? value as Record<string, any> : {};
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function shortHash(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+function lspDiagnosticSeverity(value: unknown): SemanticDiagnostic["severity"] {
+  if (value === 1) return "error";
+  if (value === 2) return "warning";
+  if (value === 3) return "suggestion";
+  return "message";
 }

@@ -7,6 +7,7 @@ import { API, type NodeHandle, type Project, type Snapshot } from "typescript/un
 import { isIdentifier, type Node, type SourceFile } from "typescript/unstable/ast";
 
 import type { ContextEvidence, TaskContextRequest } from "../../domain/task-context.js";
+import type { SemanticDiagnostic, SemanticDiagnosticsResult } from "../../ports/context-providers.js";
 import type { SemanticEngine } from "./semantic-context-adapter.js";
 
 const ENGINE_NAME = "typescript-7-native-api";
@@ -59,6 +60,50 @@ export class TypeScriptSemanticEngine implements SemanticEngine {
     const symbols = collectMatchedSymbols(project, root, candidateFiles, terms, maxItems);
     const perItemBudget = Math.max(700, Math.floor(maxChars / Math.max(1, symbols.length)));
     return symbols.map((symbol) => toEvidence(root, symbol, perItemBudget));
+  }
+
+  async diagnostics(root: string, changedFiles: readonly string[]): Promise<SemanticDiagnosticsResult> {
+    const normalizedRoot = path.resolve(root);
+    const session = await this.sessionFor(normalizedRoot);
+    const project = session.refresh(changedFiles);
+    const diagnostics: SemanticDiagnostic[] = [];
+    const seen = new Set<string>();
+
+    for (const file of changedFiles) {
+      const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(normalizedRoot, file);
+      const sourceFile = project.program.getSourceFile(absolute);
+      if (!sourceFile) continue;
+      const raw = [
+        ...project.program.getSyntacticDiagnostics(absolute),
+        ...project.program.getBindDiagnostics(absolute),
+        ...project.program.getSemanticDiagnostics(absolute)
+      ];
+      for (const item of raw) {
+        const position = sourceFile.getLineAndCharacterOfPosition(Math.max(0, item.pos ?? 0));
+        const relative = path.relative(normalizedRoot, item.fileName || absolute);
+        const diagnostic: SemanticDiagnostic = {
+          path: relative && !relative.startsWith("..") ? relative : (item.fileName || absolute),
+          line: position.line + 1,
+          column: position.character + 1,
+          severity: diagnosticSeverity(item.category),
+          code: item.code,
+          message: item.text
+        };
+        const key = `${diagnostic.path}:${diagnostic.line}:${diagnostic.column}:${diagnostic.code}:${diagnostic.message}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        diagnostics.push(diagnostic);
+      }
+    }
+
+    return {
+      diagnostics: diagnostics.slice(0, 100),
+      language: "typescript",
+      engine: ENGINE_NAME,
+      available: true,
+      state: "ready",
+      fresh: true
+    };
   }
 
   async close(): Promise<void> {
@@ -391,6 +436,13 @@ function normalizePath(value: string): string {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function diagnosticSeverity(category: number): SemanticDiagnostic["severity"] {
+  if (category === 1) return "error";
+  if (category === 0) return "warning";
+  if (category === 2) return "suggestion";
+  return "message";
 }
 
 function shortHash(value: string): string {

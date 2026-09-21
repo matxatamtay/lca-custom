@@ -39,6 +39,11 @@ test("every alias resolves to a tool allowed by its facade", () => {
   }
 });
 
+test("workspace_edit batch alias resolves to transactional apply_patch", () => {
+  assert.equal(resolveCompactAction("workspace_edit", "batch", backendTools), "apply_patch");
+  assert.match(COMPACT_SERVER_INSTRUCTIONS, /action=batch\/apply_patch/);
+});
+
 test("unknown and cross-facade actions are rejected", () => {
   assert.throws(
     () => resolveCompactAction("workspace_read", "run_command", backendTools),

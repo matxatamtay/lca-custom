@@ -303,8 +303,15 @@ export class SessionAwareMemoryPort implements MemoryPort {
   ) {}
 
   async recall(request: TaskContextRequest): Promise<readonly ContextEvidence[]> {
-    await this.sessions.ensureSession(request.root, request.task);
-    return this.memory.recall(request);
+    // Session bootstrap used to sit fully in front of smart-search, making the
+    // first memory lookup pay health/reconciliation/session creation serially.
+    // The first search is already project-scoped and the new session has no
+    // observations yet, so bootstrap can safely overlap the search. Later
+    // recalls still include the active session through sessionIdForRoot.
+    const session = this.sessions.ensureSession(request.root, request.task);
+    const recall = this.memory.recall(request);
+    const [, evidence] = await Promise.all([session, recall]);
+    return evidence;
   }
 }
 

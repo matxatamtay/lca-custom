@@ -56,6 +56,7 @@ async function startServer(workspace) {
       ...process.env,
       PORT: String(port),
       AGENT_WORKSPACE: workspace,
+      AGENT_EXTRA_ROOTS_JSON: "[]",
       AGENTMEMORY_RECORD_SESSIONS: "0",
       MCP_AUTH_TOKEN: "",
       AGENT_AUDIT: "0"
@@ -131,7 +132,12 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 144, `expected complete internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 152, `expected complete internal backend coverage, received ${assigned.size} actions`);
+  for (const action of ["worktree_create", "worktree_status", "worktree_diff", "worktree_check", "worktree_gc", "worktree_cleanup"]) {
+    assert.deepEqual(assigned.get(action), ["workspace_git"], `${action} must stay behind workspace_git`);
+  }
+  assert.deepEqual(assigned.get("verify_changed"), ["workspace_verify"], "verify_changed must stay behind workspace_verify");
+  assert.deepEqual(assigned.get("performance_follow"), ["workspace_status"], "performance_follow must stay behind workspace_status");
   for (const directName of DIRECT_NAMES) assert.ok(compactNames.includes(directName), `${directName} must remain direct`);
 
   const writeResult = await client.callTool({
@@ -146,6 +152,36 @@ try {
   });
   assert.equal(parseJsonResult(readResult).content, "compact facade works\n");
 
+  const fusedPatchResult = await client.callTool({
+    name: "workspace_edit",
+    arguments: {
+      action: "apply_patch",
+      arguments: {
+        operations: [{
+          op: "update",
+          path: "compact.txt",
+          edits: [{ old_text: "compact facade works", new_text: "compact facade works faster" }]
+        }],
+        verify: "changed"
+      }
+    }
+  });
+  assert.notEqual(fusedPatchResult.isError, true, `fused apply_patch verification failed: ${firstText(fusedPatchResult)}`);
+  const fusedPatch = parseJsonResult(fusedPatchResult);
+  assert.equal(fusedPatch.ok, true);
+  assert.equal(fusedPatch.verification?.requested, true);
+  assert.equal(fusedPatch.verification?.ok, true);
+  assert.ok(Number(fusedPatch.verification?.duration_ms) >= 0);
+
+  const changedPlanResult = await client.callTool({
+    name: "workspace_verify",
+    arguments: { action: "verify_changed", arguments: { cwd: workspace, changed_files: ["compact.txt"], execute: false, fresh: true } }
+  });
+  assert.notEqual(changedPlanResult.isError, true, `verify_changed runtime binding failed: ${firstText(changedPlanResult)}`);
+  const changedPlan = parseJsonResult(changedPlanResult);
+  assert.equal(changedPlan.root, workspace);
+  assert.deepEqual(changedPlan.changed_files, ["compact.txt"]);
+
   const blocked = await client.callTool({
     name: "workspace_read",
     arguments: { action: "run_command", arguments: { command: "echo should-not-run" } }
@@ -155,6 +191,27 @@ try {
 
   const status = parseJsonResult(await client.callTool({ name: "workspace_status", arguments: {} }));
   assert.equal(status.tool_surface, "compact");
+  assert.ok(status.runtime_recovery, "workspace_info must surface runtime recovery metrics");
+  assert.ok(status.runtime_recovery.transactions, "workspace_info recovery metrics must include transactions");
+  assert.ok(status.performance, "workspace_info must surface performance telemetry");
+  assert.equal(status.performance.version, 2);
+  assert.ok(status.performance.aggregate, "performance telemetry must include aggregate task metrics");
+  assert.ok(status.performance_follow, "workspace_info must surface performance follow rollups");
+  assert.equal(status.performance_follow.version, 1);
+
+  const performance = parseJsonResult(await client.callTool({
+    name: "workspace_status",
+    arguments: { action: "performance", arguments: { path: workspace, window_days: 30, task_class: "all", compact: true } }
+  }));
+  assert.equal(performance.version, 1);
+  assert.equal(performance.query.root, workspace);
+  assert.ok(Array.isArray(performance.bottlenecks));
+
+  const doctor = parseJsonResult(await client.callTool({
+    name: "workspace_status",
+    arguments: { action: "doctor", arguments: {} }
+  }));
+  assert.ok(doctor.runtime_recovery, "workspace_doctor must surface runtime recovery metrics");
 
   const lcaInput = compactTools.find((tool) => tool.name === "lca_input");
   assert.equal(lcaInput?._meta?.["openai/outputTemplate"], "ui://widget/lca-compact-input-v2.html");

@@ -6,6 +6,7 @@ import type {
   SemanticContextPort,
   SemanticContextResult,
   SemanticContextState,
+  SemanticDiagnosticsResult,
   SemanticLanguage
 } from "../../ports/context-providers.js";
 import { DartSemanticEngine } from "./dart-semantic-engine.js";
@@ -22,6 +23,7 @@ export interface SemanticEngine {
   readonly language: Exclude<SemanticLanguage, "unknown">;
   readonly name: string;
   context(request: TaskContextRequest): Promise<readonly ContextEvidence[] | SemanticEngineResult>;
+  diagnostics?(root: string, changedFiles: readonly string[]): Promise<SemanticDiagnosticsResult>;
   close?(): Promise<void>;
 }
 
@@ -74,6 +76,53 @@ export class SemanticContextAdapter implements SemanticContextPort {
     } catch (error) {
       return {
         evidence: [],
+        language,
+        engine: engine.name,
+        available: false,
+        state: "unavailable",
+        reason: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  async diagnostics(root: string, changedFiles: readonly string[]): Promise<SemanticDiagnosticsResult> {
+    const language = await detectSemanticLanguage(root, changedFiles);
+    if (language === "unknown") {
+      return {
+        diagnostics: [],
+        language,
+        engine: null,
+        available: false,
+        state: "unavailable",
+        reason: "No TypeScript/JavaScript, Dart/Flutter, or Java project markers were detected."
+      };
+    }
+    const engine = this.engines.get(language);
+    if (!engine) {
+      return {
+        diagnostics: [],
+        language,
+        engine: null,
+        available: false,
+        state: "unavailable",
+        reason: `${language} semantic engine is not registered yet.`
+      };
+    }
+    if (!engine.diagnostics) {
+      return {
+        diagnostics: [],
+        language,
+        engine: engine.name,
+        available: false,
+        state: "unavailable",
+        reason: `${engine.name} does not expose changed-file diagnostics.`
+      };
+    }
+    try {
+      return await engine.diagnostics(root, changedFiles);
+    } catch (error) {
+      return {
+        diagnostics: [],
         language,
         engine: engine.name,
         available: false,

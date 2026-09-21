@@ -21,7 +21,8 @@ const STOP_WORDS = new Set([
   "about", "after", "before", "build", "change", "check", "code", "context", "could", "current",
   "debug", "does", "file", "files", "find", "fix", "from", "function", "implement", "into", "issue",
   "make", "need", "project", "refactor", "remove", "service", "should", "that", "this", "trace",
-  "understand", "what", "when", "where", "which", "with", "without", "would"
+  "understand", "what", "when", "where", "which", "with", "without", "would", "architecture", "architectural",
+  "performance", "improvements", "bottlenecks", "measurable", "speculative", "remaining", "telemetry", "prioritize"
 ]);
 
 export interface CodeGraphIndexReceipt {
@@ -50,28 +51,49 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
   private readonly revisionByRoot = new Map<string, string | null>();
   private readonly cache = new Map<string, readonly ContextEvidence[]>();
   private readonly inFlight = new Map<string, Promise<readonly ContextEvidence[]>>();
+  private readonly telemetryByRoot = new Map<string, Readonly<Record<string, unknown>>>();
 
   constructor(private readonly options: CodeGraphAdapterOptions) {}
 
   async ensureIndexed(root: string, changedFiles: readonly string[] = []): Promise<void> {
     const normalizedRoot = path.resolve(root);
     const previousRevision = this.revisionByRoot.get(normalizedRoot);
+    const startedAt = performance.now();
     const receipt = await this.options.indexer.ensureIndexed(normalizedRoot, changedFiles);
+    this.mergeTelemetry(normalizedRoot, {
+      index_ms: elapsedMs(startedAt),
+      index_synced: receipt.synced
+    });
     this.revisionByRoot.set(normalizedRoot, receipt.revision);
-    if (changedFiles.length > 0 || previousRevision !== undefined && previousRevision !== receipt.revision) {
+    if ((changedFiles.length > 0 && receipt.synced) || previousRevision !== undefined && previousRevision !== receipt.revision) {
       this.evictRoot(normalizedRoot);
     }
+  }
+
+  async prewarm(root: string): Promise<void> {
+    const normalizedRoot = path.resolve(root);
+    const startedAt = performance.now();
+    await this.ensureIndexed(normalizedRoot);
+    const result = await this.options.client.callTool("codegraph_status", { projectPath: normalizedRoot });
+    if (result.isError) throw new Error(extractText(result) || "CodeGraph status prewarm failed.");
+    this.mergeTelemetry(normalizedRoot, { prewarm_ms: elapsedMs(startedAt) });
+  }
+
+  telemetry(root: string): Readonly<Record<string, unknown>> | undefined {
+    return this.telemetryByRoot.get(path.resolve(root));
   }
 
   close(): Promise<void> {
     this.cache.clear();
     this.inFlight.clear();
     this.revisionByRoot.clear();
+    this.telemetryByRoot.clear();
     return this.options.client.close();
   }
 
   async context(request: TaskContextRequest): Promise<readonly ContextEvidence[]> {
     const projectPath = path.resolve(request.root);
+    const startedAt = performance.now();
     const route = routeCodeGraphRequest(request, projectPath);
     const revision = this.revisionByRoot.get(projectPath) ?? null;
     const cacheKey = revision ? this.cacheKey(projectPath, revision, route) : null;
@@ -80,19 +102,30 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
       const cached = this.cache.get(cacheKey);
       if (cached) {
         this.touchCache(cacheKey, cached);
-        return markCacheHit(cached);
+        const hit = markCacheHit(cached);
+        this.recordContextTelemetry(projectPath, route, startedAt, true);
+        return hit;
       }
       const pending = this.inFlight.get(cacheKey);
-      if (pending) return markCacheHit(await pending);
+      if (pending) {
+        const hit = markCacheHit(await pending);
+        this.recordContextTelemetry(projectPath, route, startedAt, true);
+        return hit;
+      }
     }
 
     const operation = this.executeRoute(request, projectPath, revision, route);
-    if (!cacheKey) return operation;
+    if (!cacheKey) {
+      const evidence = await operation;
+      this.recordContextTelemetry(projectPath, route, startedAt, false);
+      return evidence;
+    }
 
     this.inFlight.set(cacheKey, operation);
     try {
       const evidence = await operation;
       this.storeCache(cacheKey, evidence);
+      this.recordContextTelemetry(projectPath, route, startedAt, false);
       return evidence;
     } finally {
       this.inFlight.delete(cacheKey);
@@ -105,17 +138,79 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     revision: string | null,
     route: CodeGraphRoute
   ): Promise<readonly ContextEvidence[]> {
-    const result = await this.options.client.callTool(route.tool, route.args);
-    if (result.isError) {
-      throw new Error(extractText(result) || `CodeGraph ${route.tool} failed.`);
+    if (route.mode === "deep") {
+      const staged = await this.executeStagedDeepRoute(request, projectPath, revision, route);
+      if (staged) return staged;
+    }
+    return this.executeSingleRoute(request, projectPath, revision, route, route.mode === "deep" ? ["search", "relation", "deep"] : [route.mode]);
+  }
+
+  private async executeStagedDeepRoute(
+    request: TaskContextRequest,
+    projectPath: string,
+    revision: string | null,
+    deepRoute: CodeGraphRoute
+  ): Promise<readonly ContextEvidence[] | null> {
+    const terms = extractQueryTerms(request.task, request.changedFiles ?? []);
+    const primary = terms[0];
+    if (!primary) return null;
+    const limit = Math.max(3, Math.min(12, request.budget?.maxItems ?? 8));
+    const searchRoute: CodeGraphRoute = {
+      tool: "codegraph_search",
+      mode: "search",
+      args: { query: primary, limit, projectPath }
+    };
+    const search = await this.callRoute(searchRoute);
+    const escalationPath: string[] = ["search"];
+    if (relationshipSignal(search.content) >= 3) {
+      return this.evidenceFromContent(request, projectPath, revision, searchRoute, search.content, escalationPath);
     }
 
-    const content = extractText(result).trim();
-    if (!content) return [];
-    const providerCap = route.mode === "deep" ? 14_000 : 8_000;
-    const requestedCap = request.budget?.maxChars ?? providerCap;
-    const boundedContent = content.slice(0, Math.max(1_000, Math.min(providerCap, requestedCap)));
+    if (!isEmptyGraphResult(search.content)) {
+      const relationRoute = stagedRelationRoute(request, primary, projectPath, limit);
+      escalationPath.push(relationRoute.mode);
+      const relation = await this.callRoute(relationRoute);
+      if (relationshipSignal(relation.content) >= 2) {
+        return this.evidenceFromContent(request, projectPath, revision, relationRoute, relation.content, escalationPath);
+      }
+    }
 
+    escalationPath.push("deep");
+    const deep = await this.callRoute(deepRoute);
+    if (!deep.content.trim()) return [];
+    return this.evidenceFromContent(request, projectPath, revision, deepRoute, deep.content, escalationPath);
+  }
+
+  private async executeSingleRoute(
+    request: TaskContextRequest,
+    projectPath: string,
+    revision: string | null,
+    route: CodeGraphRoute,
+    escalationPath: readonly string[]
+  ): Promise<readonly ContextEvidence[]> {
+    const result = await this.callRoute(route);
+    if (!result.content.trim()) return [];
+    return this.evidenceFromContent(request, projectPath, revision, route, result.content, escalationPath);
+  }
+
+  private async callRoute(route: CodeGraphRoute): Promise<{ content: string }> {
+    const result = await this.options.client.callTool(route.tool, route.args);
+    if (result.isError) throw new Error(extractText(result) || `CodeGraph ${route.tool} failed.`);
+    return { content: extractText(result).trim() };
+  }
+
+  private evidenceFromContent(
+    request: TaskContextRequest,
+    projectPath: string,
+    revision: string | null,
+    route: CodeGraphRoute,
+    content: string,
+    escalationPath: readonly string[]
+  ): readonly ContextEvidence[] {
+    const compacted = compactCodeGraphContent(content, route.mode);
+    const providerCap = route.mode === "deep" ? 6_000 : 4_000;
+    const requestedCap = request.budget?.maxChars ?? providerCap;
+    const boundedContent = compacted.content.slice(0, Math.max(1_000, Math.min(providerCap, requestedCap)));
     return [{
       id: `codegraph-${shortHash(`${projectPath}\u0000${route.tool}\u0000${stableStringify(route.args)}\u0000${boundedContent}`)}`,
       provider: "codegraph",
@@ -128,9 +223,28 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
         mode: route.mode,
         revision,
         cache_hit: false,
-        truncated: boundedContent.length < content.length
+        cold_router_v2: escalationPath.length > 1,
+        escalation_path: escalationPath,
+        source_omitted: compacted.sourceOmitted,
+        truncated: boundedContent.length < compacted.content.length || compacted.sourceOmitted
       }
     }];
+  }
+
+  private recordContextTelemetry(root: string, route: CodeGraphRoute, startedAt: number, cacheHit: boolean): void {
+    this.mergeTelemetry(root, {
+      query_ms: elapsedMs(startedAt),
+      route: route.mode,
+      cache_hit: cacheHit
+    });
+  }
+
+  private mergeTelemetry(root: string, values: Readonly<Record<string, unknown>>): void {
+    const normalizedRoot = path.resolve(root);
+    this.telemetryByRoot.set(normalizedRoot, {
+      ...(this.telemetryByRoot.get(normalizedRoot) ?? {}),
+      ...values
+    });
   }
 
   private cacheKey(projectPath: string, revision: string, route: CodeGraphRoute): string {
@@ -172,6 +286,8 @@ export interface CodeGraphCliIndexerOptions {
 export class CodeGraphCliIndexer implements CodeGraphIndexer {
   private readonly lastSyncByRoot = new Map<string, number>();
   private readonly lastReceiptByRoot = new Map<string, CodeGraphIndexReceipt>();
+  private readonly lastChangedFilesRevisionByRoot = new Map<string, string>();
+  private readonly inFlightByRoot = new Map<string, Promise<CodeGraphIndexReceipt>>();
   private readonly syncTtlMs: number;
 
   constructor(private readonly options: CodeGraphCliIndexerOptions) {
@@ -180,10 +296,31 @@ export class CodeGraphCliIndexer implements CodeGraphIndexer {
 
   async ensureIndexed(root: string, changedFiles: readonly string[] = []): Promise<CodeGraphIndexReceipt> {
     const normalizedRoot = path.resolve(root);
+    const forceSync = changedFiles.length > 0;
+    const pending = this.inFlightByRoot.get(normalizedRoot);
+    if (pending) {
+      const completed = await pending;
+      if (!forceSync) return { ...completed, synced: false, checkedAt: Date.now() };
+    }
+
+    const operation = this.ensureIndexedOnce(normalizedRoot, changedFiles);
+    this.inFlightByRoot.set(normalizedRoot, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.inFlightByRoot.get(normalizedRoot) === operation) this.inFlightByRoot.delete(normalizedRoot);
+    }
+  }
+
+  private async ensureIndexedOnce(normalizedRoot: string, changedFiles: readonly string[]): Promise<CodeGraphIndexReceipt> {
     const databasePath = path.join(normalizedRoot, ".codegraph", "codegraph.db");
     const lastSync = this.lastSyncByRoot.get(normalizedRoot) ?? 0;
     const cached = this.lastReceiptByRoot.get(normalizedRoot);
-    const forceSync = changedFiles.length > 0;
+    const changedFilesRevision = changedFiles.length > 0
+      ? await changedFilesRevisionToken(normalizedRoot, changedFiles)
+      : null;
+    const forceSync = changedFilesRevision !== null
+      && this.lastChangedFilesRevisionByRoot.get(normalizedRoot) !== changedFilesRevision;
     if (!forceSync && cached && Date.now() - lastSync < this.syncTtlMs) {
       const revision = await databaseRevision(databasePath);
       const receipt = { ...cached, revision, synced: false, checkedAt: Date.now() };
@@ -216,6 +353,9 @@ export class CodeGraphCliIndexer implements CodeGraphIndexer {
     };
     this.lastSyncByRoot.set(normalizedRoot, receipt.checkedAt);
     this.lastReceiptByRoot.set(normalizedRoot, receipt);
+    if (changedFilesRevision !== null) {
+      this.lastChangedFilesRevisionByRoot.set(normalizedRoot, changedFilesRevision);
+    }
     return receipt;
   }
 }
@@ -309,6 +449,37 @@ function routeCodeGraphRequest(request: TaskContextRequest, projectPath: string)
   };
 }
 
+function stagedRelationRoute(
+  request: TaskContextRequest,
+  primary: string,
+  projectPath: string,
+  limit: number
+): CodeGraphRoute {
+  const task = request.task.toLowerCase();
+  if (request.intent === "review" || /\b(?:architecture|architectural|relationship|cross-module|blast radius|affected|impact)\b/i.test(task)) {
+    return { tool: "codegraph_impact", mode: "impact", args: { symbol: primary, depth: 2, projectPath } };
+  }
+  return { tool: "codegraph_callers", mode: "callers", args: { symbol: primary, limit, projectPath } };
+}
+
+function isEmptyGraphResult(content: string): boolean {
+  const text = String(content || "").trim();
+  return !text || /^(?:no results?|not found|no matches?)/i.test(text) || /no results found/i.test(text);
+}
+
+function relationshipSignal(content: string): number {
+  const text = String(content || "").trim();
+  if (isEmptyGraphResult(text)) return 0;
+  let score = 0;
+  const fileRefs = text.match(/(?:^|\s)[\w./\\-]+\.(?:ts|tsx|js|jsx|mjs|cjs|dart|java|py|go|rs|cs)(?::\d+)?/g) ?? [];
+  if (fileRefs.length >= 1) score += 1;
+  if (fileRefs.length >= 2) score += 1;
+  if (/\b(?:caller|callee|affected|depends|dependency|blast radius|references?|used by|impact)\b/i.test(text)) score += 2;
+  if (/\b(?:found|symbols?)\b/i.test(text) && /\bacross\b/i.test(text)) score += 1;
+  if (text.split(/\r?\n/).filter(Boolean).length >= 5) score += 1;
+  return score;
+}
+
 function isDeepStructuralTask(task: string, intent: TaskContextRequest["intent"], termCount: number): boolean {
   if (/\b(?:architecture|architectural|flow|call path|end-to-end|relationship|cross-module|across modules|kiến trúc|luồng|quan hệ)\b/i.test(task)) return true;
   if (/\btrace\b/i.test(task) && termCount >= 2) return true;
@@ -343,6 +514,22 @@ function termPriority(term: string): number {
   return score;
 }
 
+function compactCodeGraphContent(content: string, mode: CodeGraphRoute["mode"]): { content: string; sourceOmitted: boolean } {
+  if (mode !== "deep") return { content, sourceOmitted: false };
+  const markers = ["\n**Source Code**", "\n## Source Code", "\nSource Code\n"];
+  let cut = -1;
+  for (const marker of markers) {
+    const index = content.indexOf(marker);
+    if (index >= 0 && (cut < 0 || index < cut)) cut = index;
+  }
+  if (cut < 0) return { content, sourceOmitted: false };
+  const summary = content.slice(0, cut).trimEnd();
+  return {
+    content: `${summary}\n\nSource snippets omitted from compact context; read the cited files/symbols when exact code is needed.`,
+    sourceOmitted: true
+  };
+}
+
 function markCacheHit(evidence: readonly ContextEvidence[]): readonly ContextEvidence[] {
   return evidence.map((item) => ({
     ...item,
@@ -363,6 +550,23 @@ function stableStringify(value: Readonly<Record<string, unknown>>): string {
 
 function shortHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+export async function changedFilesRevisionToken(root: string, changedFiles: readonly string[]): Promise<string> {
+  const normalized = [...new Set(changedFiles.map((file) => path.isAbsolute(file) ? path.resolve(file) : path.resolve(root, file)))].sort();
+  const hash = createHash("sha256");
+  for (const file of normalized) {
+    hash.update(path.relative(root, file));
+    hash.update("\0");
+    try {
+      const metadata = await stat(file);
+      hash.update(`${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`);
+    } catch {
+      hash.update("missing");
+    }
+    hash.update("\0");
+  }
+  return hash.digest("hex");
 }
 
 async function databaseRevision(databasePath: string): Promise<string | null> {
@@ -388,4 +592,8 @@ async function exists(target: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
 }

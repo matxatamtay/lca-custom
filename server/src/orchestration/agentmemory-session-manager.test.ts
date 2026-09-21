@@ -90,9 +90,17 @@ test("rechecks runtime readiness when reusing an existing session", async () => 
   assert.equal(client.starts.length, 1);
 });
 
-test("starts a session before delegated memory recall", async () => {
+test("overlaps first session bootstrap with delegated memory recall", async () => {
   const events: string[] = [];
   const client = fakeClient(events);
+  let releaseStart: (() => void) | undefined;
+  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  client.startSession = async (input) => {
+    events.push("start");
+    client.starts.push(input);
+    await startGate;
+    events.push("start-done");
+  };
   const sessions = new AgentMemorySessionManager({
     supervisor: fakeSupervisor(events),
     client,
@@ -105,9 +113,13 @@ test("starts a session before delegated memory recall", async () => {
     }
   });
 
-  await memory.recall({ task: "Trace auth flow", root: "/repo" });
+  const pending = memory.recall({ task: "Trace auth flow", root: "/repo" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(events.includes("recall"), "memory recall should start before session bootstrap finishes");
+  assert.equal(events.includes("start-done"), false);
+  releaseStart?.();
+  await pending;
 
-  assert.deepEqual(events, ["ready", "start", "recall"]);
   assert.equal(client.starts[0]?.title, "Trace auth flow");
 });
 
