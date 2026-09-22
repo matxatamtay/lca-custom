@@ -102,9 +102,9 @@ neo-blessed renderer
         ↓
 LcaTuiClient
         ↓ persistent Streamable HTTP
-20 compact MCP tools
+19 compact MCP tools
         ↓ in-memory backend
-144 implementation actions
+176 hidden implementation actions
 ```
 
 Project mutation, runtime lifecycle, and AgentMemory portability operations go through a small launcher subprocess bridge. Before every launcher command it reloads `.env.local`, removes values deleted in the Config screen, and passes the current values by environment rather than command-line arguments. The persistent MCP client reconnects once after server restarts or transport replacement.

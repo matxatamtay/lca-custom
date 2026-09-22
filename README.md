@@ -48,24 +48,140 @@ The compact workspace facades now cover the full edit-and-run loop without forci
 
 ## Quick setup
 
-Requirements:
+### 1. Requirements
 
 - Node.js 20+
 - npm and Git
 - Docker for the default managed AgentMemory engine
-- OpenAI tunnel ID and runtime API key for ChatGPT Web
+- OpenAI tunnel ID and runtime API key only when connecting ChatGPT Web through the managed private tunnel
+
+Check the basics first:
 
 ```bash
+node --version
+npm --version
+git --version
+docker --version
+```
+
+### 2. Clone and run the setup wizard
+
+```bash
+git clone https://github.com/matxatamtay/lca-custom.git
+cd lca-custom
+
 # macOS, Linux, WSL
 bash scripts/lca-custom setup
 ```
 
+Windows:
+
 ```powershell
-# Windows
+git clone https://github.com/matxatamtay/lca-custom.git
+cd lca-custom
 scripts\lca-custom.cmd setup
 ```
 
-The installer pins and verifies the core server, CodeGraph `1.5.0`, AgentMemory `0.9.28`, TypeScript output, tunnel client, local config, and service state.
+The setup wizard installs/verifies the core server, CodeGraph `1.5.0`, AgentMemory `0.9.28`, TypeScript output, tunnel client, global `lca-custom` command, local config, and managed service state. Secrets are written to local configuration only; do not commit `.env.local`.
+
+### 3. Select workspaces and start LCA
+
+```bash
+# Replace the primary project and remove stale configured roots.
+lca-custom reset /absolute/path/to/main-project
+
+# Add peer repositories when one task spans multiple repos.
+lca-custom add /absolute/path/to/another-project
+
+# Start the managed server and private tunnel in the background.
+lca-custom start --background
+
+# Verify runtime and dependencies.
+lca-custom status
+lca-custom doctor
+```
+
+For local-only development without the managed tunnel:
+
+```bash
+lca-custom start --background --no-tunnel
+```
+
+Default local endpoints:
+
+- MCP: `http://127.0.0.1:8790/mcp`
+- Health: `http://127.0.0.1:8790/healthz`
+
+A quick health check:
+
+```bash
+curl -fsS http://127.0.0.1:8790/healthz
+```
+
+### 4. Manual/developer setup
+
+Use this path when developing LCA itself and you do not need the managed installer:
+
+```bash
+git clone https://github.com/matxatamtay/lca-custom.git
+cd lca-custom/server
+npm ci
+npm start
+```
+
+Or run the server directly after building:
+
+```bash
+cd server
+npm run build:next
+PORT=8790 AGENT_WORKSPACE=/absolute/path/to/project node server.mjs
+```
+
+On Windows PowerShell:
+
+```powershell
+cd server
+npm ci
+npm run build:next
+$env:PORT = "8790"
+$env:AGENT_WORKSPACE = "C:\path\to\project"
+node server.mjs
+```
+
+This development path does not install the global `lca-custom` wrapper or configure the managed tunnel automatically.
+
+### 5. Restart after runtime/config changes
+
+```bash
+lca-custom stop
+lca-custom start --background
+lca-custom doctor
+```
+
+A restart is required after changing server code, the compact MCP schema, or environment variables consumed only at startup.
+
+### Optional self-improvement tooling
+
+The core runtime starts without these tools. Install only the sensors you want:
+
+| Tool | Used for | Behavior when missing |
+|---|---|---|
+| `ast-grep` | structural search and bounded AST rewrite planning | `workspace_search ast` / AST maintenance checks report unavailable |
+| Semgrep | invariant, security, and learned regression scans | `workspace_verify semgrep` reports `available=false` |
+| StrykerJS | incremental mutation testing | `workspace_verify mutation` reports `available=false` |
+| Renovate | dependency intelligence source | LCA still works; dependency feed is unavailable unless a local report exists |
+
+Binary discovery can be overridden in `.env.local`:
+
+```dotenv
+AST_GREP_BIN=/absolute/path/to/ast-grep
+SEMGREP_BIN=/absolute/path/to/semgrep
+STRYKER_BIN=/absolute/path/to/stryker
+RENOVATE_BIN=/absolute/path/to/renovate
+RENOVATE_FEED_PATH=/absolute/path/to/renovate-feed.json
+```
+
+Renovate remains advisory: LCA reads JSON/JSONL feed data but does not execute Renovate updates automatically. Semgrep/Stryker are also on-demand and never become mandatory `workspace_context` providers.
 
 ## Daily use
 
@@ -76,7 +192,18 @@ lca-custom start --background
 lca-custom tui
 lca-custom status
 lca-custom doctor
+
+# Analysis-only self-improvement report.
 lca-custom improve
+
+# Full analysis-only maintenance sweep.
+lca-custom improve --maintenance
+
+# Apply at most one explicitly low-risk deterministic candidate.
+lca-custom improve --maintenance --apply-safe
+
+# Apply one exact deterministic candidate by id.
+lca-custom improve --apply <candidate-id>
 ```
 
 `lca-custom improve` is analysis-only by default. It ranks current self-improvement candidates without editing source files or dependencies. Filters: `--latest`, `--performance`, `--tests`, `--dependencies`, and `--security`. `lca-custom improve --apply <candidate-id>` is explicit-only and accepts only bounded deterministic `workspace_edit.apply_patch` recipes stored on the candidate; unsupported candidates are refused before the local MCP server is contacted. Apply execution uses `workspace_context`, before/after `performance_follow` snapshots, and fused `workspace_edit` changed verification. A before/after evaluator then requires measurable evidence beyond a bounded noise threshold: performance/reliability use allowlisted `performance_follow` metrics, TEST_QUALITY uses the candidate's exact Stryker rerun when available, and SECURITY uses local Semgrep severity counts. Passing tests alone never accepts an improvement; a non-improving or regressing patch is immediately reverted through `workspace_edit undo`. Only an accepted, non-regressing improvement is persisted into the existing project-scoped AgentMemory as durable `fact` knowledge, including candidate/problem evidence, deterministic solution summary, before/after metrics, verification, affected paths, and regression-rule references when present. Future `workspace_context` calls can retrieve that memory through the existing AgentMemory provider; rejected or reverted candidates are never stored as successful improvement knowledge. `lca-custom improve --maintenance` runs the Phase 16 analysis-only maintenance sweep across performance history, Semgrep, ast-grep direct-only architecture signatures, incremental Stryker mutation telemetry, Renovate dependency feed, dependency/security state, cache behavior, Jev behavior, and CodeGraph behavior, then ranks the top candidates. `--apply-safe` is explicit and applies at most one candidate carrying a bounded deterministic recipe with an allowlisted safe class and `risk=low`; known-regression fixes require a rule reference, patch dependency updates additionally require low-risk patch metadata plus a full-green-gate marker, and architectural redesign is always refused. It never invokes a secondary model, automatic package updater, commit, or push. The final roadmap acceptance bundle is available as `npm run test:self-improvement` from `server/`; it checks the direct-only architecture invariants, self-improvement core/sensors/evaluator/maintenance tests, and the compact MCP surface together.
@@ -112,7 +239,9 @@ Detailed connector instructions: [docs/CHATGPT_WEB_CONNECTOR.md](docs/CHATGPT_WE
 
 ## Architecture
 
-The model-facing MCP server dispatches into an internal in-memory backend containing 144 implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
+The model-facing MCP server exposes nineteen public tools and currently dispatches into an internal in-memory backend containing 176 hidden implementation actions. This preserves precise handlers and compatibility while keeping the tool schema small. Cross-facade dispatch is rejected.
+
+The runtime is direct-only: LCA does not contain a Codex/Hermes/sub-agent delegation path. `workspace_context`, CodeGraph, AgentMemory, Jev, edits, verification, Git, and local integrations execute through the local LCA runtime itself.
 
 Language-native semantic analysis runs in parallel with CodeGraph. TypeScript/JavaScript uses a persistent TypeScript 7 native API/tsgo session. Dart/Flutter uses the project Dart Analysis Server over persistent LSP with background cold prewarming, so the first context call reports `warming` instead of blocking. Java uses a persistent Eclipse JDT LS session with project-isolated workspace metadata; the checksum-pinned JDT runtime lives under ignored `runtime/jdtls/` and can be provisioned with `node scripts/jdtls-runtime.mjs install`. All three return compact definition/reference locations instead of duplicating source bodies.
 
@@ -187,12 +316,35 @@ Backups use a versioned envelope, stable SHA-256 checksum, atomic writes, and fi
 
 ## Validation
 
+For the complete release gate:
+
 ```bash
 cd server
+npm ci
 npm run test:all
 ```
 
-The release gate covers TypeScript, mandatory context fan-out, persistent MCP clients, desktop bridges, compact schema budgets, Pro behavior, direct trusted execution, transport hardening, and end-to-end evals.
+For the self-improvement roadmap acceptance bundle only:
+
+```bash
+cd server
+npm run test:self-improvement
+```
+
+Useful focused checks:
+
+```bash
+npm run typecheck
+npm run test:unit
+npm run test:runtime
+npm run test:integration:context
+npm run test:compact
+npm run test:pro
+npm run test:trusted-runtime
+npm run docs:check
+```
+
+The release gate covers TypeScript, mandatory context fan-out, persistent MCP clients, desktop bridges, compact schema budgets, Pro behavior, direct trusted execution, transport hardening, self-improvement invariants, and end-to-end evals.
 
 Historical baseline versus the compact runtime:
 

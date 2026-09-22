@@ -14,15 +14,15 @@ start Local Coding Agent.
 - Let the setup wizard download `tunnel-client` when possible; fall back to a
   customer-provided path if download/extraction fails.
 - Do not print, commit, or upload API keys, tunnel IDs, auth tokens, or local config.
-- Default to `mode=full` and `policy=full` in the setup wizard.
+- LCA is trusted-local/direct-only. Do not configure Codex, Hermes, delegated model providers, or a secondary agent runner.
 
 ## Steps
 
 1. Check prerequisites:
-   - `node -v` must be 18 or newer.
-   - `git --version` should work.
+   - `node -v` must be 20 or newer.
+   - `npm --version`, `git --version`, and `docker --version` should work.
 2. Clone the repo if needed:
-   - `git clone https://github.com/luongduy2798/local-coding-agent.git`
+   - `git clone https://github.com/matxatamtay/lca-custom.git`
 3. Enter the repo and run setup wizard:
    - Windows: `scripts\lca-custom.cmd setup`
    - macOS/Linux/WSL: `bash scripts/lca-custom setup`
@@ -31,12 +31,15 @@ start Local Coding Agent.
    - Tunnel ID
    - Runtime API key for `.env.local`
    - tunnel-client path only if auto-download fails
-5. Start from the target repo:
-   - `cd /path/to/workspace`
-   - `lca-custom`
+5. Select and start the target workspace:
+   - `lca-custom reset /path/to/workspace`
+   - `lca-custom start --background`
+   - use `--no-tunnel` only when a local-only MCP server is desired
 6. Verify:
-   - `http://127.0.0.1:8790/healthz`
-   - `scripts\lca-custom.cmd status` or `bash scripts/lca-custom status`
+   - MCP: `http://127.0.0.1:8790/mcp`
+   - Health: `http://127.0.0.1:8790/healthz`
+   - `lca-custom status`
+   - `lca-custom doctor`
 
 ## Report Back
 
@@ -46,6 +49,6 @@ Return:
 - workspace path
 - MCP URL
 - health URL
-- mode and policy
+- direct-only runtime status
 - tunnel status
 - any missing requirement and the exact next fix

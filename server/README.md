@@ -43,15 +43,28 @@ The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent
 
 ## Run
 
-The managed CLI is the supported entrypoint:
+### Managed setup
+
+The managed CLI is the recommended entrypoint for normal use:
 
 ```bash
-lca-custom install
+# From the repository root on macOS/Linux/WSL:
+bash scripts/lca-custom setup
+
+# Then select the primary project and start:
+lca-custom reset /absolute/path/to/project
 lca-custom start --background
+lca-custom status
 lca-custom doctor
 ```
 
-Low-level development run:
+Use `--no-tunnel` for a local-only MCP server:
+
+```bash
+lca-custom start --background --no-tunnel
+```
+
+### Low-level development setup
 
 ```bash
 cd server
@@ -59,8 +72,32 @@ npm ci
 npm start
 ```
 
+Or:
+
+```bash
+cd server
+npm run build:next
+PORT=8790 AGENT_WORKSPACE=/absolute/path/to/project node server.mjs
+```
+
+Local endpoints:
+
 - MCP: `http://127.0.0.1:8790/mcp`
 - Health: `http://127.0.0.1:8790/healthz`
+
+After startup:
+
+```bash
+curl -fsS http://127.0.0.1:8790/healthz
+lca-custom doctor
+```
+
+Restart the managed runtime after changing startup environment variables or server/MCP-schema code:
+
+```bash
+lca-custom stop
+lca-custom start --background
+```
 
 ## Code intelligence and memory
 
@@ -118,6 +155,36 @@ DBeaver remains editor-first:
 
 Direct model-style preparation or execution without the widget capability is rejected. Generic `dbeaver_call_tool` remains limited to upstream tools declaring `readOnlyHint=true`.
 
+## Optional self-improvement tools
+
+The self-improvement stack is intentionally fail-open for optional local tooling:
+
+```dotenv
+# .env.local
+AST_GREP_BIN=
+SEMGREP_BIN=
+STRYKER_BIN=
+RENOVATE_BIN=
+RENOVATE_FEED_PATH=
+OTEL_EXPORTER_OTLP_ENDPOINT=
+```
+
+- `AST_GREP_BIN`: override structural search/rewrite binary discovery.
+- `SEMGREP_BIN`: override local Semgrep binary discovery.
+- `STRYKER_BIN`: override StrykerJS binary discovery. A project-local `node_modules/.bin/stryker` is also detected.
+- `RENOVATE_BIN`: optional Renovate binary discovery metadata. LCA does not execute Renovate updates.
+- `RENOVATE_FEED_PATH`: local Renovate JSON/JSONL report consumed by `workspace_status action=dependencies`.
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: optional OTLP/HTTP trace exporter. When empty/unset, LCA makes zero OTLP network calls.
+
+Check the full self-improvement stack with:
+
+```bash
+lca-custom improve
+lca-custom improve --maintenance
+```
+
+Missing Semgrep, Stryker, or Renovate data is reported as `available=false`; it does not prevent LCA from starting. `ast-grep` is likewise optional for ordinary coding work, though AST search/rewrite and the AST portion of maintenance require it.
+
 ## Important environment variables
 
 | Variable | Default | Purpose |
@@ -143,11 +210,35 @@ Direct model-style preparation or execution without the widget capability is rej
 | `PENPOT_MCP_URL` | `http://127.0.0.1:9001/mcp/stream` | Local Penpot MCP endpoint without credentials. |
 | `PENPOT_USER_TOKEN` | empty | Generated Penpot MCP user token; store only in `.env.local`. |
 | `PENPOT_MCP_TIMEOUT_MS` | `120000` | Penpot tool timeout. |
+| `AST_GREP_BIN` | auto-detect | Optional ast-grep binary override. |
+| `SEMGREP_BIN` | auto-detect | Optional Semgrep binary override. |
+| `STRYKER_BIN` | auto-detect | Optional StrykerJS binary override. |
+| `RENOVATE_BIN` | auto-detect | Optional Renovate binary metadata/discovery override; never auto-executed for updates. |
+| `RENOVATE_FEED_PATH` | standard local feed names | Renovate JSON/JSONL dependency feed. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | Optional OTLP endpoint; empty keeps trace export local-only. |
 
 ## Tests
 
+Full release gate:
+
 ```bash
 npm run test:all
+```
+
+Self-improvement acceptance only:
+
+```bash
+npm run test:self-improvement
+```
+
+Fast development checks:
+
+```bash
+npm run typecheck
+npm run test:unit
+npm run test:compact
+npm run test:runtime
+npm run docs:check
 ```
 
 Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:penpot`, `test:coolify`, `test:notion`, `test:notion:widget`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
