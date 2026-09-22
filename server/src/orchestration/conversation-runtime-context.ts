@@ -7,20 +7,14 @@ export interface ConversationRuntimeState {
   discoveryRoots: readonly string[];
   conversationId?: string;
   sessionId?: string;
-  runner: string;
   profile?: string;
-  isolation: "shared" | "worktree";
-  networkAccess: boolean;
   correlationId: string;
 }
 
 export interface ConversationRuntimeContextOptions {
   primaryRoot: string;
   roots: readonly string[];
-  runner?: string;
   profile?: string;
-  isolation?: "shared" | "worktree";
-  networkAccess?: boolean;
 }
 
 export type ConversationRuntimeSelection = string | Partial<ConversationRuntimeState> | undefined;
@@ -38,10 +32,7 @@ export class ConversationRuntimeContext {
     this.#fallback = Object.freeze({
       primaryRoot,
       discoveryRoots: Object.freeze(roots),
-      runner: options.runner?.trim() || "codex",
       ...(options.profile?.trim() ? { profile: options.profile.trim() } : {}),
-      isolation: options.isolation ?? "worktree",
-      networkAccess: options.networkAccess !== false,
       correlationId: "runtime-default"
     });
   }
@@ -59,9 +50,6 @@ export class ConversationRuntimeContext {
       discoveryRoots: patch.discoveryRoots
         ? uniquePaths(patch.discoveryRoots)
         : changesPrimaryRoot ? [primaryRoot] : current.discoveryRoots,
-      runner: patch.runner?.trim() || current.runner,
-      isolation: patch.isolation ?? current.isolation,
-      networkAccess: patch.networkAccess ?? current.networkAccess,
       correlationId: patch.correlationId?.trim() || current.correlationId || randomUUID()
     };
     return this.#storage.run(state, callback);

@@ -8,5 +8,3 @@ Runtime JSONL is the source of truth; metrics, AgentMemory, trajectory UI, and O
 | `tool/started` | ActionExecutionPipeline | append-only JSONL |
 | `tool/completed` | ActionExecutionPipeline | append-only JSONL |
 | `tool/failed` | ActionExecutionPipeline | append-only JSONL |
-| `agent/job-snapshot` | AgentRunner runtime | append-only JSONL |
-| `agent/dag-snapshot` | AgentRunner runtime | append-only JSONL |

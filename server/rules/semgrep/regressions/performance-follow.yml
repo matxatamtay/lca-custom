@@ -1,0 +1,35 @@
+rules:
+  - id: lca.regression.performance-follow-must-not-observe-probes
+    message: performance/status probes must stay excluded from performance_follow observation.
+    severity: ERROR
+    languages: [javascript]
+    pattern: |
+      if (modelFacing) {
+        ...
+        performanceFollow.recordToolCall(...);
+        ...
+      }
+    paths:
+      include:
+        - server.mjs
+    metadata:
+      lca_category: RELIABILITY
+      component: performance-follow
+
+  - id: lca.regression.performance-follow-single-observer
+    message: Do not create a second performanceFollow.recordToolCall observer outside the server telemetry wrapper.
+    severity: WARNING
+    languages: [javascript]
+    pattern: performanceFollow.recordToolCall(...)
+    paths:
+      include:
+        - core/**/*.mjs
+        - tools/**/*.mjs
+      exclude:
+        - "**/*.test.*"
+    metadata:
+      lca_category: RELIABILITY
+      component: performance-follow
+      lca_impact: 0.7
+      lca_frequency: 0.6
+      lca_cost: 0.3

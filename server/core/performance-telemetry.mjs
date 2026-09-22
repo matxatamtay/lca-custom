@@ -95,7 +95,9 @@ export function createPerformanceTelemetry(options = {}) {
       durationMs = 0,
       inChars = 0,
       outChars = 0,
-      result = null
+      result = null,
+      correlationId = null,
+      traceId = null
     } = input || {};
     if (!tool || !root) return null;
 
@@ -105,7 +107,14 @@ export function createPerformanceTelemetry(options = {}) {
       const previousId = state.active_by_root[root];
       const previous = findTrace(previousId);
       if (previous && !previous.ended_at) previous.ended_at = timestamp;
-      trace = createTrace({ root, task, timestamp, taskClass: input?.taskClass });
+      trace = createTrace({
+        root,
+        task,
+        timestamp,
+        taskClass: input?.taskClass,
+        correlationId,
+        traceId
+      });
       state.traces.push(trace);
       state.active_by_root[root] = trace.task_id;
       trimTraces();
@@ -223,10 +232,12 @@ export function createPerformanceTelemetry(options = {}) {
     flushTimer.unref?.();
   }
 
-  function createTrace({ root, task, timestamp, taskClass }) {
+  function createTrace({ root, task, timestamp, taskClass, correlationId, traceId }) {
     const normalizedTask = String(task || "").trim().slice(0, 500);
     return {
       task_id: `task-${createId()}`,
+      correlation_id: String(correlationId || "").trim().slice(0, 200) || null,
+      trace_id: String(traceId || "").trim().slice(0, 64) || null,
       root,
       task: normalizedTask,
       task_class: taskClass || classifyTelemetryTask(normalizedTask),
@@ -275,13 +286,24 @@ export function createPerformanceTelemetry(options = {}) {
     }
   }
 
+  function activeIdentity(root) {
+    const trace = findTrace(state.active_by_root[root]);
+    if (!trace) return null;
+    return {
+      task_id: trace.task_id,
+      correlation_id: trace.correlation_id || null,
+      trace_id: trace.trace_id || null,
+      root: trace.root
+    };
+  }
+
   function taskClassMap() {
     return Object.fromEntries(state.traces
       .filter((trace) => trace?.task_id)
       .map((trace) => [trace.task_id, classifyTelemetryTask(trace.task)]));
   }
 
-  return { load, recordToolCall, snapshot, taskClassMap, flush, close };
+  return { load, recordToolCall, snapshot, activeIdentity, taskClassMap, flush, close };
 }
 
 function structured(result) {
@@ -307,6 +329,8 @@ function compactTrace(trace) {
   const elapsedMs = Math.max(0, Number((trace.ended_at || trace.last_at || trace.started_at) - trace.started_at) || 0);
   return {
     task_id: trace.task_id,
+    ...(trace.correlation_id ? { correlation_id: trace.correlation_id } : {}),
+    ...(trace.trace_id ? { trace_id: trace.trace_id } : {}),
     root: trace.root,
     task: trace.task,
     task_class: trace.task_class || classifyTelemetryTask(trace.task),

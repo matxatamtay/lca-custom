@@ -44,6 +44,7 @@ export function createAgentMemoryObservation(options) {
   function extractAgentMemoryDecision(name, args, success, root) {
     if (!success || name !== "workspace_edit" || args?.action !== "decision") return null;
     const forwarded = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
+    if (forwarded.memory_kind === "accepted_improvement") return null;
     const decision = typeof forwarded.decision === "string" ? forwarded.decision.trim() : "";
     const why = typeof forwarded.why === "string" ? forwarded.why.trim() : "";
     if (!decision || !why) return null;

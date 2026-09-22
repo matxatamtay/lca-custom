@@ -223,6 +223,74 @@ test("reconciles dead LCA sessions but preserves live processes", async () => {
 });
 
 
+test("persists only accepted non-regressing improvements as scoped durable facts", async () => {
+  const events: string[] = [];
+  const client = fakeClient(events);
+  const sessions = new AgentMemorySessionManager({
+    supervisor: fakeSupervisor(events),
+    client,
+    createId: () => "improvement",
+    now: () => new Date("2026-09-21T00:00:00.000Z")
+  });
+
+  await sessions.recordImprovement({
+    root: "/repo",
+    candidateId: "si-performance-demo",
+    category: "PERFORMANCE",
+    component: "workspace_context",
+    problem: "workspace_context p95 is too high",
+    evidence: "{\"p95_ms\":200}",
+    solution: "{\"kind\":\"workspace_edit.apply_patch\"}",
+    before: "{\"p95_ms\":200}",
+    after: "{\"p95_ms\":150}",
+    regression: false,
+    verdict: "improved",
+    files: ["server/context.ts"],
+    verification: "{\"ok\":true}",
+    regressionRules: ["rules/context.yml"]
+  });
+
+  assert.equal(client.memories.length, 1);
+  const memory = client.memories[0];
+  assert.equal(memory?.project, "project-one");
+  assert.equal(memory?.type, "fact");
+  assert.deepEqual(memory?.concepts?.slice(0, 2), ["lca-self-improvement", "accepted-improvement"]);
+  assert.deepEqual(memory?.files, ["server/context.ts"]);
+  assert.match(String(memory?.content), /Candidate: si-performance-demo/);
+  assert.match(String(memory?.content), /Before: \{"p95_ms":200\}/);
+  assert.match(String(memory?.content), /After: \{"p95_ms":150\}/);
+  assert.match(String(memory?.content), /Regression: false/);
+  assert.match(String(memory?.content), /Verdict: improved/);
+
+  await sessions.recordImprovement({
+    root: "/repo",
+    candidateId: "si-performance-rejected",
+    category: "PERFORMANCE",
+    component: "workspace_context",
+    problem: "no gain",
+    evidence: "{}",
+    solution: "{}",
+    before: "{}",
+    after: "{}",
+    regression: false,
+    verdict: "not_improved"
+  });
+  await sessions.recordImprovement({
+    root: "/repo",
+    candidateId: "si-performance-regressed",
+    category: "PERFORMANCE",
+    component: "workspace_context",
+    problem: "regressed",
+    evidence: "{}",
+    solution: "{}",
+    before: "{}",
+    after: "{}",
+    regression: true,
+    verdict: "improved"
+  });
+  assert.equal(client.memories.length, 1, "rejected or regressing candidates must not become successful memories");
+});
+
 test("persists an intentional architectural decision immediately", async () => {
   const events: string[] = [];
   const client = fakeClient(events);

@@ -73,6 +73,8 @@ export function createPerformanceFollow(options = {}) {
       seq: nextSequence(),
       ts: timestamp,
       task_id: safeText(trace.task_id || input.taskId, 100),
+      correlation_id: safeText(trace.correlation_id || input.correlationId, 200),
+      trace_id: safeText(trace.trace_id || input.traceId, 64),
       task_class: normalizeTaskClass(trace.task_class || input.taskClass),
       root,
       context_temperature: normalizeTemperature(trace.context_temperature),
@@ -93,6 +95,45 @@ export function createPerformanceFollow(options = {}) {
       ...cache,
       ...(prewarm ? { prewarm_age_ms: Math.max(0, timestamp - prewarm.ts), prewarm_recent: timestamp - prewarm.ts <= 10 * 60_000 } : {})
     });
+
+    if (input.tool === "workspace_verify" && (input.action === "semgrep" || input.action === "semgrep_scan")) {
+      const semgrepSummary = structured?.summary || {};
+      append({
+        ...base,
+        seq: nextSequence(),
+        kind: "sensor",
+        name: "semgrep",
+        duration_ms: round(input.durationMs),
+        available: structured?.available !== false,
+        success: structured?.available === false ? true : structured?.ok !== false,
+        findings: boundedNumber(semgrepSummary.findings),
+        error_findings: boundedNumber(semgrepSummary.error),
+        warning_findings: boundedNumber(semgrepSummary.warning),
+        info_findings: boundedNumber(semgrepSummary.info)
+      });
+    }
+
+    if (input.tool === "workspace_verify" && (input.action === "mutation" || input.action === "mutation_test")) {
+      const mutation = structured?.telemetry || {};
+      append({
+        ...base,
+        seq: nextSequence(),
+        kind: "sensor",
+        name: "mutation",
+        duration_ms: round(input.durationMs),
+        available: structured?.available !== false,
+        success: structured?.available === false ? true : structured?.ok !== false,
+        mode: safeText(structured?.mode, 20),
+        mutants_total: boundedNumber(mutation.mutants_total),
+        killed: boundedNumber(mutation.killed),
+        survived: boundedNumber(mutation.survived),
+        timeout_mutants: boundedNumber(mutation.timeout),
+        no_coverage: boundedNumber(mutation.no_coverage),
+        mutation_score: Number.isFinite(Number(mutation.mutation_score))
+          ? round(Number(mutation.mutation_score))
+          : null
+      });
+    }
 
     if (input.tool === "workspace_context") {
       for (const [provider, value] of Object.entries(structured?.coverage || {})) {
@@ -146,6 +187,41 @@ export function createPerformanceFollow(options = {}) {
     scheduleFlush();
   }
 
+  function recordRuntimeSpans(input = {}) {
+    const root = safeText(input.root, 500);
+    const trace = input.trace || {};
+    const spans = Array.isArray(input.spans) ? input.spans : [];
+    if (!root || !trace.task_id || !spans.length) return { recorded: 0 };
+
+    let recorded = 0;
+    for (const span of spans.slice(0, 500)) {
+      const name = safeText(span?.name, 160);
+      if (!name) continue;
+      const timestamp = Date.parse(span?.startedAt || "");
+      append({
+        seq: nextSequence(),
+        ts: Number.isFinite(timestamp) ? timestamp : now(),
+        task_id: safeText(trace.task_id, 100),
+        correlation_id: safeText(trace.correlation_id || input.correlationId || span?.correlationId, 200),
+        trace_id: safeText(trace.trace_id || input.traceId, 64),
+        task_class: normalizeTaskClass(trace.task_class || input.taskClass),
+        root,
+        project_root: safeText(input.projectRoot, 500),
+        context_temperature: normalizeTemperature(trace.context_temperature),
+        success: span?.success !== false,
+        kind: "span",
+        name,
+        duration_ms: round(span?.durationMs),
+        span_id: safeText(span?.spanId, 200),
+        parent_span_id: safeText(span?.parentSpanId, 200),
+        surface: safeText(span?.surface, 30)
+      });
+      recorded += 1;
+    }
+    if (recorded) scheduleFlush();
+    return { recorded };
+  }
+
   function recordPrewarm(input = {}) {
     const root = safeText(input.root, 500);
     if (!root) return;
@@ -195,10 +271,27 @@ export function createPerformanceFollow(options = {}) {
     const commands = groupMetrics(samples.filter((sample) => sample.kind === "command"));
     const providers = groupMetrics(samples.filter((sample) => sample.kind === "provider"));
     const rankings = samples.filter((sample) => sample.kind === "ranking");
+    const runtimeSpans = samples.filter((sample) => sample.kind === "span");
+    const contextRuntimeSpans = runtimeSpans.filter((sample) => sample.name.startsWith("workspace_context."));
+    const editRuntimeSpans = runtimeSpans.filter((sample) => sample.name.startsWith("workspace_edit."));
+    const sensors = samples.filter((sample) => sample.kind === "sensor");
+    const semgrepSensors = sensors.filter((sample) => sample.name === "semgrep");
+    const mutationSensors = sensors.filter((sample) => sample.name === "mutation");
     const prewarms = windowSamples.filter((sample) => sample.kind === "prewarm");
     const tasks = new Set(samples.map((sample) => sample.task_id).filter(Boolean));
-    const contexts = samples.filter((sample) => sample.kind === "tool" && sample.name === "workspace_context");
-    const searches = samples.filter((sample) => sample.kind === "tool" && sample.name.startsWith("workspace_search"));
+    const toolSamples = samples.filter((sample) => sample.kind === "tool");
+    const contexts = toolSamples.filter((sample) => sample.name === "workspace_context");
+    const searches = toolSamples.filter((sample) => sample.name.startsWith("workspace_search"));
+    const reads = toolSamples.filter((sample) => sample.name.startsWith("workspace_read"));
+    const verifications = toolSamples.filter((sample) => sample.name.startsWith("workspace_verify"));
+    const testCommands = samples.filter((sample) => sample.kind === "command" && /(?:^|:)test$/.test(sample.name || ""));
+    const codegraphProviders = samples.filter((sample) => sample.kind === "provider" && sample.name === "codegraph");
+    const codegraphIndex = codegraphProviders
+      .filter((sample) => Number.isFinite(Number(sample.details?.index_ms)))
+      .map((sample) => ({ ...sample, duration_ms: Number(sample.details.index_ms) }));
+    const codegraphQuery = codegraphProviders
+      .filter((sample) => Number.isFinite(Number(sample.details?.query_ms)))
+      .map((sample) => ({ ...sample, duration_ms: Number(sample.details.query_ms) }));
     const cacheSamples = samples.filter((sample) => typeof sample.cache_hit === "boolean" || Number(sample.cache_checks || 0) > 0);
     const cacheChecks = cacheSamples.reduce((sum, sample) => sum + (Number(sample.cache_checks || 0) || (typeof sample.cache_hit === "boolean" ? 1 : 0)), 0);
     const cacheHits = cacheSamples.reduce((sum, sample) => sum + (Number(sample.cache_hits || 0) || (sample.cache_hit === true ? 1 : 0)), 0);
@@ -229,6 +322,14 @@ export function createPerformanceFollow(options = {}) {
       task_classes: classCounts,
       context_temperature: temperatureCounts,
       context_ms: metrics(contexts),
+      trace_attribution: {
+        workspace_context: attributionSummary(contexts, contextRuntimeSpans, "workspace_context."),
+        workspace_edit: attributionSummary(
+          toolSamples.filter((sample) => sample.name.startsWith("workspace_edit")),
+          editRuntimeSpans,
+          "workspace_edit."
+        )
+      },
       cache_efficiency: {
         checks: cacheChecks,
         hits: cacheHits,
@@ -239,7 +340,62 @@ export function createPerformanceFollow(options = {}) {
       search_efficiency: {
         calls: searches.length,
         failures: searches.filter((sample) => sample.success === false).length,
-        calls_per_task: tasks.size ? round(searches.length / tasks.size) : 0
+        calls_per_task: tasks.size ? round(searches.length / tasks.size) : 0,
+        by_action: Object.fromEntries(groupMetrics(searches).map(({ name, ...value }) => [
+          name.startsWith("workspace_search:") ? name.slice("workspace_search:".length) : name,
+          value
+        ]))
+      },
+      workflow_efficiency: {
+        tool_calls: toolSamples.length,
+        roundtrips_per_task: tasks.size ? round(toolSamples.length / tasks.size) : 0,
+        read_calls: reads.length,
+        read_calls_per_task: tasks.size ? round(reads.length / tasks.size) : 0,
+        bytes_to_model: toolSamples.reduce((sum, sample) => sum + Number(sample.out_bytes || 0), 0),
+        bytes_to_model_per_task: tasks.size
+          ? round(toolSamples.reduce((sum, sample) => sum + Number(sample.out_bytes || 0), 0) / tasks.size)
+          : 0,
+        failure_rate: toolSamples.length
+          ? roundRatio(toolSamples.filter((sample) => sample.success === false).length / toolSamples.length)
+          : 0
+      },
+      verification_ms: metrics(verifications),
+      test_duration_ms: metrics(testCommands),
+      codegraph: {
+        index_ms: metrics(codegraphIndex),
+        query_ms: metrics(codegraphQuery)
+      },
+      semgrep: {
+        samples: semgrepSensors.length,
+        available_samples: semgrepSensors.filter((sample) => sample.available !== false).length,
+        unavailable_samples: semgrepSensors.filter((sample) => sample.available === false).length,
+        gate_failures: semgrepSensors.filter((sample) => sample.available !== false && sample.success === false).length,
+        findings: {
+          error: semgrepSensors.reduce((sum, sample) => sum + Number(sample.error_findings || 0), 0),
+          warning: semgrepSensors.reduce((sum, sample) => sum + Number(sample.warning_findings || 0), 0),
+          info: semgrepSensors.reduce((sum, sample) => sum + Number(sample.info_findings || 0), 0),
+          total: semgrepSensors.reduce((sum, sample) => sum + Number(sample.findings || 0), 0)
+        },
+        latency_ms: metrics(semgrepSensors)
+      },
+      mutation: {
+        samples: mutationSensors.length,
+        available_samples: mutationSensors.filter((sample) => sample.available !== false).length,
+        unavailable_samples: mutationSensors.filter((sample) => sample.available === false).length,
+        gate_failures: mutationSensors.filter((sample) => sample.available !== false && sample.success === false).length,
+        modes: countBy(mutationSensors.filter((sample) => sample.mode), (sample) => sample.mode),
+        mutants_total: mutationSensors.reduce((sum, sample) => sum + Number(sample.mutants_total || 0), 0),
+        killed: mutationSensors.reduce((sum, sample) => sum + Number(sample.killed || 0), 0),
+        survived: mutationSensors.reduce((sum, sample) => sum + Number(sample.survived || 0), 0),
+        timeout: mutationSensors.reduce((sum, sample) => sum + Number(sample.timeout_mutants || 0), 0),
+        no_coverage: mutationSensors.reduce((sum, sample) => sum + Number(sample.no_coverage || 0), 0),
+        avg_score: mutationSensors.filter((sample) => Number.isFinite(Number(sample.mutation_score))).length
+          ? round(mutationSensors
+              .filter((sample) => Number.isFinite(Number(sample.mutation_score)))
+              .reduce((sum, sample) => sum + Number(sample.mutation_score), 0)
+              / mutationSensors.filter((sample) => Number.isFinite(Number(sample.mutation_score))).length)
+          : null,
+        latency_ms: metrics(mutationSensors)
       },
       jev: {
         samples: rankings.length,
@@ -353,7 +509,7 @@ export function createPerformanceFollow(options = {}) {
     return state.sequence;
   }
 
-  return { load, recordToolCall, recordPrewarm, report, reclassifyTasks, flush, close };
+  return { load, recordToolCall, recordRuntimeSpans, recordPrewarm, report, reclassifyTasks, flush, close };
 }
 
 function latestTaskIdFrom(samples) {
@@ -370,8 +526,11 @@ function taskSummary(samples, taskId) {
   const ended = tools.length
     ? Math.max(...tools.map((sample) => Number(sample.ts || 0) + Number(sample.duration_ms || 0)))
     : started;
+  const identitySample = samples.find((sample) => sample.correlation_id || sample.trace_id) || {};
   return {
     task_id: taskId,
+    correlation_id: identitySample.correlation_id || null,
+    trace_id: identitySample.trace_id || null,
     observed_wall_ms: round(Math.max(0, ended - started)),
     observed_tool_ms: round(tools.reduce((sum, sample) => sum + Number(sample.duration_ms || 0), 0)),
     tool_calls: tools.length,
@@ -392,6 +551,13 @@ function buildTimeline(samples) {
       name: sample.name,
       duration_ms: round(sample.duration_ms || 0),
       success: sample.success !== false,
+      ...(sample.correlation_id ? { correlation_id: sample.correlation_id } : {}),
+      ...(sample.trace_id ? { trace_id: sample.trace_id } : {}),
+      ...(sample.kind === "span" ? {
+        span_id: sample.span_id || null,
+        parent_span_id: sample.parent_span_id || null,
+        surface: sample.surface || null
+      } : {}),
       ...(sample.kind === "provider" && sample.details ? { details: sample.details } : {}),
       ...(sample.kind === "ranking" ? {
         model: sample.model || null,
@@ -406,6 +572,31 @@ function buildTimeline(samples) {
       } : {}),
       ...(sample.prewarm_age_ms !== undefined ? { prewarm_age_ms: sample.prewarm_age_ms } : {})
     }));
+}
+
+function attributionSummary(parentSamples, spanSamples, prefix) {
+  const parentMetrics = metrics(parentSamples);
+  const grouped = groupMetrics(spanSamples).map((entry) => ({
+    component: String(entry.name || "").startsWith(prefix)
+      ? String(entry.name).slice(prefix.length)
+      : String(entry.name || "unknown"),
+    calls: entry.calls,
+    total_ms: entry.total_ms,
+    avg_ms: entry.avg_ms,
+    p50_ms: entry.p50_ms,
+    p95_ms: entry.p95_ms,
+    max_ms: entry.max_ms,
+    failures: entry.failures,
+    share_of_parent_p95: parentMetrics.p95_ms > 0
+      ? roundRatio(entry.p95_ms / parentMetrics.p95_ms)
+      : null
+  })).sort((left, right) => right.p95_ms - left.p95_ms || right.total_ms - left.total_ms);
+  return {
+    spans: spanSamples.length,
+    parent: parentMetrics,
+    components: grouped,
+    top_contributors: grouped.slice(0, 8)
+  };
 }
 
 function providerCacheSummary(samples) {

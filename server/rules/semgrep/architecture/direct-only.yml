@@ -1,0 +1,69 @@
+rules:
+  - id: lca.architecture.no-workspace-agent-facade
+    message: workspace_agent must not be reintroduced; LCA remains direct-only.
+    severity: ERROR
+    languages: [generic]
+    pattern-regex: '(?m)\bworkspace_agent\s*:'
+    paths:
+      include:
+        - server.mjs
+        - src/**/*.ts
+        - core/**/*.mjs
+        - tools/**/*.mjs
+      exclude:
+        - "**/*.test.*"
+        - "test-*.mjs"
+    metadata:
+      lca_category: CORRECTNESS
+      component: direct-only-runtime
+
+  - id: lca.architecture.no-codex-sdk-dependency
+    message: "@openai/codex-sdk must not be reintroduced."
+    severity: ERROR
+    languages: [generic]
+    pattern-regex: '@openai/codex-sdk'
+    paths:
+      include:
+        - package.json
+        - package-lock.json
+        - pnpm-lock.yaml
+        - yarn.lock
+    metadata:
+      lca_category: DEPENDENCY
+      component: direct-only-runtime
+
+  - id: lca.architecture.no-codex-delegation-manager
+    message: CodexDelegationManager must not be reintroduced.
+    severity: ERROR
+    languages: [generic]
+    pattern-regex: '\bCodexDelegationManager\b'
+    paths:
+      include:
+        - server.mjs
+        - src/**/*.ts
+        - core/**/*.mjs
+        - tools/**/*.mjs
+      exclude:
+        - "**/*.test.*"
+        - "test-*.mjs"
+    metadata:
+      lca_category: CORRECTNESS
+      component: direct-only-runtime
+
+  - id: lca.architecture.no-agent-runner-registry
+    message: AgentRunnerRegistry must not be reintroduced.
+    severity: ERROR
+    languages: [generic]
+    pattern-regex: '\bAgentRunnerRegistry\b'
+    paths:
+      include:
+        - server.mjs
+        - src/**/*.ts
+        - core/**/*.mjs
+        - tools/**/*.mjs
+      exclude:
+        - "**/*.test.*"
+        - "test-*.mjs"
+    metadata:
+      lca_category: CORRECTNESS
+      component: direct-only-runtime

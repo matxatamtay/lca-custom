@@ -23,6 +23,16 @@ test("pipeline records one correlation across nested actions", async () => {
     const events = store.query({ typePrefix: "tool/" });
     assert.equal(events.length, 4);
     assert.equal(new Set(events.map((event) => event.correlationId)).size, 1);
+
+    const outerStarted = events.find((event) => event.type === "tool/started" && event.data.name === "outer");
+    const innerStarted = events.find((event) => event.type === "tool/started" && event.data.name === "inner");
+    const outerCompleted = events.find((event) => event.type === "tool/completed" && event.data.name === "outer");
+    const innerCompleted = events.find((event) => event.type === "tool/completed" && event.data.name === "inner");
+    assert.ok(outerStarted?.data.spanId);
+    assert.ok(innerStarted?.data.spanId);
+    assert.equal(innerStarted?.parentId, outerStarted?.data.spanId);
+    assert.equal(innerCompleted?.parentId, outerStarted?.data.spanId);
+    assert.equal(outerCompleted?.parentId, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

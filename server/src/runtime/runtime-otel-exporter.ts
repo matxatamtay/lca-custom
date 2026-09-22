@@ -38,8 +38,9 @@ export class RuntimeOtelExporter {
         scopeSpans: [{
           scope: { name: "local-coding-agent/runtime" },
           spans: [{
-            traceId: hashHex(observation.correlationId, 32),
-            spanId: hashHex(`${observation.correlationId}:${observation.startedAt}:${observation.name}`, 16),
+            traceId: traceIdForCorrelation(observation.correlationId),
+            spanId: hashHex(observation.spanId, 16),
+            ...(observation.parentSpanId ? { parentSpanId: hashHex(observation.parentSpanId, 16) } : {}),
             name: observation.name,
             kind: 1,
             startTimeUnixNano: startNs.toString(),
@@ -76,6 +77,10 @@ function normalizeEndpoint(value: string | undefined): string | undefined {
     url.pathname = `${url.pathname.replace(/\/$/, "")}/v1/traces`.replace(/\/+/g, "/");
   }
   return url.toString();
+}
+
+export function traceIdForCorrelation(value: string): string {
+  return hashHex(value, 32);
 }
 
 function hashHex(value: string, length: number): string {

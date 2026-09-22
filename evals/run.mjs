@@ -60,6 +60,8 @@ async function startServer(workspace) {
           ...process.env,
           PORT: String(EVAL_PORT),
           AGENT_WORKSPACE: workspace,
+          AGENT_EXTRA_ROOTS: "",
+          AGENT_EXTRA_ROOTS_JSON: "",
           AGENTMEMORY_RECORD_SESSIONS: "0"
         },
         windowsHide: true

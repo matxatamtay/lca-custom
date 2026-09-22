@@ -1,0 +1,24 @@
+rules:
+  - id: lca.correctness.context-providers-remain-mandatory
+    message: workspace_context providers filesystem, semantic, codegraph, and agentmemory must remain mandatory dependencies.
+    severity: ERROR
+    languages: [generic]
+    pattern-regex: '(?m)^\s*(filesystem|semantic|codegraph|agentmemory)\?\s*:'
+    paths:
+      include:
+        - src/application/context/build-task-context.ts
+    metadata:
+      lca_category: CORRECTNESS
+      component: workspace-context
+
+  - id: lca.correctness.prewarm-project-root-not-remapped
+    message: performance prewarm must record the active project root directly; do not remap it through projectRootForPath.
+    severity: ERROR
+    languages: [generic]
+    pattern-regex: 'projectRoot\s*:\s*projectRootForPath\s*\('
+    paths:
+      include:
+        - server.mjs
+    metadata:
+      lca_category: CORRECTNESS
+      component: context-prewarm

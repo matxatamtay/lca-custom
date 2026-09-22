@@ -12,13 +12,14 @@ Trusted local MCP execution engine for ChatGPT with native semantic analysis, Co
 
 ## What ships
 
-ChatGPT sees exactly fifteen tools:
+ChatGPT sees exactly nineteen tools:
 
 ```text
 workspace_context  workspace_search  workspace_read   workspace_edit
 workspace_exec     workspace_process workspace_git    workspace_verify
-workspace_status   workspace_skill   figma            dbeaver
-bruno              coolify           lca_input
+workspace_ui       workspace_status  workspace_skill  figma
+dbeaver            bruno             penpot           coolify
+notion             lca_input         notion_page
 ```
 
 `workspace_context` is the default first call for coding tasks. Every call queries four context lanes in parallel:
@@ -37,15 +38,13 @@ Actions execute directly without mode, policy, or approval turns. Project roots 
 The compact workspace facades now cover the full edit-and-run loop without forcing repeated model-side polling or manual app testing:
 
 - **Context Retrieval V2** filters generated/vendor/license noise, reranks filesystem hits with changed-file and CodeGraph hints, balances providers, semantically deduplicates results, and enforces a global character budget.
-- **`workspace_agent`** delegates coding work to a runner-neutral agent layer. Codex is the first adapter and supports single jobs, parallel jobs, dependency DAGs, cancellation, structured collection, and explicit cleanup.
-- Writable delegated jobs default to **detached git worktrees**. The worktree inherits the current tracked and bounded untracked working-tree state into an ephemeral baseline, then emits only the delegated delta. `agent_merge` runs scope validation and `git apply --check` before touching the source tree; conflicts leave it unchanged.
 - **`workspace_ui`** bridges approved Chromium tabs through Local Browser Agent and connected Android devices through ADB for screenshots, UI hierarchy, input, logcat, app launch/stop, and short screen recordings.
 - **`workspace_process.wait`** waits server-side for process exit, output regexes, TCP ports, HTTP health, or file events instead of consuming repeated MCP polling turns.
 - **Compiler-native code intelligence** uses TypeScript 7 LSP for definitions, references, semantic rename, and organize-imports, plus the native compiler API for structured diagnostics. Other languages retain bounded text fallbacks where a semantic provider is unavailable.
 - **Verification intelligence** builds a changed-file/risk/affected-test plan, runs dependency-aware targeted tests where possible, and parses compiler/test output into structured file/line diagnostics.
 - **Performance profiling** records only tool name, facade/backend surface, success, latency, and input/output character counts. `workspace_status` exposes recent trace metadata and aggregated p50/p95/failure/payload signals without retaining tool arguments or output content.
 
-`parallel_tasks` remains the lightweight shell DAG. Use `workspace_agent` when independent work benefits from actual model agents and isolated writable worktrees.
+`parallel_tasks` remains the lightweight shell DAG for direct local command work; it does not spawn or delegate to additional models.
 
 ## Quick setup
 
@@ -77,7 +76,10 @@ lca-custom start --background
 lca-custom tui
 lca-custom status
 lca-custom doctor
+lca-custom improve
 ```
+
+`lca-custom improve` is analysis-only by default. It ranks current self-improvement candidates without editing source files or dependencies. Filters: `--latest`, `--performance`, `--tests`, `--dependencies`, and `--security`. `lca-custom improve --apply <candidate-id>` is explicit-only and accepts only bounded deterministic `workspace_edit.apply_patch` recipes stored on the candidate; unsupported candidates are refused before the local MCP server is contacted. Apply execution uses `workspace_context`, before/after `performance_follow` snapshots, and fused `workspace_edit` changed verification. A before/after evaluator then requires measurable evidence beyond a bounded noise threshold: performance/reliability use allowlisted `performance_follow` metrics, TEST_QUALITY uses the candidate's exact Stryker rerun when available, and SECURITY uses local Semgrep severity counts. Passing tests alone never accepts an improvement; a non-improving or regressing patch is immediately reverted through `workspace_edit undo`. Only an accepted, non-regressing improvement is persisted into the existing project-scoped AgentMemory as durable `fact` knowledge, including candidate/problem evidence, deterministic solution summary, before/after metrics, verification, affected paths, and regression-rule references when present. Future `workspace_context` calls can retrieve that memory through the existing AgentMemory provider; rejected or reverted candidates are never stored as successful improvement knowledge. `lca-custom improve --maintenance` runs the Phase 16 analysis-only maintenance sweep across performance history, Semgrep, ast-grep direct-only architecture signatures, incremental Stryker mutation telemetry, Renovate dependency feed, dependency/security state, cache behavior, Jev behavior, and CodeGraph behavior, then ranks the top candidates. `--apply-safe` is explicit and applies at most one candidate carrying a bounded deterministic recipe with an allowlisted safe class and `risk=low`; known-regression fixes require a rule reference, patch dependency updates additionally require low-risk patch metadata plus a full-green-gate marker, and architectural redesign is always refused. It never invokes a secondary model, automatic package updater, commit, or push. The final roadmap acceptance bundle is available as `npm run test:self-improvement` from `server/`; it checks the direct-only architecture invariants, self-improvement core/sensors/evaluator/maintenance tests, and the compact MCP surface together.
 
 `lca-custom tui` opens the mouse-enabled terminal dashboard for projects, files, search, mandatory context, Git, commands, processes, verification, tasks, skills, integrations, memory, tools, and logs. Full guide: [docs/TUI.md](docs/TUI.md).
 
@@ -124,22 +126,7 @@ More detail and benchmark history: [docs/NEXT_ARCHITECTURE.md](docs/NEXT_ARCHITE
 
 LCA includes an Obsidian-compatible Markdown vault for durable project context and structured task handoffs. Backend actions include `context_pin`, `context_list`, `context_explain`, `context_remove`, `task_brief`, `intent_check`, `scope_guard`, `knowledge_state`, `parallel_tasks`, `handoff_packet`, `checkpoint`, and `resume`.
 
-`parallel_tasks` runs bounded dependency-aware command lanes; it coordinates shell work and does not spawn additional model agents. `workspace_agent` is the separate model-agent orchestration layer. Scope guards are opt-in per task, and command/write results include compact result digests. See [Persistent Memory and Shared Task Protocol](docs/PERSISTENT_MEMORY_AND_TASK_PROTOCOL.md).
-
-## Delegated agent providers and fallback
-
-`workspace_agent` can run Codex against server-side OpenAI-compatible provider credentials. The MCP call never accepts raw API keys: configure provider metadata in `LCA_AGENT_PROVIDERS_JSON`, point `api_key_env` at a separate secret variable, then define the normal order in `LCA_AGENT_PROVIDER_CHAIN`.
-
-```dotenv
-LCA_AGENT_PROVIDERS_JSON=[{"name":"primary","base_url":"https://provider-a.example/v1","api_key_env":"AGENT_PRIMARY_API_KEY","model":"model-a"},{"name":"backup","base_url":"https://provider-b.example/v1","api_key_env":"AGENT_BACKUP_API_KEY","model":"model-b"}]
-LCA_AGENT_PROVIDER_CHAIN=primary,backup,codex
-AGENT_PRIMARY_API_KEY=...
-AGENT_BACKUP_API_KEY=...
-```
-
-The reserved `codex` provider preserves the existing Codex authentication/endpoint behavior and can be placed anywhere in the chain. You can also override routing for one task with `provider: "backup"` or `provider_chain: ["backup", "codex"]`. Automatic fallback happens for exhausted credit/quota, HTTP 429/rate limiting, timeouts/network failures, and provider 5xx/overload errors. Authentication failures, bad requests, and unknown models stay visible instead of silently routing elsewhere. Retryable failures put that provider on an in-memory cooldown so later jobs skip it temporarily; explicitly selecting one provider bypasses cooldown.
-
-OpenAI-compatible delegated providers must support the Responses API used by the bundled Codex CLI. A gateway that only exposes Chat Completions is not treated as compatible. Set `output_schema: false` for gateways that support Responses but not JSON-schema structured output. Use `lca-custom tui` → **Config** → **Add** to store these variables locally; key-like variable names are masked and `.env.local` is written with restricted permissions. Restart LCA after changing provider configuration.
+`parallel_tasks` runs bounded dependency-aware command lanes and never spawns additional model agents. Scope guards are opt-in per task, and command/write results include compact result digests. See [Persistent Memory and Shared Task Protocol](docs/PERSISTENT_MEMORY_AND_TASK_PROTOCOL.md).
 
 ## Desktop integrations
 
@@ -170,7 +157,7 @@ Set `COOLIFY_BASE_URL` and `COOLIFY_ACCESS_TOKEN` in `.env.local`. LCA starts th
 
 LCA records an append-only runtime event stream under its local workspace data directory. `workspace_status action=trace` projects that stream into a correlation-grouped trajectory, and `lca_input` can display the same trace tree. Tool metrics and AgentMemory observations consume the shared action pipeline instead of instrumenting separate execution paths. Optional OTLP/HTTP export is enabled with `OTEL_EXPORTER_OTLP_ENDPOINT`; JSONL remains the local source of truth.
 
-Delegated Codex jobs default to `danger-full-access`, network enabled, and isolated worktrees. Job/DAG descriptors are persisted for restart reconstruction, with active pre-crash work reported honestly as recoverable or orphaned. `workspace_exec action=code` can combine multiple LCA backend actions in one TypeScript worker program; every nested binding still re-enters the ordinary backend pipeline and correctness checks.
+LCA executes coding work directly through its local tool runtime. `workspace_exec action=code` can combine multiple LCA backend actions in one TypeScript worker program; every nested binding still re-enters the ordinary backend pipeline and correctness checks.
 
 ### Notion
 
@@ -211,7 +198,7 @@ Historical baseline versus the compact runtime:
 
 | Metric | Before | Current target |
 |---|---:|---:|
-| Model-facing tools | 143 | 20 |
+| Model-facing tools | 143 | 19 |
 | `tools/list` bytes | 91,420 | under 24,000 |
 | Server instruction chars | 4,458 | under 1,000 |
 

@@ -31,6 +31,7 @@ export interface BuildTaskContextDependencies {
   codegraph: CodeIntelligencePort;
   agentmemory: MemoryPort;
   reranker?: ContextRerankerPort;
+  traceSpan?: <T>(name: string, operation: () => Promise<T> | T) => Promise<T>;
   now?: () => Date;
   createId?: () => string;
 }
@@ -90,10 +91,12 @@ export class BuildTaskContext {
     const normalizedRequest: TaskContextRequest = { ...request, task };
 
     const [filesystem, semantic, codegraph, agentmemory] = await Promise.all([
-      this.runProvider("filesystem", () => this.dependencies.filesystem.search(normalizedRequest)),
-      this.runSemanticProvider(normalizedRequest),
+      this.trace("workspace_context.filesystem", () =>
+        this.runProvider("filesystem", () => this.dependencies.filesystem.search(normalizedRequest))),
+      this.trace("workspace_context.semantic", () => this.runSemanticProvider(normalizedRequest)),
       this.runCodegraphProvider(normalizedRequest),
-      this.runProvider("agentmemory", () => this.dependencies.agentmemory.recall(normalizedRequest))
+      this.trace("workspace_context.agentmemory", () =>
+        this.runProvider("agentmemory", () => this.dependencies.agentmemory.recall(normalizedRequest)))
     ]);
 
     const providerResults = [filesystem, semantic, codegraph, agentmemory] as const;
@@ -101,6 +104,8 @@ export class BuildTaskContext {
       providerResults.map((result) => [result.provider, this.toCoverage(result)])
     ) as ContextCoverage;
     const reranked = await this.rerankEvidence(normalizedRequest, providerResults);
+    const evidence = await this.trace("workspace_context.merge", () =>
+      mergeEvidence(reranked.results, normalizedRequest));
 
     return {
       contextId: this.createId(),
@@ -108,7 +113,7 @@ export class BuildTaskContext {
       root: normalizedRequest.root,
       generatedAt: this.now().toISOString(),
       coverage,
-      evidence: mergeEvidence(reranked.results, normalizedRequest),
+      evidence,
       ...(reranked.ranking ? { ranking: reranked.ranking } : {})
     };
   }
@@ -122,7 +127,8 @@ export class BuildTaskContext {
     const original = results.flatMap((result) => result.evidence);
     const startedAt = performance.now();
     try {
-      const reranked = await this.dependencies.reranker.rerank(request, original);
+      const reranked = await this.trace("workspace_context.jev", () =>
+        this.dependencies.reranker!.rerank(request, original));
       const replacements = new Map(reranked.evidence.map((item) => [selectionKey(item), item]));
       const mappedResults = results.map((result) => ({
         ...result,
@@ -151,8 +157,10 @@ export class BuildTaskContext {
   private async runCodegraphProvider(request: TaskContextRequest): Promise<ProviderResult> {
     const startedAt = performance.now();
     try {
-      await this.dependencies.codegraph.ensureIndexed(request.root, request.changedFiles ?? []);
-      const evidence = await this.dependencies.codegraph.context(request);
+      await this.trace("workspace_context.codegraph.ensure_index", () =>
+        this.dependencies.codegraph.ensureIndexed(request.root, request.changedFiles ?? []));
+      const evidence = await this.trace("workspace_context.codegraph.query", () =>
+        this.dependencies.codegraph.context(request));
       const telemetry = this.dependencies.codegraph.telemetry?.(request.root);
       return {
         provider: "codegraph",
@@ -182,6 +190,11 @@ export class BuildTaskContext {
     } catch (error) {
       throw new ContextProviderUnavailableError(provider, error);
     }
+  }
+
+  private trace<T>(name: string, operation: () => Promise<T> | T): Promise<T> {
+    if (this.dependencies.traceSpan) return this.dependencies.traceSpan(name, operation);
+    return Promise.resolve().then(operation);
   }
 
   private toCoverage(result: ProviderResult): ProviderCoverage {

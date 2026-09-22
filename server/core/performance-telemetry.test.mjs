@@ -65,6 +65,8 @@ test("tracks one model-facing task across context, read, fused patch verificatio
     tool: "workspace_context",
     root: "/repo",
     task: "fix retry",
+    correlationId: "corr-task-1",
+    traceId: "trace-task-1",
     durationMs: 120,
     outChars: 8_000,
     result: {
@@ -107,6 +109,14 @@ test("tracks one model-facing task across context, read, fused patch verificatio
 
   const active = telemetry.snapshot().active[0];
   assert.equal(active.task_id, "task-1");
+  assert.equal(active.correlation_id, "corr-task-1");
+  assert.equal(active.trace_id, "trace-task-1");
+  assert.deepEqual(telemetry.activeIdentity("/repo"), {
+    task_id: "task-1",
+    correlation_id: "corr-task-1",
+    trace_id: "trace-task-1",
+    root: "/repo"
+  });
   assert.equal(active.tool_roundtrips, 3);
   assert.equal(active.bytes_to_model, 11_000);
   assert.equal(active.context_ms, 120);

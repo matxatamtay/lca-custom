@@ -84,8 +84,28 @@ export class SupervisedMemoryPort implements MemoryPort {
 
   async recall(request: TaskContextRequest): Promise<readonly ContextEvidence[]> {
     await this.supervisor.ensureReady();
-    return this.memory.recall(request);
+    try {
+      return await this.memory.recall(request);
+    } catch (error) {
+      if (!isRetryableAgentMemoryRecallError(error)) throw error;
+      await this.supervisor.ensureReady();
+      return this.memory.recall(request);
+    }
   }
+}
+
+function isRetryableAgentMemoryRecallError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = `${error.name}: ${error.message}`.toLowerCase();
+  const code = String((error as Error & { code?: unknown; cause?: { code?: unknown } }).code
+    ?? (error as Error & { cause?: { code?: unknown } }).cause?.code
+    ?? "").toLowerCase();
+  return message.includes("fetch failed")
+    || message.includes("network")
+    || message.includes("socket hang up")
+    || message.includes("connection reset")
+    || message.includes("connection refused")
+    || ["econnrefused", "econnreset", "etimedout", "und_err_connect_timeout", "und_err_socket"].includes(code);
 }
 
 export interface HttpAgentMemoryHealthProbeOptions {

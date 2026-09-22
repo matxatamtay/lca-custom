@@ -31,14 +31,13 @@ import { z } from "zod";
 import { ConversationRuntimeContext } from "./dist/orchestration/conversation-runtime-context.js";
 import { ActionExecutionPipeline } from "./dist/runtime/action-execution-pipeline.js";
 import { RuntimeEventStore } from "./dist/runtime/runtime-event-store.js";
-import { RuntimeOtelExporter } from "./dist/runtime/runtime-otel-exporter.js";
+import { RuntimeOtelExporter, traceIdForCorrelation } from "./dist/runtime/runtime-otel-exporter.js";
 import { RuntimePluginHost } from "./dist/runtime/runtime-plugin.js";
 import { summarizeArgs } from "./core/redaction.mjs";
 import {
   WorkspaceProtocol,
   buildResultDigest,
-  defaultMemoryVault,
-  validateTaskDag
+  defaultMemoryVault
 } from "./core/workspace-protocol.mjs";
 import {
   appendLimited, boundedNumber, comparePath, dedupe, firstText, hasCommand, isoNow,
@@ -46,6 +45,11 @@ import {
 } from "./core/runtime-utils.mjs";
 import { createNotesSkills } from "./core/notes-skills.mjs";
 import { createFilesystemCore } from "./core/filesystem-core.mjs";
+import { createAstGrepSearch } from "./core/ast-grep-search.mjs";
+import { createAstGrepRewritePlanner } from "./core/ast-grep-rewrite.mjs";
+import { createSemgrepScanner } from "./core/semgrep-scan.mjs";
+import { createMutationTestingRunner } from "./core/mutation-testing.mjs";
+import { buildRuntimeWaterfall } from "./core/runtime-waterfall.mjs";
 import { createCommandRuntime } from "./core/command-runtime.mjs";
 import { createExecAccelerator } from "./core/exec-accelerator.mjs";
 import { createProjectIntelligence } from "./core/project-intelligence.mjs";
@@ -65,6 +69,13 @@ import { createHttpRuntime } from "./core/http-runtime.mjs";
 import { createAgentMemoryObservation } from "./core/agentmemory-observation.mjs";
 import { createPerformanceTelemetry, modelVisibleResultBytes, telemetryPathCandidates } from "./core/performance-telemetry.mjs";
 import { createPerformanceFollow } from "./core/performance-follow.mjs";
+import { createBaselineStore } from "./core/self-improvement/baseline-store.mjs";
+import { createImprovementCandidateStore } from "./core/self-improvement/improvement-candidate-store.mjs";
+import { collectImprovementMetrics, detectPerformanceCandidates } from "./core/self-improvement/improvement-metrics.mjs";
+import { rankCandidates } from "./core/self-improvement/candidate-scorer.mjs";
+import { createRegressionRuleStore } from "./core/self-improvement/regression-rule-store.mjs";
+import { createRegressionRuleManager } from "./core/self-improvement/regression-rule-manager.mjs";
+import { createRenovateDependencyFeed } from "./core/self-improvement/dependency-feed.mjs";
 import {
   DEFAULT_FIGMA_DESKTOP_MCP_URL,
   callFigmaDesktopTool,
@@ -130,7 +141,6 @@ import {
 } from "./notion-api.mjs";
 import { buildNotionEditProposal } from "./notion-edit-proposal.mjs";
 import { registerNotionTools } from "./notion-tools.mjs";
-import { AgentRunnerRegistry } from "./agent-runner.mjs";
 import {
   browserAgentStatus,
   callBrowserAgentTool,
@@ -211,7 +221,8 @@ async function getNextApplicationRuntime() {
         jevModel: process.env.JEV_MODEL || undefined,
         jevTimeoutMs: process.env.JEV_TIMEOUT_MS ? Number(process.env.JEV_TIMEOUT_MS) : undefined,
         jevMaxCandidates: process.env.JEV_MAX_CANDIDATES ? Number(process.env.JEV_MAX_CANDIDATES) : undefined,
-        jevMaxStateChars: process.env.JEV_MAX_STATE_CHARS ? Number(process.env.JEV_MAX_STATE_CHARS) : undefined
+        jevMaxStateChars: process.env.JEV_MAX_STATE_CHARS ? Number(process.env.JEV_MAX_STATE_CHARS) : undefined,
+        traceSpan: (name, operation) => ACTION_PIPELINE.execute({ name, surface: "runtime" }, operation)
       }))
       .catch((error) => {
         nextApplicationRuntimePromise = undefined;
@@ -260,10 +271,7 @@ const EXTRA_ROOTS = parseExtraRoots(STARTUP_PROFILE);
 const ROOTS = dedupe([PRIMARY_ROOT, ...EXTRA_ROOTS]);
 const CONVERSATION_RUNTIME = new ConversationRuntimeContext({
   primaryRoot: PRIMARY_ROOT,
-  roots: ROOTS,
-  runner: "codex",
-  isolation: "worktree",
-  networkAccess: true
+  roots: ROOTS
 });
 
 function activePrimaryRoot() {
@@ -305,6 +313,22 @@ const OTEL_EXPORTER = new RuntimeOtelExporter({
   serviceName: process.env.OTEL_SERVICE_NAME || "local-coding-agent"
 });
 ACTION_PIPELINE.subscribe((observation) => OTEL_EXPORTER.observe(observation));
+
+function runtimeTraceReport({ correlationId = null, traceLimit = 5, spanLimit = 200 } = {}) {
+  return buildRuntimeWaterfall(
+    RUNTIME_EVENTS.query({
+      ...(correlationId ? { correlationId } : {}),
+      limit: Math.max(100, Math.min(10_000, Number(spanLimit) * Math.max(2, Number(traceLimit)) * 2))
+    }),
+    {
+      correlationId,
+      traceLimit,
+      spanLimit,
+      otelEnabled: OTEL_EXPORTER.enabled
+    }
+  );
+}
+
 const RUNTIME_PLUGIN_HOST = new RuntimePluginHost({
   runtime: CONVERSATION_RUNTIME,
   events: RUNTIME_EVENTS
@@ -481,10 +505,6 @@ const MAX_BODY_BYTES = Number(process.env.AGENT_MAX_BODY_BYTES || 16 * 1024 * 10
 const DEFAULT_CMD_TIMEOUT = 60_000;
 const WORKTREE_GC_MAX_AGE_MS = boundedNumber(process.env.AGENT_WORKTREE_GC_MAX_AGE_MS, 14 * 24 * 60 * 60_000, 60_000, 3650 * 24 * 60 * 60_000);
 const MAX_PROCS = 24;
-const MAX_PARALLEL_TASKS = 8;
-const MAX_TASK_STEPS = 8;
-const MAX_PARALLEL_STEPS = 32;
-const MAX_TASK_CONCURRENCY = 4;
 const PROC_BUFFER = 200_000;
 const MANIFEST_NAMES = new Set([
   "package.json",
@@ -675,6 +695,138 @@ async function runStartupRecovery() {
 }
 
 const workspaceStateRegistry = createWorkspaceStateRegistry({ DATA_DIR, isoNow, comparePath });
+const selfImprovementStores = new Map();
+
+function selfImprovementForRoot(root) {
+  const workspace = workspaceStateRegistry.forRoot(root);
+  const existing = selfImprovementStores.get(workspace.workspaceId);
+  if (existing) return existing;
+  const baseline = createBaselineStore({
+    filePath: path.join(workspace.paths.workspaceDataDir, "improvement-baseline.json")
+  });
+  const candidates = createImprovementCandidateStore({
+    jsonlPath: path.join(workspace.paths.workspaceDataDir, "improvement-candidates.jsonl"),
+    statePath: path.join(workspace.paths.workspaceDataDir, "improvement-state.json")
+  });
+  const regressionRules = createRegressionRuleStore({
+    statePath: path.join(workspace.paths.workspaceDataDir, "regression-rules.json"),
+    rulesDir: path.join(workspace.paths.workspaceDataDir, "semgrep-rules"),
+    minBlockingRuns: 5
+  });
+  const value = {
+    baseline,
+    candidates,
+    regressionRules,
+    ready: Promise.all([baseline.load(), candidates.load(), regressionRules.load()])
+  };
+  selfImprovementStores.set(workspace.workspaceId, value);
+  return value;
+}
+
+async function ingestImprovementCandidates(root, candidates) {
+  const workspaceRoot = projectRootForPath(root);
+  const stores = selfImprovementForRoot(workspaceRoot);
+  await stores.ready;
+  return stores.candidates.ingest(candidates || []);
+}
+
+async function regressionRuleStoreForRoot(root) {
+  const stores = selfImprovementForRoot(projectRootForPath(root));
+  await stores.ready;
+  return stores.regressionRules;
+}
+
+const renovateDependencyFeed = createRenovateDependencyFeed({
+  configuredReportPath: process.env.RENOVATE_FEED_PATH,
+  configuredBinary: process.env.RENOVATE_BIN,
+  hasCommand
+});
+
+async function dependencyFeedReport({ root, reportPath = null, ingest = true } = {}) {
+  const workspaceRoot = projectRootForPath(root);
+  const result = await renovateDependencyFeed.inspect({
+    root: workspaceRoot,
+    reportPath
+  });
+  let candidateIngestion = {
+    detected: result.candidates?.length || 0,
+    added: 0,
+    existing: 0,
+    total: 0,
+    ingested: false
+  };
+  if (ingest && result.ok && Array.isArray(result.candidates) && result.candidates.length) {
+    const ingestion = await ingestImprovementCandidates(workspaceRoot, result.candidates);
+    candidateIngestion = { ...ingestion, detected: result.candidates.length, ingested: true };
+  }
+  return { ...result, candidate_ingestion: candidateIngestion };
+}
+
+async function improvementReport({
+  root,
+  windowDays = 30,
+  taskClass = "user",
+  category = null,
+  limit = 10,
+  refresh = true
+} = {}) {
+  const stores = selfImprovementForRoot(root);
+  await stores.ready;
+  const performanceReport = performanceFollow.report({
+    root,
+    windowDays,
+    taskClass,
+    compact: false
+  });
+  const metrics = collectImprovementMetrics(performanceReport);
+  const captured = await stores.baseline.capture({
+    root,
+    query: { window_days: windowDays, task_class: taskClass },
+    metrics
+  });
+  const detected = refresh
+    ? detectPerformanceCandidates({ metrics, report: performanceReport, root })
+    : [];
+  const ingestion = refresh
+    ? await stores.candidates.ingest(detected)
+    : { detected: 0, added: 0, existing: 0, total: (await stores.candidates.list({ limit: 200 })).length };
+  const stored = await stores.candidates.list({ category, limit: 200 });
+  const ranked = rankCandidates(stored).slice(0, Math.max(1, Math.min(50, Number(limit) || 10)));
+  return {
+    version: 1,
+    root,
+    query: {
+      window_days: windowDays,
+      task_class: taskClass,
+      category: category || null,
+      refresh: Boolean(refresh)
+    },
+    baseline: {
+      id: captured.baseline.id,
+      changed: captured.changed,
+      metrics: captured.baseline.metrics
+    },
+    observed: ingestion,
+    candidates: ranked.map((candidate) => ({
+      id: candidate.id,
+      score: candidate.score,
+      category: candidate.category,
+      source: candidate.source,
+      evidence: candidate.evidence,
+      affected_component: candidate.component,
+      affected_paths: candidate.affected_paths,
+      estimated_benefit: candidate.estimated_benefit,
+      confidence: candidate.confidence,
+      impact: candidate.impact,
+      frequency: candidate.frequency,
+      estimated_cost: candidate.estimated_cost,
+      status: candidate.status || "open",
+      observations: Number(candidate.observations || 0),
+      first_seen: candidate.first_seen || null,
+      last_seen: candidate.last_seen || null
+    }))
+  };
+}
 
 const { detectTestCommands, parseTestFailures, runGatedCommand } = createTestCore({ runShellCommand: runAcceleratedShellCommand });
 
@@ -708,6 +860,69 @@ await loadWorkspaceProfile();
 // Detect ripgrep once at startup — the fastest search engine when present.
 const RG_BIN = await detectRg();
 if (RG_BIN) console.log("ripgrep detected: search_text/find_files will use rg");
+const AST_GREP_BIN = detectAstGrepBinary();
+const astGrepSearch = createAstGrepSearch({ binary: AST_GREP_BIN, toRel });
+const astGrepRewritePlanner = createAstGrepRewritePlanner({ binary: AST_GREP_BIN, toRel });
+const SEMGREP_BIN = detectSemgrepBinary();
+const regressionRuleManager = createRegressionRuleManager({
+  storeForRoot: regressionRuleStoreForRoot,
+  semgrepBinary: SEMGREP_BIN,
+  spawnCapture,
+  astGrepSearch
+});
+const semgrepScanner = createSemgrepScanner({
+  binary: SEMGREP_BIN,
+  rulesDir: path.join(APP_DIR, "rules", "semgrep"),
+  spawnCapture,
+  toRel,
+  recordCandidates: ingestImprovementCandidates,
+  additionalRuleConfigs: (root) => regressionRuleManager.activeConfigs(root),
+  recordRuleScan: (root, observation) => regressionRuleManager.recordScan(root, observation)
+});
+const mutationTestingRunner = createMutationTestingRunner({
+  spawnCapture,
+  configuredBinary: process.env.STRYKER_BIN,
+  hasCommand,
+  stateDirForRoot: async (root) => {
+    const workspace = workspaceStateRegistry.forRoot(projectRootForPath(root));
+    return workspace.paths.workspaceDataDir;
+  },
+  ingestCandidates: ingestImprovementCandidates,
+  analyzeTestQuality: async (root, sourcePath) => {
+    const absoluteSource = path.resolve(root, sourcePath);
+    const verification = await changeAwareVerification.plan(root, [absoluteSource]);
+    const history = await spawnCapture(
+      "git",
+      ["log", "--format=%H", "-n", "50", "--", sourcePath],
+      root,
+      30_000
+    );
+    const sourceChangeFrequency = history.exit_code === 0
+      ? String(history.stdout || "").split(/\r?\n/).filter(Boolean).length
+      : 0;
+
+    const stem = path.basename(sourcePath, path.extname(sourcePath));
+    const refs = await spawnCapture(
+      "git",
+      ["grep", "-l", "-F", stem, "--", "*.js", "*.jsx", "*.ts", "*.tsx", "*.mjs", "*.cjs", "*.mts", "*.cts"],
+      root,
+      30_000
+    );
+    const referenceFiles = refs.exit_code === 0
+      ? [...new Set(String(refs.stdout || "").split(/\r?\n/).filter(Boolean))]
+          .filter((value) => value !== sourcePath)
+          .filter((value) => !/(?:^|\/)(?:__tests__|test|tests)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(value))
+          .slice(0, 50)
+      : [];
+
+    return {
+      source_change_frequency: sourceChangeFrequency,
+      blast_radius: referenceFiles.length,
+      related_tests: verification.impacted_tests || [],
+      reference_files: referenceFiles
+    };
+  }
+});
 const ADB_BIN = detectAdbBinary();
 if (ADB_BIN) console.log(`adb detected: ${ADB_BIN}`);
 
@@ -772,6 +987,18 @@ function detectRg() {
     child.on("error", () => resolve(null));
     child.on("close", (code) => resolve(code === 0 ? "rg" : null));
   });
+}
+
+function detectAstGrepBinary() {
+  const configured = String(process.env.AST_GREP_BIN || "").trim();
+  if (configured) return hasCommand(configured) ? configured : null;
+  return hasCommand("ast-grep") ? "ast-grep" : null;
+}
+
+function detectSemgrepBinary() {
+  const configured = String(process.env.SEMGREP_BIN || "").trim();
+  if (configured) return hasCommand(configured) ? configured : null;
+  return hasCommand("semgrep") ? "semgrep" : null;
 }
 
 function detectAdbBinary() {
@@ -1459,309 +1686,6 @@ function registerCodeIntelligenceTools(mcp) {
   });
 }
 
-function registerAgentTools(mcp) {
-  const commonTaskShape = {
-    runner: z.string().optional().describe("Agent runner name. Default: codex."),
-    task: z.string().min(1),
-    name: z.string().min(1).max(120).optional(),
-    cwd: z.string().optional().describe("Working directory. Default: conversation primary project."),
-    files: z.array(z.string().min(1)).max(200).optional().describe("Optional correctness scope for delegated writes. Omit to let an isolated worker edit any file needed for the task."),
-    context: z.string().max(80_000).optional().describe("Bounded parent-agent context to pass to the worker."),
-    model: z.string().optional(),
-    provider: z.string().min(1).max(64).optional().describe("Use one configured provider by name; explicit provider selection bypasses provider cooldown."),
-    provider_chain: z.array(z.string().min(1).max(64)).max(8).optional().describe("Ordered provider fallback chain. Secrets stay server-side in environment variables."),
-    reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
-    sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional().describe("Default: danger-full-access."),
-    isolation: z.enum(["shared", "worktree"]).optional().describe("Writable jobs default to isolated git worktrees; read-only jobs default to shared."),
-    inherit_dirty: z.boolean().optional().describe("Copy current tracked/untracked state into the isolated baseline. Default true."),
-    network_access: z.boolean().optional().describe("Default: true."),
-    additional_directories: z.array(z.string().min(1)).max(20).optional(),
-    parent_task_id: z.string().min(1).max(120).optional(),
-    parent_session_id: z.string().min(1).max(200).optional(),
-    task_id: TASK_ID_SCHEMA
-  };
-
-  reg(
-    mcp,
-    "agent_capabilities",
-    {
-      title: "Agent runner capabilities",
-      description: "List available delegated model-agent runners and supported execution features.",
-      inputSchema: {}
-    },
-    async () => jsonResult(getAgentRunnerRegistry().capabilities())
-  );
-
-  reg(
-    mcp,
-    "agent_spawn",
-    {
-      title: "Spawn delegated coding agent",
-      description: "Start one delegated model-agent coding job. Codex is the default runner. Returns immediately with a managed job id.",
-      inputSchema: commonTaskShape
-    },
-    async (input) => {
-      const prepared = await prepareAgentTaskInput(input);
-      const job = getAgentRunnerRegistry().spawn(prepared);
-      return jsonResult({
-        runner: prepared.runner || "codex",
-        job,
-        scope: prepared.scope,
-        result_digest: buildResultDigest({
-          ok: true,
-          taskId: prepared.scope.task_id,
-          changedFiles: prepared.files || [],
-          summary: `Started delegated agent job ${job.id}.`
-        })
-      });
-    }
-  );
-
-  reg(
-    mcp,
-    "agent_spawn_parallel",
-    {
-      title: "Spawn parallel delegated coding agents",
-      description: "Start up to 8 independent model-agent jobs concurrently. Delegates default to danger-full-access with network enabled and isolated worktrees; only shared parallel writes require disjoint declared scopes.",
-      inputSchema: {
-        runner: z.string().optional(),
-        cwd: z.string().optional(),
-        context: z.string().max(80_000).optional(),
-        model: z.string().optional(),
-        provider: z.string().min(1).max(64).optional(),
-        provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
-        reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
-        sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
-        isolation: z.enum(["shared", "worktree"]).optional(),
-        inherit_dirty: z.boolean().optional(),
-        network_access: z.boolean().optional(),
-        additional_directories: z.array(z.string().min(1)).max(20).optional(),
-        allow_overlap: z.boolean().optional(),
-        task_id: TASK_ID_SCHEMA,
-        tasks: z.array(z.object({
-          task: z.string().min(1),
-          name: z.string().min(1).max(120).optional(),
-          cwd: z.string().optional(),
-          files: z.array(z.string().min(1)).max(200).optional(),
-          context: z.string().max(80_000).optional(),
-          model: z.string().optional(),
-          provider: z.string().min(1).max(64).optional(),
-          provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
-          reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
-          sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
-          isolation: z.enum(["shared", "worktree"]).optional(),
-          inherit_dirty: z.boolean().optional(),
-          network_access: z.boolean().optional(),
-          additional_directories: z.array(z.string().min(1)).max(20).optional()
-        })).min(1).max(MAX_PARALLEL_TASKS)
-      }
-    },
-    async (input) => {
-      const workdir = resolvePath(input.cwd || ".");
-      const common = { ...input, cwd: workdir };
-      delete common.tasks;
-      delete common.task_id;
-      const preparedTasks = [];
-      const allFiles = [];
-      for (const task of input.tasks) {
-        const taskCwd = resolveAgentPath(workdir, task.cwd || ".");
-        const files = resolveAgentPaths(taskCwd, task.files || []);
-        preparedTasks.push({ ...task, cwd: taskCwd, files });
-        allFiles.push(...files);
-      }
-      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, allFiles);
-      const batch = getAgentRunnerRegistry().spawnParallel({ ...common, tasks: preparedTasks, allow_overlap: input.allow_overlap });
-      return jsonResult({ runner: input.runner || "codex", ...batch, scope });
-    }
-  );
-
-  reg(
-    mcp,
-    "agent_list",
-    {
-      title: "List delegated agent jobs",
-      description: "List managed delegated model-agent jobs without returning full job output.",
-      inputSchema: { runner: z.string().optional() }
-    },
-    async (input) => jsonResult(getAgentRunnerRegistry().list(input))
-  );
-
-  reg(
-    mcp,
-    "agent_collect",
-    {
-      title: "Collect delegated agent results",
-      description: "Collect full results for a delegated agent batch or explicit job ids.",
-      inputSchema: {
-        runner: z.string().optional(),
-        batch_id: z.string().optional(),
-        job_ids: z.array(z.string().min(1)).max(MAX_PARALLEL_TASKS).optional()
-      }
-    },
-    async (input) => jsonResult(getAgentRunnerRegistry().collect(input))
-  );
-
-  reg(
-    mcp,
-    "agent_stop",
-    {
-      title: "Stop delegated agent",
-      description: "Cancel one managed delegated model-agent job.",
-      inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
-    },
-    async (input) => jsonResult(getAgentRunnerRegistry().stop(input))
-  );
-
-  reg(
-    mcp,
-    "agent_merge",
-    {
-      title: "Merge isolated agent result",
-      description: "Apply a completed isolated agent patch only after scope validation and git apply --check. Conflicts leave the source tree unchanged.",
-      inputSchema: {
-        runner: z.string().optional(),
-        job_id: z.string().min(1),
-        target_cwd: z.string().optional(),
-        cleanup: z.boolean().optional(),
-        task_id: TASK_ID_SCHEMA
-      }
-    },
-    async (input) => {
-      const registry = getAgentRunnerRegistry();
-      const collected = registry.collect({ runner: input.runner, job_ids: [input.job_id] });
-      const job = collected.jobs?.[0];
-      if (!job) throw new Error(`No delegated agent job ${input.job_id}.`);
-      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, job.changed_files || []);
-      const result = await registry.merge({
-        ...input,
-        target_cwd: input.target_cwd ? resolvePath(input.target_cwd) : undefined
-      });
-      return jsonResult({ ...result, scope });
-    }
-  );
-
-  reg(
-    mcp,
-    "agent_cleanup",
-    {
-      title: "Cleanup isolated agent worktree",
-      description: "Remove a delegated agent worktree and temporary patch after review, merge, or abandonment.",
-      inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
-    },
-    async (input) => jsonResult(await getAgentRunnerRegistry().cleanup(input))
-  );
-
-  reg(mcp, "agent_recover", {
-    title: "Recover delegated agent descriptor",
-    description: "Read the durable descriptor reconstructed after LCA restart, including recoverable worktree and patch metadata.",
-    inputSchema: { job_id: z.string().min(1) }
-  }, async (input) => jsonResult(getAgentRunnerRegistry().recover(input)));
-
-  reg(mcp, "agent_resume", {
-    title: "Resume delegated agent",
-    description: "Resume a provider-backed delegated agent when the selected runner advertises resume support; otherwise returns supported=false.",
-    inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
-  }, async (input) => jsonResult(await getAgentRunnerRegistry().resume(input)));
-
-  reg(mcp, "agent_followup", {
-    title: "Follow up delegated agent",
-    description: "Send a follow-up to a continuable delegated agent when supported by its runner.",
-    inputSchema: { runner: z.string().optional(), job_id: z.string().min(1), content: z.string().min(1).max(80_000) }
-  }, async (input) => jsonResult(await getAgentRunnerRegistry().followup(input)));
-
-  reg(mcp, "agent_interrupt", {
-    title: "Interrupt delegated agent",
-    description: "Interrupt the current delegated turn when supported by its runner without deleting durable state.",
-    inputSchema: { runner: z.string().optional(), job_id: z.string().min(1) }
-  }, async (input) => jsonResult(await getAgentRunnerRegistry().interrupt(input)));
-
-  reg(
-    mcp,
-    "agent_dag",
-    {
-      title: "Start agent task DAG",
-      description: "Start a dependency-aware DAG of delegated coding agents. Independent ready nodes run concurrently; failed required dependencies block downstream nodes.",
-      inputSchema: {
-        runner: z.string().optional(),
-        cwd: z.string().optional(),
-        context: z.string().max(80_000).optional(),
-        model: z.string().optional(),
-        provider: z.string().min(1).max(64).optional(),
-        provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
-        reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
-        sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
-        isolation: z.enum(["shared", "worktree"]).optional(),
-        inherit_dirty: z.boolean().optional(),
-        network_access: z.boolean().optional(),
-        additional_directories: z.array(z.string().min(1)).max(20).optional(),
-        max_concurrency: z.number().int().min(1).max(MAX_PARALLEL_TASKS).optional(),
-        allow_overlap: z.boolean().optional(),
-        task_id: TASK_ID_SCHEMA,
-        tasks: z.array(z.object({
-          id: z.string().min(1).max(80),
-          task: z.string().min(1),
-          name: z.string().min(1).max(120).optional(),
-          depends_on: z.array(z.string().min(1).max(80)).max(32).optional(),
-          allow_failure: z.boolean().optional(),
-          cwd: z.string().optional(),
-          files: z.array(z.string().min(1)).max(200).optional(),
-          context: z.string().max(80_000).optional(),
-          model: z.string().optional(),
-          provider: z.string().min(1).max(64).optional(),
-          provider_chain: z.array(z.string().min(1).max(64)).max(8).optional(),
-          reasoning_effort: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
-          sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
-          isolation: z.enum(["shared", "worktree"]).optional(),
-          inherit_dirty: z.boolean().optional(),
-          network_access: z.boolean().optional(),
-          additional_directories: z.array(z.string().min(1)).max(20).optional()
-        })).min(1).max(MAX_PARALLEL_STEPS)
-      }
-    },
-    async (input) => {
-      const workdir = resolvePath(input.cwd || ".");
-      const allFiles = [];
-      const tasks = input.tasks.map((task) => {
-        const taskCwd = resolveAgentPath(workdir, task.cwd || ".");
-        const files = resolveAgentPaths(taskCwd, task.files || []);
-        const additionalDirectories = resolveAgentPaths(taskCwd, task.additional_directories || []);
-        allFiles.push(...files);
-        return { ...task, cwd: taskCwd, files, additional_directories: additionalDirectories };
-      });
-      const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, allFiles);
-      const dag = getAgentRunnerRegistry().spawnDag({
-        ...input,
-        cwd: workdir,
-        additional_directories: resolveAgentPaths(workdir, input.additional_directories || []),
-        tasks
-      });
-      return jsonResult({ ...dag, scope });
-    }
-  );
-
-  reg(
-    mcp,
-    "agent_dag_collect",
-    {
-      title: "Collect agent DAG",
-      description: "Inspect DAG node states and optionally include delegated job results.",
-      inputSchema: { dag_id: z.string().min(1), include_results: z.boolean().optional() }
-    },
-    async (input) => jsonResult(getAgentRunnerRegistry().collectDag(input))
-  );
-
-  reg(
-    mcp,
-    "agent_dag_stop",
-    {
-      title: "Stop agent DAG",
-      description: "Cancel active jobs and pending nodes in one delegated agent DAG.",
-      inputSchema: { dag_id: z.string().min(1) }
-    },
-    async (input) => jsonResult(getAgentRunnerRegistry().stopDag(input))
-  );
-}
-
 function registerUiTools(mcp) {
   reg(
     mcp,
@@ -1987,39 +1911,6 @@ async function fallbackCodeSymbolSearch(root, symbol, mode, limit = 500) {
   };
 }
 
-function getAgentRunnerRegistry() {
-  if (!agentRunnerRegistry) {
-    agentRunnerRegistry = new AgentRunnerRegistry({
-      events: RUNTIME_EVENTS,
-      correlationId: () => ACTION_PIPELINE.currentCorrelationId(),
-      codexOptions: { maxParallel: MAX_PARALLEL_TASKS }
-    });
-  }
-  return agentRunnerRegistry;
-}
-
-async function prepareAgentTaskInput(input) {
-  const cwd = resolvePath(input.cwd || ".");
-  const files = resolveAgentPaths(cwd, input.files || []);
-  const additionalDirectories = resolveAgentPaths(cwd, input.additional_directories || []);
-  const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, files);
-  return {
-    ...input,
-    cwd,
-    files,
-    additional_directories: additionalDirectories,
-    scope
-  };
-}
-
-function resolveAgentPaths(cwd, values) {
-  return [...new Set((values || []).map((value) => resolveAgentPath(cwd, value)))];
-}
-
-function resolveAgentPath(cwd, value) {
-  return path.isAbsolute(value) ? path.resolve(value) : path.resolve(cwd, value);
-}
-
 async function androidDevices() {
   if (!ADB_BIN) return { ok: false, adb: false, devices: [], error: "adb unavailable" };
   const result = await spawnCapture(ADB_BIN, ["devices", "-l"], activePrimaryRoot(), 10_000);
@@ -2155,7 +2046,6 @@ function registerBackendTools(mcp) {
   registerPatchEngineTools(mcp);  // v2.2
   registerTestRunnerTools(mcp);   // v2.3
   registerReviewTools(mcp);       // v2.4
-  registerAgentTools(mcp);        // v4.5 — delegated model agents
   registerUiTools(mcp);           // v4.5 — browser + Android automation
   registerPlannerTools(mcp);      // v2.5
   registerProfileTools(mcp);      // v2.8
@@ -2324,6 +2214,39 @@ function telemetryAction(args) {
   return typeof args?.action === "string" && args.action.trim() ? args.action.trim() : null;
 }
 
+const PENDING_RUNTIME_SPANS = new Map();
+
+function bufferRuntimeSpan(observation) {
+  if (observation?.surface !== "runtime") return;
+  if (!/^(?:workspace_context|workspace_edit)\./.test(String(observation?.name || ""))) return;
+  const correlationId = String(observation?.correlationId || "").trim();
+  if (!correlationId) return;
+  const spans = PENDING_RUNTIME_SPANS.get(correlationId) || [];
+  spans.push({
+    name: observation.name,
+    surface: observation.surface,
+    correlationId,
+    spanId: observation.spanId,
+    parentSpanId: observation.parentSpanId || null,
+    startedAt: observation.startedAt,
+    durationMs: observation.durationMs,
+    success: observation.success
+  });
+  PENDING_RUNTIME_SPANS.delete(correlationId);
+  PENDING_RUNTIME_SPANS.set(correlationId, spans.slice(-500));
+  while (PENDING_RUNTIME_SPANS.size > 100) {
+    PENDING_RUNTIME_SPANS.delete(PENDING_RUNTIME_SPANS.keys().next().value);
+  }
+}
+
+function drainRuntimeSpans(correlationId) {
+  const key = String(correlationId || "").trim();
+  if (!key) return [];
+  const spans = PENDING_RUNTIME_SPANS.get(key) || [];
+  PENDING_RUNTIME_SPANS.delete(key);
+  return spans;
+}
+
 function consumeActionObservation(observation) {
   TOOL_METRICS.record({
     ts: observation.startedAt,
@@ -2334,6 +2257,7 @@ function consumeActionObservation(observation) {
     inChars: observation.inChars,
     outChars: observation.outChars
   });
+  bufferRuntimeSpan(observation);
 }
 
 function reg(mcp, name, def, handler) {
@@ -2344,12 +2268,33 @@ function reg(mcp, name, def, handler) {
     const argSummary = AUDIT_ENABLED && AUDIT_ARGS ? summarizeArgs(args) : "";
     let inChars = 0;
     try { inChars = JSON.stringify(args ?? {}).length; } catch { inChars = argSummary.length; }
+    const action = telemetryAction(args ?? {});
+    const isPerformanceProbe = name === "workspace_status" && (
+      action === "performance"
+      || action === "performance_follow"
+      || action === "improvements"
+      || action === "improvement_candidates"
+      || action === "trace"
+      || action === "tool_trace"
+    );
+    let activeIdentity = null;
+    if (modelFacing && name !== "workspace_context" && !isPerformanceProbe) {
+      try {
+        activeIdentity = performanceTelemetry.activeIdentity(inferTelemetryRoot(args ?? {}, null));
+      } catch { /* correlation falls back to a fresh trace */ }
+    }
+    const correlationId = ACTION_PIPELINE.currentCorrelationId()
+      || activeIdentity?.correlation_id
+      || randomUUID();
+    const traceId = activeIdentity?.trace_id || traceIdForCorrelation(correlationId);
+
     let result;
     try {
       result = await ACTION_PIPELINE.execute({
         name,
         surface: modelFacing ? "facade" : "backend",
         args: args ?? {},
+        correlationId,
         resultIsError: (value) => Boolean(value?.isError)
       }, () => handler(args ?? {}, extra));
     } catch (err) {
@@ -2361,8 +2306,6 @@ function reg(mcp, name, def, handler) {
     const durationMs = Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10);
     const errText = success ? null : firstText(result).slice(0, 200);
     audit({ ts: startedAt, tool: name, ok: success, durationMs, inChars, outChars, error: errText || undefined, args: argSummary || undefined });
-    const action = telemetryAction(args ?? {});
-    const isPerformanceProbe = name === "workspace_status" && (action === "performance" || action === "performance_follow");
     if (modelFacing && !isPerformanceProbe) {
       try {
         const telemetryRoot = inferTelemetryRoot(args ?? {}, result);
@@ -2375,7 +2318,9 @@ function reg(mcp, name, def, handler) {
           durationMs,
           inChars,
           outChars: modelOutBytes,
-          result
+          result,
+          correlationId,
+          traceId
         });
         performanceFollow.recordToolCall({
           tool: name,
@@ -2386,9 +2331,24 @@ function reg(mcp, name, def, handler) {
           durationMs,
           inChars,
           outBytes: modelOutBytes,
-          result
+          result,
+          correlationId,
+          traceId
         });
+        const runtimeSpans = drainRuntimeSpans(correlationId);
+        if (trace && runtimeSpans.length) {
+          performanceFollow.recordRuntimeSpans({
+            root: telemetryRoot,
+            projectRoot: trace.context_root || null,
+            trace,
+            correlationId,
+            traceId,
+            spans: runtimeSpans
+          });
+        }
       } catch { /* performance recording must never downgrade a tool result */ }
+    } else if (modelFacing) {
+      drainRuntimeSpans(correlationId);
     }
     if (modelFacing && RECORD_AGENTMEMORY_SESSIONS) {
       scheduleAgentMemoryObservation(name, args ?? {}, result, success, durationMs, outChars, errText);
@@ -2419,10 +2379,6 @@ function workspaceInfoPayload() {
       max_read_chars: MAX_READ_CHARS,
       max_batch_read_chars: MAX_BATCH_READ_CHARS,
       max_command_output: MAX_COMMAND_OUTPUT,
-      max_parallel_tasks: MAX_PARALLEL_TASKS,
-      max_task_steps: MAX_TASK_STEPS,
-      max_parallel_steps: MAX_PARALLEL_STEPS,
-      max_task_concurrency: MAX_TASK_CONCURRENCY,
       max_procs: MAX_PROCS
     },
     running_processes: [...processes.values()].filter((p) => p.status === "running").length,
@@ -2440,18 +2396,19 @@ function workspaceInfoPayload() {
 }
 
 const registerBasicTools = createBasicToolRegistrar({
-  reg, jsonResult, textResult, isoNow, readNotes, writeNotes, workspaceInfoPayload, performanceFollow,
-  workspaceStateRegistry, resolvePath, projectRootForPath, PRIMARY_ROOT
+  reg, jsonResult, textResult, isoNow, readNotes, writeNotes, workspaceInfoPayload, performanceFollow, improvementReport,
+  dependencyFeedReport, runtimeTraceReport, workspaceStateRegistry, resolvePath, projectRootForPath, PRIMARY_ROOT
 });
 
 const registerFsReadTools = createFsReadToolRegistrar({
   reg, jsonResult, resolvePath, toRel, listEntries, ripgrepGrep, gitGrep, attachContext, findFiles, searchTree, buildTree,
-  RG_BIN, MANIFEST_NAMES, MAX_BATCH_READ_CHARS, MAX_READ_CHARS, READ_DEFAULT
+  astGrepSearch, RG_BIN, MANIFEST_NAMES, MAX_BATCH_READ_CHARS, MAX_READ_CHARS, READ_DEFAULT
 });
 
 const registerFsWriteTools = createFsWriteToolRegistrar({
   reg, jsonResult, resolvePath, toRel, applyOperations, applyUnifiedDiff, createBackupBatch, runJournaledMutation, editTransaction,
-  postEditIntelligence, workspaceStateRegistry, projectRootForPath, changeAwareVerification,
+  postEditIntelligence, workspaceStateRegistry, projectRootForPath, changeAwareVerification, astGrepRewritePlanner,
+  traceSpan: (name, operation) => ACTION_PIPELINE.execute({ name, surface: "runtime" }, operation),
   resolveActiveProjectRoot: discoverActiveProjectRoot
 });
 
@@ -2674,6 +2631,7 @@ const registerRepoIntelTools = createRepoIntelToolRegistrar({
   isoNow, readRepoIndex, recommendNextActions, recommendedReads, relEntriesToAbs,
   resolveTaskProjectRoot, resolveActiveProjectRoot: discoverActiveProjectRoot, scanSymbols, writeRepoIndex, workspaceStateRegistry, projectRootForPath,
   changeAwareVerification, getPerformanceSnapshot: () => performanceTelemetry.snapshot(),
+  traceSpan: (name, operation) => ACTION_PIPELINE.execute({ name, surface: "runtime" }, operation),
   ALLOWED_ORIGINS, AUTH_TOKEN, MANIFEST_NAMES, PRIMARY_ROOT, PRODUCT_TIER,
   REPO_INDEX_TTL_MS, RG_BIN, ROOTS, VERSION
 });
@@ -2690,7 +2648,10 @@ const registerTestRunnerTools = createTestRunnerToolRegistrar({
   reg, jsonResult, detectProjectProfile, getTestCommandsMerged, resolvePath,
   runGatedCommand, runQualityGate, spawnCapture, DEFAULT_CMD_TIMEOUT,
   workspaceStateRegistry, projectRootForPath,
-  changeAwareVerification, resolveActiveProjectRoot: discoverActiveProjectRoot
+  changeAwareVerification, semgrepScan: (input) => semgrepScanner.scan(input),
+  semgrepRules: (root, input) => regressionRuleManager.manage(root, input),
+  mutationRun: (input) => mutationTestingRunner.run(input),
+  resolveActiveProjectRoot: discoverActiveProjectRoot
 });
 
 function shellQuoteForCommand(value) {
@@ -2714,7 +2675,11 @@ const registerReviewTools = createReviewToolRegistrar({
 
 const registerPlannerTools = createPlannerToolRegistrar({
   reg, jsonResult, textResult, isoNow,
-  workspaceStateRegistry, resolvePath, projectRootForPath, PRIMARY_ROOT
+  workspaceStateRegistry, resolvePath, projectRootForPath, PRIMARY_ROOT,
+  async persistImprovementMemory(input) {
+    const runtime = await getNextApplicationRuntime();
+    await runtime.memorySessions.recordImprovement(input);
+  }
 });
 
 // ============================================================================

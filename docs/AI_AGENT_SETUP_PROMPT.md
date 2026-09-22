@@ -1,6 +1,6 @@
 # AI Agent Setup Prompt
 
-Copy prompt này vào Codex, Claude Code, Cursor hoặc agent local khác nếu muốn nó hỗ trợ cài repo này.
+Copy prompt này vào Claude Code, Cursor hoặc agent local khác nếu muốn nó hỗ trợ cài repo này.
 
 ```text
 Hãy cài Local Coding Agent theo flow TUI mới.

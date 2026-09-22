@@ -39,6 +39,7 @@ export interface DefaultContainerOptions {
   jevTimeoutMs?: number;
   jevMaxCandidates?: number;
   jevMaxStateChars?: number;
+  traceSpan?: <T>(name: string, operation: () => Promise<T> | T) => Promise<T>;
 }
 
 export interface PrewarmProviderReceipt {
@@ -136,7 +137,8 @@ export function createDefaultApplicationContainer(
       semantic,
       codegraph,
       agentmemory: memoryPort,
-      ...(reranker ? { reranker } : {})
+      ...(reranker ? { reranker } : {}),
+      ...(options.traceSpan ? { traceSpan: options.traceSpan } : {})
     }),
     memorySessions,
     invalidateContext(root, changedFiles = []) {

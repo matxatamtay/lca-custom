@@ -114,6 +114,7 @@ try {
   const targetNames = TARGET_TOOL_CATALOG.map((tool) => tool.name);
 
   assert.deepEqual(compactNames, targetNames, "active compact surface must match the target catalog exactly");
+  assert.equal(compactNames.includes("workspace_agent"), false, "delegated model-agent facade must stay removed");
   assert.ok(compactTools.length <= 20, `expected at most 20 tools, received ${compactTools.length}`);
 
   const schemaBytes = Buffer.byteLength(JSON.stringify(compactTools), "utf8");
@@ -132,12 +133,20 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 168, `expected complete merged internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 176, `expected complete merged internal backend coverage, received ${assigned.size} actions`);
   for (const action of ["worktree_create", "worktree_status", "worktree_diff", "worktree_check", "worktree_gc", "worktree_cleanup"]) {
     assert.deepEqual(assigned.get(action), ["workspace_git"], `${action} must stay behind workspace_git`);
   }
   assert.deepEqual(assigned.get("verify_changed"), ["workspace_verify"], "verify_changed must stay behind workspace_verify");
+  assert.deepEqual(assigned.get("semgrep_scan"), ["workspace_verify"], "Semgrep scan must stay behind workspace_verify");
+  assert.deepEqual(assigned.get("semgrep_rules"), ["workspace_verify"], "learned Semgrep rule lifecycle must stay behind workspace_verify");
+  assert.deepEqual(assigned.get("mutation_test"), ["workspace_verify"], "mutation testing must stay behind workspace_verify");
   assert.deepEqual(assigned.get("performance_follow"), ["workspace_status"], "performance_follow must stay behind workspace_status");
+  assert.deepEqual(assigned.get("improvement_candidates"), ["workspace_status"], "improvement candidates must stay behind workspace_status");
+  assert.deepEqual(assigned.get("dependency_feed"), ["workspace_status"], "dependency feed must stay behind workspace_status");
+  assert.deepEqual(assigned.get("tool_trace"), ["workspace_status"], "runtime trace must stay behind workspace_status");
+  assert.deepEqual(assigned.get("ast_search"), ["workspace_search"], "ast structural search must stay behind workspace_search");
+  assert.deepEqual(assigned.get("ast_rewrite"), ["workspace_edit"], "ast structural rewrite must stay behind workspace_edit");
   for (const directName of DIRECT_NAMES) assert.ok(compactNames.includes(directName), `${directName} must remain direct`);
 
   const writeResult = await client.callTool({
@@ -151,6 +160,104 @@ try {
     arguments: { action: "one", arguments: { path: "compact.txt" } }
   });
   assert.equal(parseJsonResult(readResult).content, "compact facade works\n");
+
+  const astFixture = await client.callTool({
+    name: "workspace_edit",
+    arguments: { action: "write", arguments: { path: "ast-sample.ts", content: "const structural = Promise.all([one, two]);\n" } }
+  });
+  assert.notEqual(astFixture.isError, true, firstText(astFixture));
+  const astResult = parseJsonResult(await client.callTool({
+    name: "workspace_search",
+    arguments: {
+      action: "ast",
+      arguments: { pattern: "Promise.all($$$A)", lang: "ts", path: "ast-sample.ts", limit: 5 }
+    }
+  }));
+  assert.equal(astResult.engine, "ast-grep");
+  if (astResult.available) {
+    assert.equal(astResult.ok, true, JSON.stringify(astResult));
+    assert.equal(astResult.count, 1);
+    assert.equal(astResult.matches[0].path, "ast-sample.ts");
+    assert.equal(astResult.matches[0].node_kind, "call_expression");
+    assert.ok(astResult.matches[0].captures.A);
+  } else {
+    assert.match(astResult.reason || "", /unavailable/i);
+    assert.deepEqual(astResult.matches, []);
+  }
+  const textSearchResult = parseJsonResult(await client.callTool({
+    name: "workspace_search",
+    arguments: {
+      action: "text",
+      arguments: { query: "Promise.all", path: "ast-sample.ts", limit: 5 }
+    }
+  }));
+  assert.equal(textSearchResult.count, 1);
+
+  if (astResult.available) {
+    const dryRewrite = parseJsonResult(await client.callTool({
+      name: "workspace_edit",
+      arguments: {
+        action: "ast_rewrite",
+        arguments: {
+          pattern: "const $A = $B",
+          rewrite: "let $A = $B",
+          lang: "ts",
+          paths: ["ast-sample.ts"],
+          max_matches: 2,
+          dry_run: true,
+          verify: "changed"
+        }
+      }
+    }));
+    assert.equal(dryRewrite.ok, true, JSON.stringify(dryRewrite));
+    assert.equal(dryRewrite.dry_run, true);
+    assert.equal(dryRewrite.applied, false);
+    assert.equal(dryRewrite.count, 1);
+    const afterDryRun = parseJsonResult(await client.callTool({
+      name: "workspace_read",
+      arguments: { action: "one", arguments: { path: "ast-sample.ts" } }
+    }));
+    assert.match(afterDryRun.content, /^const structural/);
+
+    const appliedRewrite = parseJsonResult(await client.callTool({
+      name: "workspace_edit",
+      arguments: {
+        action: "ast_rewrite",
+        arguments: {
+          pattern: "const $A = $B",
+          rewrite: "let $A = $B",
+          lang: "ts",
+          paths: ["ast-sample.ts"],
+          max_matches: 2,
+          dry_run: false,
+          verify: "changed"
+        }
+      }
+    }));
+    assert.equal(appliedRewrite.ok, true, JSON.stringify(appliedRewrite));
+    assert.equal(appliedRewrite.applied, true);
+    assert.equal(appliedRewrite.regression_gate, "pass");
+    assert.equal(appliedRewrite.rollback_available, true);
+    assert.equal(appliedRewrite.verification?.requested, true);
+    assert.ok(appliedRewrite.post_edit?.roots?.[0]?.semantic, "ast rewrite must run post-edit semantic diagnostics");
+    const afterRewrite = parseJsonResult(await client.callTool({
+      name: "workspace_read",
+      arguments: { action: "one", arguments: { path: "ast-sample.ts" } }
+    }));
+    assert.match(afterRewrite.content, /^let structural/);
+
+    const undoRewrite = parseJsonResult(await client.callTool({
+      name: "workspace_edit",
+      arguments: { action: "undo", arguments: {} }
+    }));
+    assert.equal(undoRewrite.ok, true, JSON.stringify(undoRewrite));
+    assert.equal(undoRewrite.tool, "ast_rewrite");
+    const afterUndo = parseJsonResult(await client.callTool({
+      name: "workspace_read",
+      arguments: { action: "one", arguments: { path: "ast-sample.ts" } }
+    }));
+    assert.match(afterUndo.content, /^const structural/);
+  }
 
   const fusedPatchResult = await client.callTool({
     name: "workspace_edit",
@@ -172,6 +279,123 @@ try {
   assert.equal(fusedPatch.verification?.requested, true);
   assert.equal(fusedPatch.verification?.ok, true);
   assert.ok(Number(fusedPatch.verification?.duration_ms) >= 0);
+
+  const runtimeTrace = parseJsonResult(await client.callTool({
+    name: "workspace_status",
+    arguments: {
+      action: "trace",
+      arguments: { trace_limit: 10, span_limit: 500 }
+    }
+  }));
+  assert.equal(runtimeTrace.kind, "runtime_trace_waterfall");
+  assert.equal(runtimeTrace.source, "RuntimeEventStore");
+  assert.equal(runtimeTrace.authoritative_history, "performance_follow");
+  assert.equal(typeof runtimeTrace.otel_export_enabled, "boolean");
+  const traceSpans = runtimeTrace.groups.flatMap((group) => group.spans || []);
+  for (const name of [
+    "workspace_edit.match",
+    "workspace_edit.write",
+    "workspace_edit.semantic_refresh",
+    "workspace_edit.verify_changed"
+  ]) {
+    assert.ok(traceSpans.some((span) => span.name === name), `missing runtime trace span ${name}`);
+  }
+  assert.ok(traceSpans.some((span) => span.name === "workspace_edit.verify_changed" && span.depth >= 1));
+
+  const draftRule = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: {
+      action: "regression_rules",
+      arguments: {
+        cwd: workspace,
+        operation: "draft",
+        id: "compact-runtime",
+        message: "Prevent BAD_RULE marker",
+        lang: "generic",
+        pattern_regex: "BAD_RULE\\(",
+        severity: "ERROR",
+        category: "CORRECTNESS",
+        component: "compact-runtime",
+        before: "BAD_RULE();",
+        after: "GOOD_RULE();"
+      }
+    }
+  }));
+  assert.equal(draftRule.ok, true, JSON.stringify(draftRule));
+  assert.equal(draftRule.rule.state, "draft");
+
+  const shadowRule = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: {
+      action: "semgrep_rules",
+      arguments: { cwd: workspace, operation: "promote", id: draftRule.rule.id, to: "shadow" }
+    }
+  }));
+  assert.equal(shadowRule.ok, true, JSON.stringify(shadowRule));
+  assert.equal(shadowRule.rule.state, "shadow");
+
+  const fixtureRule = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: {
+      action: "semgrep_rules",
+      arguments: { cwd: workspace, operation: "validate_fixture", id: draftRule.rule.id }
+    }
+  }));
+  assert.equal(fixtureRule.ok, true, JSON.stringify(fixtureRule));
+  assert.equal(fixtureRule.rule.validation.fixture_passed, true);
+
+  const validatedRule = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: {
+      action: "semgrep_rules",
+      arguments: { cwd: workspace, operation: "promote", id: draftRule.rule.id, to: "validated" }
+    }
+  }));
+  assert.equal(validatedRule.ok, true, JSON.stringify(validatedRule));
+  assert.equal(validatedRule.rule.state, "validated");
+
+  const blockedRule = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: {
+      action: "semgrep_rules",
+      arguments: { cwd: workspace, operation: "promote", id: draftRule.rule.id, to: "blocking" }
+    }
+  }));
+  assert.equal(blockedRule.ok, false, JSON.stringify(blockedRule));
+  assert.equal(blockedRule.blocked, true);
+  assert.equal(blockedRule.requirements.min_runs, 5);
+  assert.equal(blockedRule.requirements.runs, 0);
+
+  const semgrepResult = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: { action: "semgrep", arguments: { cwd: workspace, max_results: 20 } }
+  }));
+  assert.equal(semgrepResult.engine, "semgrep");
+  if (semgrepResult.available) {
+    assert.ok(["pass", "fail"].includes(semgrepResult.gate));
+    assert.ok(semgrepResult.summary);
+    assert.ok(Array.isArray(semgrepResult.findings));
+  } else {
+    assert.equal(semgrepResult.gate, "unavailable");
+    assert.match(semgrepResult.reason || "", /semgrep/i);
+  }
+
+  const mutationResult = parseJsonResult(await client.callTool({
+    name: "workspace_verify",
+    arguments: {
+      action: "mutation",
+      arguments: { cwd: workspace, mode: "changed", max_candidates: 20 }
+    }
+  }));
+  assert.equal(mutationResult.engine, "stryker");
+  if (mutationResult.available) {
+    assert.ok(["pass", "warn", "fail"].includes(mutationResult.gate));
+    assert.ok(mutationResult.telemetry);
+    assert.ok(Array.isArray(mutationResult.surviving_mutants));
+  } else {
+    assert.equal(mutationResult.gate, "unavailable");
+    assert.match(mutationResult.reason || "", /stryker/i);
+  }
 
   const changedPlanResult = await client.callTool({
     name: "workspace_verify",
@@ -206,6 +430,38 @@ try {
   assert.equal(performance.version, 1);
   assert.equal(performance.query.root, workspace);
   assert.ok(Array.isArray(performance.bottlenecks));
+  assert.equal(performance.search_efficiency.by_action.text.calls >= 1, true);
+  if (astResult.available) assert.equal(performance.search_efficiency.by_action.ast.calls >= 1, true);
+  assert.equal(performance.semgrep.samples >= 1, true);
+  if (!semgrepResult.available) assert.equal(performance.semgrep.unavailable_samples >= 1, true);
+  assert.equal(performance.mutation.samples >= 1, true);
+  if (!mutationResult.available) assert.equal(performance.mutation.unavailable_samples >= 1, true);
+
+  const improvements = parseJsonResult(await client.callTool({
+    name: "workspace_status",
+    arguments: { action: "improvements", arguments: { path: workspace, window_days: 30, task_class: "all", limit: 5 } }
+  }));
+  assert.equal(improvements.version, 1);
+  assert.equal(improvements.root, workspace);
+  assert.ok(improvements.baseline?.id);
+  assert.ok(Array.isArray(improvements.candidates));
+
+  const dependencyFeed = parseJsonResult(await client.callTool({
+    name: "workspace_status",
+    arguments: {
+      action: "dependencies",
+      arguments: { path: workspace, ingest: true }
+    }
+  }));
+  assert.equal(dependencyFeed.engine, "renovate");
+  assert.equal(dependencyFeed.analysis_only, true);
+  assert.equal(dependencyFeed.auto_apply, false);
+  assert.equal(dependencyFeed.auto_merge, false);
+  assert.equal(dependencyFeed.binary?.executed, false);
+  assert.ok(Array.isArray(dependencyFeed.candidates));
+  if (!dependencyFeed.available) {
+    assert.equal(dependencyFeed.reason, "renovate_feed_report_unavailable");
+  }
 
   const doctor = parseJsonResult(await client.callTool({
     name: "workspace_status",

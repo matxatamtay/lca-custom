@@ -3,7 +3,7 @@
 
 ```mermaid
 graph TD
-  ChatGPT[ChatGPT / MCP client] --> Compact[20 compact facades]
+  ChatGPT[ChatGPT / MCP client] --> Compact[19 compact tools]
   Compact --> Pipeline[ActionExecutionPipeline]
   Pipeline --> Backend[Hidden backend actions]
   Pipeline --> Events[RuntimeEventStore JSONL]
@@ -11,9 +11,7 @@ graph TD
   Pipeline --> Memory[AgentMemory consumer]
   Pipeline --> OTEL[OTLP exporter optional]
   Events --> Trace[Trajectory query + lca_input]
-  Backend --> Agent[AgentRunnerRegistry]
-  Agent --> Codex[Codex provider]
-  Agent --> Worktree[Isolated worktree + conflict merge]
+  Backend --> Git[Direct Git/worktree utilities]
   Backend --> UI[Browser + ADB]
   Backend --> Integrations[Figma / Penpot / Coolify]
   Backend --> Protected[DBeaver / Bruno / Notion protected semantics]
@@ -21,8 +19,8 @@ graph TD
 
 ### Invariants
 
+- LCA executes coding work directly; there is no secondary model-runner layer.
 - LCA is trusted-local: capability is allowed by default; validation protects correctness, not permission ceremony.
 - DBeaver, Bruno, and Notion preserve their integration-specific protection semantics.
 - Project roots are discovery/default-routing inputs, not authorization boundaries.
 - Runtime JSONL is authoritative for trajectory/recovery; OTLP is an optional external projection.
-- Writable delegates default to full-access execution inside isolated worktrees; merge remains conflict-checked.

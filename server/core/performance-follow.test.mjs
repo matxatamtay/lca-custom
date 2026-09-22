@@ -21,7 +21,13 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
   try {
     const follow = createPerformanceFollow({ filePath: file, now: () => now });
     await follow.load();
-    const trace = { task_id: "task-1", task_class: "user", context_temperature: "cold" };
+    const trace = {
+      task_id: "task-1",
+      task_class: "user",
+      context_temperature: "cold",
+      correlation_id: "corr-task-1",
+      trace_id: "trace-task-1"
+    };
     follow.recordToolCall({
       tool: "workspace_context",
       root: "/repo",
@@ -35,7 +41,7 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
           coverage: {
             filesystem: { status: "ok", hits: 4, latencyMs: 40 },
             semantic: { status: "ok", hits: 2, latencyMs: 70 },
-            codegraph: { status: "ok", hits: 1, latencyMs: 310 },
+            codegraph: { status: "ok", hits: 1, latencyMs: 310, details: { index_ms: 250, query_ms: 60 } },
             agentmemory: { status: "ok", hits: 0, latencyMs: 90 }
           },
           ranking: {
@@ -53,6 +59,32 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
           evidence: [{ metadata: { cache_hit: false } }, { metadata: { cache_hit: true } }]
         }
       }
+    });
+    follow.recordRuntimeSpans({
+      root: "/repo",
+      trace,
+      spans: [
+        {
+          name: "workspace_context.codegraph.ensure_index",
+          surface: "runtime",
+          correlationId: "corr-task-1",
+          spanId: "span-index",
+          parentSpanId: "span-context",
+          startedAt: "1970-01-01T00:00:01.000Z",
+          durationMs: 250,
+          success: true
+        },
+        {
+          name: "workspace_context.jev",
+          surface: "runtime",
+          correlationId: "corr-task-1",
+          spanId: "span-jev",
+          parentSpanId: "span-context",
+          startedAt: "1970-01-01T00:00:01.010Z",
+          durationMs: 120,
+          success: true
+        }
+      ]
     });
     now += 100;
     follow.recordToolCall({
@@ -89,6 +121,8 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
     assert.equal(report.tasks, 1);
     assert.equal(report.context_ms.p50_ms, 400);
     assert.equal(report.providers.find((item) => item.name === "codegraph")?.p95_ms, 310);
+    assert.equal(report.codegraph.index_ms.p95_ms, 250);
+    assert.equal(report.codegraph.query_ms.p95_ms, 60);
     assert.equal(report.commands.find((item) => item.name === "npm:typecheck")?.p50_ms, 1_000);
     assert.equal(report.commands.find((item) => item.name === "flutter:test")?.p95_ms, 3_000);
     assert.equal(report.bottlenecks[0].name, "workspace_exec:many");
@@ -103,7 +137,28 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
     assert.equal(report.jev.avg_pruned, 3);
     assert.equal(report.jev.acceptance_rate, 0.833);
     assert.equal(report.search_efficiency.calls, 0);
+    assert.equal(report.workflow_efficiency.roundtrips_per_task, 2);
+    assert.equal(report.workflow_efficiency.bytes_to_model_per_task, 4_500);
+    assert.equal(report.test_duration_ms.p95_ms, 3_000);
+    assert.equal(report.codegraph.index_ms.calls, 1);
     assert.equal(report.provider_cache.codegraph.checks, 0);
+    assert.equal(report.trace_attribution.workspace_context.spans, 2);
+    assert.equal(report.trace_attribution.workspace_context.top_contributors[0].component, "codegraph.ensure_index");
+    assert.equal(report.trace_attribution.workspace_context.top_contributors[0].p95_ms, 250);
+
+    const taskReport = follow.report({
+      root: "/repo",
+      taskClass: "user",
+      taskId: "task-1",
+      includeTimeline: true
+    });
+    assert.equal(taskReport.task.correlation_id, "corr-task-1");
+    assert.equal(taskReport.task.trace_id, "trace-task-1");
+    const spanRow = taskReport.timeline.find((item) => item.kind === "span" && item.name === "workspace_context.jev");
+    assert.equal(spanRow?.span_id, "span-jev");
+    assert.equal(spanRow?.parent_span_id, "span-context");
+    assert.equal(spanRow?.correlation_id, "corr-task-1");
+    assert.equal(spanRow?.trace_id, "trace-task-1");
 
     const persisted = await readFile(file, "utf8");
     assert.doesNotMatch(persisted, /RAW_SECRET_SHOULD_NOT_PERSIST/);
@@ -121,6 +176,95 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("records structural-vs-text search timings by action for benchmark comparison", () => {
+  let now = 5_000;
+  const follow = createPerformanceFollow({ now: () => now++ });
+  const trace = { task_id: "search-task", task_class: "user" };
+  follow.recordToolCall({
+    tool: "workspace_search",
+    action: "text",
+    root: "/repo",
+    trace,
+    durationMs: 12,
+    success: true,
+    result: {}
+  });
+  follow.recordToolCall({
+    tool: "workspace_search",
+    action: "ast",
+    root: "/repo",
+    trace,
+    durationMs: 31,
+    success: true,
+    result: {}
+  });
+  const report = follow.report({ root: "/repo", taskClass: "user" });
+  assert.equal(report.search_efficiency.calls, 2);
+  assert.equal(report.search_efficiency.by_action.text.p50_ms, 12);
+  assert.equal(report.search_efficiency.by_action.ast.p50_ms, 31);
+});
+
+test("Semgrep INFO findings are retained as aggregate telemetry without source content", () => {
+  const follow = createPerformanceFollow({ now: () => 9_000 });
+  follow.recordToolCall({
+    tool: "workspace_verify",
+    action: "semgrep_scan",
+    root: "/repo",
+    trace: { task_id: "semgrep-task", task_class: "user" },
+    durationMs: 125,
+    success: true,
+    result: {
+      structuredContent: {
+        available: true,
+        ok: true,
+        summary: { findings: 4, error: 0, warning: 1, info: 3 },
+        findings: [{ message: "RAW_FINDING_TEXT_SHOULD_NOT_PERSIST" }]
+      }
+    }
+  });
+  const report = follow.report({ root: "/repo", taskClass: "user" });
+  assert.equal(report.semgrep.samples, 1);
+  assert.equal(report.semgrep.findings.warning, 1);
+  assert.equal(report.semgrep.findings.info, 3);
+  assert.equal(report.semgrep.gate_failures, 0);
+  assert.doesNotMatch(JSON.stringify(follow.report({ root: "/repo", taskClass: "user" })), /RAW_FINDING_TEXT_SHOULD_NOT_PERSIST/);
+});
+
+test("mutation telemetry persists aggregate score and counts without survivor payloads", () => {
+  const follow = createPerformanceFollow({ now: () => 10_000 });
+  follow.recordToolCall({
+    tool: "workspace_verify",
+    action: "mutation",
+    root: "/repo",
+    trace: { task_id: "mutation-task", task_class: "user" },
+    durationMs: 500,
+    success: true,
+    result: {
+      structuredContent: {
+        available: true,
+        ok: true,
+        mode: "changed",
+        telemetry: {
+          mutants_total: 10,
+          killed: 7,
+          survived: 2,
+          timeout: 1,
+          no_coverage: 0,
+          mutation_score: 80
+        },
+        surviving_mutants: [{ replacement: "RAW_MUTANT_PAYLOAD_SHOULD_NOT_PERSIST" }]
+      }
+    }
+  });
+  const report = follow.report({ root: "/repo", taskClass: "user" });
+  assert.equal(report.mutation.samples, 1);
+  assert.equal(report.mutation.mutants_total, 10);
+  assert.equal(report.mutation.survived, 2);
+  assert.equal(report.mutation.avg_score, 80);
+  assert.equal(report.mutation.modes.changed, 1);
+  assert.doesNotMatch(JSON.stringify(report), /RAW_MUTANT_PAYLOAD_SHOULD_NOT_PERSIST/);
 });
 
 test("reclassifies persisted samples from corrected telemetry task classes", () => {

@@ -4,14 +4,14 @@
 const DIRECT = new Set(["workspace_context", "lca_input"]);
 
 const GROUPS = [
-  ["workspace_search", new Set(["workspace_search", "search_text", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan", "code_definition", "code_references", "code_diagnostics", "code_rename_symbol", "code_organize_imports"])],
+  ["workspace_search", new Set(["workspace_search", "search_text", "ast_search", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan", "code_definition", "code_references", "code_diagnostics", "code_rename_symbol", "code_organize_imports"])],
   ["workspace_read", new Set(["read_file", "read_many", "stat_path", "list_files", "list_notes", "resume"])],
-  ["workspace_edit", new Set(["apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file", "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state"])],
+  ["workspace_edit", new Set(["apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file", "ast_rewrite", "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state"])],
   ["workspace_exec", new Set(["run_command", "run_commands", "parallel_tasks"])],
   ["workspace_process", (name) => name.startsWith("proc_")],
   ["workspace_git", new Set(["git", "git_status", "git_diff", "worktree_create", "worktree_status", "worktree_diff", "worktree_check", "worktree_gc", "worktree_cleanup"])],
-  ["workspace_verify", new Set(["detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])],
-  ["workspace_status", new Set(["ping", "workspace_info", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])],
+  ["workspace_verify", new Set(["detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "semgrep_scan", "semgrep_rules", "mutation_test", "change_summary", "session_report"])],
+  ["workspace_status", new Set(["ping", "workspace_info", "performance_follow", "improvement_candidates", "dependency_feed", "tool_trace", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])],
   ["workspace_skill", new Set(["list_skills", "read_skill", "create_skill", "delete_skill", "slash_commands", "compose_prompt"])],
   ["figma", (name) => name.startsWith("figma_")],
   ["dbeaver", (name) => name.startsWith("dbeaver_")],

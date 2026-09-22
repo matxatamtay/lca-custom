@@ -39,6 +39,8 @@ import { createIntegrationCommands } from "./lib/integration-commands.mjs";
 import { openUrl } from "./lib/open-url.mjs";
 import { createSkillsTuiCommands } from "./lib/skills-tui-commands.mjs";
 import { createLauncherProcessRuntime } from "./lib/launcher-process-runtime.mjs";
+import { createImproveCommand } from "./lib/improve-command.mjs";
+import { PersistentHttpMcpClient } from "../server/persistent-http-mcp-client.mjs";
 export {
   normalizeTunnelArch,
   tunnelAssetName,
@@ -156,6 +158,7 @@ Usage:
   lca-custom stop
   lca-custom status
   lca-custom doctor [--json]
+  lca-custom improve [--latest|--performance|--tests|--dependencies|--security] [--maintenance] [--apply-safe] [--apply <candidate-id>] [--json]
   lca-custom tui
   lca-custom install [--force] [--json]
   lca-custom memory status [--json]
@@ -179,6 +182,15 @@ Options:
   --node <path>               Node executable
   --background                Keep server/tunnel running after this command exits
   --dry-run                   Validate without changing AgentMemory
+  --latest                    Show latest self-improvement candidates first
+  --performance               Filter improvement report to performance/agent-strategy candidates
+  --tests                     Filter improvement report to test-quality candidates
+  --dependencies              Filter improvement report to dependency candidates
+  --security                  Filter improvement report to security candidates
+  --limit <count>             Maximum improvement candidates to display (default 10)
+  --apply <candidate-id>      Explicitly apply one deterministic improvement candidate; never commits or pushes
+  --maintenance               Run the full self-improvement sensor sweep and rank maintenance candidates
+  --apply-safe                With maintenance, apply at most one explicitly low-risk deterministic candidate
   --strategy <mode>           Import strategy: skip, merge, or replace
 
 Tunnel options:
@@ -295,6 +307,38 @@ export function parseArgs(argv) {
         break;
       case "--json":
         flags.json = true;
+        break;
+      case "--latest":
+        flags.latest = true;
+        break;
+      case "--performance":
+        flags.performance = true;
+        break;
+      case "--tests":
+        flags.tests = true;
+        break;
+      case "--dependencies":
+        flags.dependencies = true;
+        break;
+      case "--security":
+        flags.security = true;
+        break;
+      case "--limit":
+        flags.limit = Number(next());
+        if (!Number.isInteger(flags.limit) || flags.limit < 1 || flags.limit > 100) {
+          throw new Error("--limit must be an integer between 1 and 100");
+        }
+        break;
+      case "--apply":
+        flags.apply = String(next()).trim();
+        if (!flags.apply) throw new Error("--apply requires a candidate id");
+        break;
+      case "--maintenance":
+        flags.maintenance = true;
+        break;
+      case "--apply-safe":
+        flags.applySafe = true;
+        flags.maintenance = true;
         break;
       default:
         if (arg.startsWith("--")) throw new Error(`Unknown argument: ${arg}`);
@@ -946,6 +990,25 @@ async function cliCommand() {
   await installCliCommand();
 }
 
+const { improveCommand } = createImproveCommand({
+  repoRoot: REPO_ROOT,
+  detectWorkspaceRoot,
+  output,
+  createExecutionClient(flags = {}) {
+    const opts = effectiveOptions(flags);
+    const headers = opts.authToken
+      ? { authorization: `Bearer ${opts.authToken}` }
+      : undefined;
+    return new PersistentHttpMcpClient({
+      endpoint: `http://127.0.0.1:${opts.port}/mcp`,
+      clientName: "lca-custom-improve",
+      clientVersion: LCA_VERSION,
+      timeoutMs: 60_000,
+      ...(headers ? { requestInit: { headers } } : {})
+    });
+  }
+});
+
 const { skillsCommand, tuiCommand } = createSkillsTuiCommands({
   CLI_SCRIPT_PATH: fileURLToPath(import.meta.url),
   CONFIG_PATH,
@@ -987,6 +1050,7 @@ async function main() {
   if (command === "stop") return stop(flags);
   if (command === "status") return status(flags);
   if (command === "doctor") return doctor(flags);
+  if (command === "improve") return improveCommand(rest, flags);
   if (command === "tui") return tuiCommand(flags);
   if (command === "profile") {
     const opts = effectiveOptions(flags);

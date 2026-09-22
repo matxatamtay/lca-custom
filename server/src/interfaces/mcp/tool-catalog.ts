@@ -15,7 +15,6 @@ export const TARGET_TOOL_CATALOG = Object.freeze([
   { name: "workspace_process", description: "Start, inspect, and stop managed background processes." },
   { name: "workspace_git", description: "Run Git operations and return compact repository state." },
   { name: "workspace_verify", description: "Detect and run focused lint, typecheck, test, and build gates." },
-  { name: "workspace_agent", description: "Run delegated model agents, dependency DAGs, isolated worktrees, and explicit conflict-checked merges." },
   { name: "workspace_ui", description: "Inspect and control trusted-local browser tabs and connected Android devices without LCA approval round-trips." },
   { name: "workspace_status", description: "Return runtime, dependency, project, graph-index, and memory health." },
   { name: "workspace_skill", description: "Discover, read, create, and delete reusable project skills." },

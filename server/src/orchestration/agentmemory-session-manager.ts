@@ -40,6 +40,23 @@ export interface AgentMemoryDecisionInput {
   files?: readonly string[];
 }
 
+export interface AgentMemoryImprovementInput {
+  root: string;
+  candidateId: string;
+  category: string;
+  component: string;
+  problem: string;
+  evidence: string;
+  solution: string;
+  before: string;
+  after: string;
+  regression: boolean;
+  verdict: "improved" | "not_improved";
+  files?: readonly string[];
+  verification?: string;
+  regressionRules?: readonly string[];
+}
+
 export interface AgentMemorySessionManagerOptions {
   supervisor: AgentMemorySupervisor;
   client: AgentMemorySessionClient;
@@ -126,6 +143,14 @@ export class AgentMemorySessionManager {
   recordDecision(input: AgentMemoryDecisionInput): Promise<void> {
     if (this.closing || this.closed) return Promise.resolve();
     const operation = this.queue.then(() => this.persistDecision(input));
+    this.queue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  recordImprovement(input: AgentMemoryImprovementInput): Promise<void> {
+    if (this.closing || this.closed) return Promise.resolve();
+    if (input.verdict !== "improved" || input.regression) return Promise.resolve();
+    const operation = this.queue.then(() => this.persistImprovement(input));
     this.queue = operation.catch(() => undefined);
     return operation;
   }
@@ -244,6 +269,50 @@ export class AgentMemorySessionManager {
       type: "fact",
       concepts: ["architectural-decision", "lca-decision", toConcept(decision)],
       files: [...new Set(input.files ?? [])]
+    });
+  }
+
+  private async persistImprovement(input: AgentMemoryImprovementInput): Promise<void> {
+    const candidateId = input.candidateId.trim();
+    const component = input.component.trim();
+    if (!candidateId || !component) {
+      throw new Error("Accepted improvement memory requires candidateId and component.");
+    }
+    const state = await this.ensureSession(input.root, `Improvement: ${component}`);
+    this.addTask(state, `Improvement: ${component}`);
+    for (const file of input.files ?? []) {
+      if (state.files.size >= this.maxFiles) break;
+      if (file.trim()) state.files.add(file.trim());
+    }
+    const files = [...new Set((input.files ?? []).filter((file) => file.trim()))].slice(0, this.maxFiles);
+    const regressionRules = [...new Set((input.regressionRules ?? []).filter((rule) => rule.trim()))].slice(0, 50);
+    await this.options.client.remember({
+      content: truncate([
+        "Accepted self-improvement learned by LCA.",
+        `Candidate: ${candidateId}`,
+        `Category: ${input.category.trim() || "unknown"}`,
+        `Component: ${component}`,
+        `Problem: ${input.problem.trim()}`,
+        `Evidence: ${input.evidence.trim()}`,
+        `Solution: ${input.solution.trim()}`,
+        `Before: ${input.before.trim()}`,
+        `After: ${input.after.trim()}`,
+        `Regression: ${input.regression ? "true" : "false"}`,
+        `Verdict: ${input.verdict}`,
+        ...(input.verification?.trim() ? [`Verification: ${input.verification.trim()}`] : []),
+        ...(regressionRules.length ? [`Regression rules: ${regressionRules.join(", ")}`] : []),
+        ...(files.length ? [`Affected paths: ${files.join(", ")}`] : []),
+        `Recorded: ${this.now().toISOString()}`
+      ].join("\n"), this.maxSummaryChars),
+      project: state.project,
+      type: "fact",
+      concepts: [
+        "lca-self-improvement",
+        "accepted-improvement",
+        toConcept(input.category),
+        toConcept(component)
+      ].filter(Boolean),
+      files
     });
   }
 

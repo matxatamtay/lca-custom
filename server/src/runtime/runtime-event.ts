@@ -4,9 +4,7 @@ import { randomUUID } from "node:crypto";
 export const KNOWN_RUNTIME_EVENT_TYPES = Object.freeze([
   "tool/started",
   "tool/completed",
-  "tool/failed",
-  "agent/job-snapshot",
-  "agent/dag-snapshot"
+  "tool/failed"
 ] as const);
 
 export interface RuntimeEvent<T extends Record<string, unknown> = Record<string, unknown>> {
@@ -43,5 +41,17 @@ export class RuntimeCorrelationScope {
 
   ensure(): string {
     return this.current() ?? randomUUID();
+  }
+}
+
+export class RuntimeSpanScope {
+  private readonly storage = new AsyncLocalStorage<string>();
+
+  current(): string | undefined {
+    return this.storage.getStore();
+  }
+
+  run<T>(spanId: string, callback: () => T): T {
+    return this.storage.run(spanId, callback);
   }
 }

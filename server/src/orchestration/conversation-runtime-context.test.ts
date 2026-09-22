@@ -13,16 +13,13 @@ test("runtime context carries project, execution defaults, and correlation indep
     primaryRoot: secondary,
     conversationId: "chat-a",
     sessionId: "session-a",
-    runner: "codex",
-    isolation: "worktree",
-    networkAccess: true,
     correlationId: "corr-a"
   }, async () => {
     await Promise.resolve();
     assert.equal(runtime.primaryRoot(), secondary);
     assert.equal(runtime.current().conversationId, "chat-a");
+    assert.equal(runtime.current().sessionId, "session-a");
     assert.equal(runtime.current().correlationId, "corr-a");
-    assert.equal(runtime.current().networkAccess, true);
   });
   assert.equal(runtime.primaryRoot(), primary);
 });

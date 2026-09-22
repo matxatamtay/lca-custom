@@ -31,7 +31,6 @@ const lca = Object.freeze({
   git: (action, args) => call('workspace_git', action, args),
   verify: (action, args) => call('workspace_verify', action, args),
   status: (action, args) => call('workspace_status', action, args),
-  agent: (action, args) => call('workspace_agent', action, args),
   ui: (action, args) => call('workspace_ui', action, args)
 });
 const safeConsole = Object.freeze({

@@ -1,6 +1,6 @@
 # Local Coding Agent MCP server
 
-Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees fifteen compact tools while an internal in-memory backend retains the richer implementation details.
+Local Coding Agent is a trusted local MCP execution engine. ChatGPT sees nineteen compact tools while an internal in-memory backend retains the richer implementation details.
 
 ## Public MCP tools
 
@@ -13,14 +13,15 @@ workspace_exec
 workspace_process
 workspace_git
 workspace_verify
-workspace_agent
 workspace_ui
 workspace_status
 workspace_skill
 figma
 dbeaver
 bruno
+penpot
 coolify
+notion
 lca_input
 notion_page
 ```
@@ -38,7 +39,7 @@ Actions execute directly without mode, policy, or approval turns. Project roots 
 lca-custom tui
 ```
 
-The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public fifteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
+The mouse-enabled TUI is implemented in `tui.mjs` and `tui/`. It is a persistent Streamable HTTP MCP client of the public nineteen-tool surface, not a direct import of backend handlers. See [`../docs/TUI.md`](../docs/TUI.md).
 
 ## Run
 
@@ -77,17 +78,33 @@ Foreground execution has a conservative toolchain accelerator. Only allowlisted 
 
 A second long-lived performance-follow log is stored at `server/data/workspaces/<id>/performance-follow.json`. It retains a bounded history of timing samples for tools, context providers, and sanitized command families, with p50/p95, total wall-clock bottlenecks, cache efficiency, task classes, and cold/warm context rollups. It intentionally does not persist raw task text, command strings, arguments, patches, stdout/stderr, or secrets. Query it through `workspace_status action=performance` with optional `path`, `window_days`, `task_class`, and `compact` arguments; `workspace_info` also includes a compact 30-day user-work summary.
 
+The self-improvement core reuses those rollups rather than creating another profiler. `workspace_status action=improvements` captures a reproducible per-workspace baseline, detects deterministic evidence-backed candidates, deduplicates them into `improvement-candidates.jsonl` + `improvement-state.json`, and returns a ranked analysis-only report. It never patches, commits, pushes, or invokes a secondary model runtime.
+
+Structural search is available through the existing `workspace_search` facade with `action=ast`. It uses the local `ast-grep` CLI read-only, respects normal ignore files and LCA path resolution, stops once the requested match limit is reached, and normalizes matches to path/range/node/capture data. Set `AST_GREP_BIN` to override binary discovery; when the CLI is missing the action returns `available=false` instead of silently changing semantics.
+
+Safe structural codemods are available through `workspace_edit action=ast_rewrite`. The action defaults to dry-run, requires explicit `paths` plus `max_matches`, uses ast-grep only to calculate replacements, then applies those replacements through LCA's path locks, preimage hashes, transaction journal, backup/undo history, post-edit semantic diagnostics, and mandatory changed-file verification. ast-grep itself never receives `--update-all` against source files.
+
+Persistent regression/invariant checks live under `server/rules/semgrep/{security,correctness,architecture,regressions}` and run on demand through `workspace_verify action=semgrep`. LCA invokes only local rule files with Semgrep metrics/version checks disabled. ERROR findings fail the verification gate, WARNING findings are deduplicated into the self-improvement candidate store, and INFO findings are retained only as aggregate `performance_follow.semgrep` telemetry. If the local Semgrep CLI is missing, the action returns `available=false` without failing the MCP runtime.
+
+Learned regression rules are persisted per workspace and managed through `workspace_verify action=regression_rules` (hidden backend action `semgrep_rules`). Every learned rule starts as `draft`, then advances only `draft → shadow → validated → blocking`. Draft rules are excluded from scans; shadow findings are telemetry-only; validated findings become WARNING candidates; blocking rules enforce their declared severity. Blocking promotion is refused until the rule has a passing before/after fixture, at least five complete full-workspace scan observations, zero reported false positives, and a clean current scan. Targeted scans do not increment lifecycle runs.
+
+Incremental mutation testing is available on demand through `workspace_verify action=mutation`. LCA never auto-installs Stryker: it uses `STRYKER_BIN`, a target project's local `node_modules/.bin/stryker`, or an existing global binary. `changed` is the default mode, with explicit `module` and `full` modes; module mode also accepts an exact `range={start_line,end_line}` for focused reruns. The incremental Stryker report is stored under per-workspace LCA data and parsed without persisting source contents. Surviving mutants become `TEST_QUALITY` candidates enriched with related tests, source change frequency, dependency-reference blast radius, survivor count, a multiplicative priority signal, the pre-improvement mutation score, and an exact-range rerun recipe. Mutation-score blocking is disabled by default and only applies when the caller explicitly supplies both `critical_paths` and a `threshold` for changed logic.
+
+Self-hosted dependency intelligence is exposed through `workspace_status action=dependencies`. LCA consumes a local Renovate JSON/JSONL report from `RENOVATE_FEED_PATH` or standard local feed names and converts updates into `DEPENDENCY` candidates with package/from/to/changelog/risk/affected-files metadata plus an isolated evaluation workflow. The adapter may detect `RENOVATE_BIN`, a project-local Renovate binary, or an existing global binary, but it deliberately does not execute Renovate. It never installs or updates packages, mutates manifests/lockfiles, commits, pushes, or auto-merges. Applying a dependency update remains a separate explicit future evaluation step in an isolated worktree.
+
 None of these context engines is exposed as a separate ChatGPT tool surface. The application layer keeps CodeGraph and AgentMemory mandatory while semantic capability is reported explicitly when unavailable.
 
 ## MCP integrations
 
 Figma, DBeaver, Bruno, and Penpot use persistent MCP clients. Coolify runs the pinned `@masonator/coolify-mcp` package as a persistent local stdio child process. Notion uses the official REST API through `NOTION_API_KEY` and exposes both the compact `notion` facade and the direct `notion_page` Apps SDK widget. Penpot and Coolify execute directly in trusted-local mode; DBeaver, Bruno, and Notion preserve their integration-specific protection semantics. Notion full-page Markdown replacement keeps optimistic conflict detection and child-content deletion disabled unless explicitly requested.
 
-## Runtime trajectory and delegated agents
+## Runtime trajectory and direct execution
 
-Every backend action runs through `ActionExecutionPipeline`. The append-only runtime source of truth is `data/workspaces/<id>/runtime/events.jsonl`; ToolMetrics, AgentMemory observations, the `workspace_status action=trace` trajectory, and optional OTLP export are consumers of that event stream. Delegated Codex work defaults to `danger-full-access` with network access enabled inside isolated Git worktrees, while merge remains conflict-checked. Agent/DAG descriptors are persisted so a restart reconstructs completed, recoverable, or orphaned work instead of losing lifecycle state.
+Every backend action runs through `ActionExecutionPipeline`. The append-only runtime source of truth is `data/workspaces/<id>/runtime/events.jsonl`; ToolMetrics, AgentMemory observations, the `workspace_status action=trace` trajectory, and optional OTLP export are consumers of that event stream. Runtime events carry nested span IDs so context-provider work (`filesystem`, `semantic`, CodeGraph index/query, AgentMemory, Jev, compose/merge) and edit stages (`match`, `write`, semantic refresh, changed verification) appear as a parent/child waterfall. `OTEL_EXPORTER_OTLP_ENDPOINT` remains opt-in; when unset, no OTLP network request is made.
 
-`workspace_exec action=code` runs a TypeScript orchestration program in a fresh bounded worker. Its curated LCA bindings re-enter the ordinary hidden backend pipeline, so nested reads, edits, commands, verification, agents, and UI actions keep normal tracing and correctness checks.
+`performance_follow` remains the authoritative historical profiler. A task opened by `workspace_context` owns one `task_id`, `correlation_id`, and OTel-compatible `trace_id`; subsequent model-facing actions routed to the same workspace reuse that identity until a newer `workspace_context` supersedes the task. Metadata-only runtime spans are correlated back into `performance_follow`, which reports component-level context/edit attribution and carries the top context contributors into `workspace_context` performance-improvement candidates. LCA executes coding work directly through its local tools; it does not delegate tasks to a secondary model runner.
+
+`workspace_exec action=code` runs a TypeScript orchestration program in a fresh bounded worker. Its curated LCA bindings re-enter the ordinary hidden backend pipeline, so nested reads, edits, commands, verification, and UI actions keep normal tracing and correctness checks.
 
 ### DBeaver SQL flow
 

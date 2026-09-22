@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
-import { RuntimeCorrelationScope } from "./runtime-event.js";
+import { RuntimeCorrelationScope, RuntimeSpanScope } from "./runtime-event.js";
 import type { RuntimeEventStore } from "./runtime-event-store.js";
 
 export interface ActionExecutionRequest {
@@ -18,6 +19,8 @@ export interface ActionExecutionObservation<T = unknown> {
   name: string;
   surface: ActionExecutionRequest["surface"];
   correlationId: string;
+  spanId: string;
+  parentSpanId?: string;
   startedAt: string;
   durationMs: number;
   success: boolean;
@@ -35,7 +38,8 @@ export class ActionExecutionPipeline {
 
   constructor(
     private readonly events: RuntimeEventStore,
-    private readonly correlations = new RuntimeCorrelationScope()
+    private readonly correlations = new RuntimeCorrelationScope(),
+    private readonly spans = new RuntimeSpanScope()
   ) {}
 
   subscribe(observer: ActionExecutionObserver): () => void {
@@ -45,42 +49,69 @@ export class ActionExecutionPipeline {
 
   execute<T>(request: ActionExecutionRequest, action: () => Promise<T> | T): Promise<T> {
     const inherited = request.correlationId?.trim() || this.correlations.current();
-    return this.correlations.run(inherited, async () => {
+    return this.correlations.run(inherited, () => {
       const correlationId = this.correlations.ensure();
-      const startedAt = new Date().toISOString();
-      const startedMs = performance.now();
-      const inChars = jsonChars(request.args ?? {});
-      const startedWrite = this.events.append({
-        type: "tool/started",
-        correlationId,
-        ...(request.sessionId ? { sessionId: request.sessionId } : {}),
-        ...(request.conversationId ? { conversationId: request.conversationId } : {}),
-        ...(request.parentId ? { parentId: request.parentId } : {}),
-        data: { name: request.name, surface: request.surface, inChars }
-      }).catch(() => undefined);
-      try {
-        const result = await action();
-        const success = !request.resultIsError?.(result);
-        const observation = observe(request, correlationId, startedAt, startedMs, inChars, success, result);
-        await this.events.append({
-          type: success ? "tool/completed" : "tool/failed",
+      const parentSpanId = request.parentId?.trim() || this.spans.current();
+      const spanId = randomUUID();
+      return this.spans.run(spanId, async () => {
+        const startedAt = new Date().toISOString();
+        const startedMs = performance.now();
+        const inChars = jsonChars(request.args ?? {});
+        const startedWrite = this.events.append({
+          type: "tool/started",
           correlationId,
-          data: durableObservation(observation)
-        });
-        await startedWrite;
-        this.notify(observation);
-        return result;
-      } catch (error) {
-        const observation = observe(request, correlationId, startedAt, startedMs, inChars, false, undefined, error);
-        await this.events.append({
-          type: "tool/failed",
-          correlationId,
-          data: durableObservation(observation)
+          ...(request.sessionId ? { sessionId: request.sessionId } : {}),
+          ...(request.conversationId ? { conversationId: request.conversationId } : {}),
+          ...(parentSpanId ? { parentId: parentSpanId } : {}),
+          data: { name: request.name, surface: request.surface, inChars, spanId }
         }).catch(() => undefined);
-        await startedWrite;
-        this.notify(observation);
-        throw error;
-      }
+        try {
+          const result = await action();
+          const success = !request.resultIsError?.(result);
+          const observation = observe(
+            request,
+            correlationId,
+            spanId,
+            parentSpanId,
+            startedAt,
+            startedMs,
+            inChars,
+            success,
+            result
+          );
+          await this.events.append({
+            type: success ? "tool/completed" : "tool/failed",
+            correlationId,
+            ...(parentSpanId ? { parentId: parentSpanId } : {}),
+            data: durableObservation(observation)
+          });
+          await startedWrite;
+          this.notify(observation);
+          return result;
+        } catch (error) {
+          const observation = observe(
+            request,
+            correlationId,
+            spanId,
+            parentSpanId,
+            startedAt,
+            startedMs,
+            inChars,
+            false,
+            undefined,
+            error
+          );
+          await this.events.append({
+            type: "tool/failed",
+            correlationId,
+            ...(parentSpanId ? { parentId: parentSpanId } : {}),
+            data: durableObservation(observation)
+          }).catch(() => undefined);
+          await startedWrite;
+          this.notify(observation);
+          throw error;
+        }
+      });
     });
   }
 
@@ -98,6 +129,8 @@ export class ActionExecutionPipeline {
 function observe<T>(
   request: ActionExecutionRequest,
   correlationId: string,
+  spanId: string,
+  parentSpanId: string | undefined,
   startedAt: string,
   startedMs: number,
   inChars: number,
@@ -112,6 +145,8 @@ function observe<T>(
     name: request.name,
     surface: request.surface,
     correlationId,
+    spanId,
+    ...(parentSpanId ? { parentSpanId } : {}),
     startedAt,
     durationMs: Math.max(0, Math.round((performance.now() - startedMs) * 10) / 10),
     success,
@@ -126,6 +161,8 @@ function durableObservation(observation: ActionExecutionObservation): Record<str
   return {
     name: observation.name,
     surface: observation.surface,
+    spanId: observation.spanId,
+    ...(observation.parentSpanId ? { parentSpanId: observation.parentSpanId } : {}),
     success: observation.success,
     durationMs: observation.durationMs,
     inChars: observation.inChars,

@@ -33,15 +33,12 @@ try {
 
   const context = new ConversationRuntimeContext({
     primaryRoot: root,
-    roots: [root],
-    runner: "codex",
-    isolation: "worktree",
-    networkAccess: true
+    roots: [root]
   });
   const CONTEXT_RUNS = 10_000;
   const contextStart = performance.now();
   for (let index = 0; index < CONTEXT_RUNS; index += 1) {
-    context.run({ correlationId: `corr-${index}` }, () => context.current().runner);
+    context.run({ correlationId: `corr-${index}` }, () => context.current().correlationId);
   }
   const contextTotalMs = performance.now() - contextStart;
 

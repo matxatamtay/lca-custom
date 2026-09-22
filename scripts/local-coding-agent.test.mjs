@@ -23,6 +23,36 @@ import {
   tunnelAssetUrl
 } from "./local-coding-agent.mjs";
 
+test("parses improve analysis filters and bounded output limit", () => {
+  const parsed = parseArgs([
+    "improve",
+    "--performance",
+    "--tests",
+    "--dependencies",
+    "--security",
+    "--latest",
+    "--json",
+    "--limit",
+    "7"
+  ]);
+  assert.equal(parsed.command, "improve");
+  assert.equal(parsed.flags.performance, true);
+  assert.equal(parsed.flags.tests, true);
+  assert.equal(parsed.flags.dependencies, true);
+  assert.equal(parsed.flags.security, true);
+  assert.equal(parsed.flags.latest, true);
+  assert.equal(parsed.flags.json, true);
+  assert.equal(parsed.flags.limit, 7);
+  const apply = parseArgs(["improve", "--apply", "si-performance-demo"]);
+  assert.equal(apply.flags.apply, "si-performance-demo");
+  const maintenance = parseArgs(["improve", "--maintenance", "--apply-safe"]);
+  assert.equal(maintenance.flags.maintenance, true);
+  assert.equal(maintenance.flags.applySafe, true);
+  assert.throws(() => parseArgs(["improve", "--apply"]), /Missing value for --apply/);
+  assert.throws(() => parseArgs(["improve", "--limit", "0"]), /between 1 and 100/);
+  assert.throws(() => parseArgs(["improve", "--limit", "101"]), /between 1 and 100/);
+});
+
 test("normalizes trusted compact runtime defaults", () => {
   const value = normalize({ mode: "safe", policy: "strict", surface: "legacy" });
   assert.equal(value.port, "8790");

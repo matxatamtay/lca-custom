@@ -2,7 +2,6 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { CODEX_RUNNER_CAPABILITIES } from "../agent-runner.mjs";
 import { COMPACT_GROUP_DEFINITIONS, COMPACT_TOOL_DESCRIPTIONS } from "../dist/interfaces/mcp/compact-mcp-interface.js";
 import { TARGET_TOOL_CATALOG } from "../dist/interfaces/mcp/tool-catalog.js";
 import { KNOWN_RUNTIME_EVENT_TYPES } from "../dist/runtime/runtime-event.js";
@@ -62,7 +61,7 @@ function renderActionCatalog() {
 
 function renderEventCatalog() {
   const rows = KNOWN_RUNTIME_EVENT_TYPES.map((type) => {
-    const owner = type.startsWith("agent/") ? "AgentRunner runtime" : "ActionExecutionPipeline";
+    const owner = "ActionExecutionPipeline";
     const persistence = "append-only JSONL";
     return `| \`${type}\` | ${owner} | ${persistence} |`;
   }).join("\n");
@@ -70,14 +69,12 @@ function renderEventCatalog() {
 }
 
 function renderProviderCatalog() {
-  const capabilities = Object.entries(CODEX_RUNNER_CAPABILITIES)
-    .map(([key, value]) => `| \`${key}\` | ${Array.isArray(value) ? value.map((item) => `\`${item}\``).join(", ") : String(value)} |`)
-    .join("\n");
-  return generatedHeader("Agent provider catalog") + `\n## \`codex\`\n\nDefault delegated coding runner. Provider credentials and routing remain server-side and are deliberately excluded from this generated document.\n\n| Capability | Value |\n| --- | --- |\n${capabilities}\n`;
+  return generatedHeader("Execution model catalog") + `
+\nLCA executes coding work directly through its local tool runtime. There is no secondary model-runner layer.\n`;
 }
 
 function renderRuntimeGraph() {
-  return generatedHeader("Runtime graph") + `\n\`\`\`mermaid\ngraph TD\n  ChatGPT[ChatGPT / MCP client] --> Compact[20 compact facades]\n  Compact --> Pipeline[ActionExecutionPipeline]\n  Pipeline --> Backend[Hidden backend actions]\n  Pipeline --> Events[RuntimeEventStore JSONL]\n  Pipeline --> Metrics[ToolMetrics]\n  Pipeline --> Memory[AgentMemory consumer]\n  Pipeline --> OTEL[OTLP exporter optional]\n  Events --> Trace[Trajectory query + lca_input]\n  Backend --> Agent[AgentRunnerRegistry]\n  Agent --> Codex[Codex provider]\n  Agent --> Worktree[Isolated worktree + conflict merge]\n  Backend --> UI[Browser + ADB]\n  Backend --> Integrations[Figma / Penpot / Coolify]\n  Backend --> Protected[DBeaver / Bruno / Notion protected semantics]\n\`\`\`\n\n### Invariants\n\n- LCA is trusted-local: capability is allowed by default; validation protects correctness, not permission ceremony.\n- DBeaver, Bruno, and Notion preserve their integration-specific protection semantics.\n- Project roots are discovery/default-routing inputs, not authorization boundaries.\n- Runtime JSONL is authoritative for trajectory/recovery; OTLP is an optional external projection.\n- Writable delegates default to full-access execution inside isolated worktrees; merge remains conflict-checked.\n`;
+  return generatedHeader("Runtime graph") + `\n\`\`\`mermaid\ngraph TD\n  ChatGPT[ChatGPT / MCP client] --> Compact[${TARGET_TOOL_CATALOG.length} compact tools]\n  Compact --> Pipeline[ActionExecutionPipeline]\n  Pipeline --> Backend[Hidden backend actions]\n  Pipeline --> Events[RuntimeEventStore JSONL]\n  Pipeline --> Metrics[ToolMetrics]\n  Pipeline --> Memory[AgentMemory consumer]\n  Pipeline --> OTEL[OTLP exporter optional]\n  Events --> Trace[Trajectory query + lca_input]\n  Backend --> Git[Direct Git/worktree utilities]\n  Backend --> UI[Browser + ADB]\n  Backend --> Integrations[Figma / Penpot / Coolify]\n  Backend --> Protected[DBeaver / Bruno / Notion protected semantics]\n\`\`\`\n\n### Invariants\n\n- LCA executes coding work directly; there is no secondary model-runner layer.\n- LCA is trusted-local: capability is allowed by default; validation protects correctness, not permission ceremony.\n- DBeaver, Bruno, and Notion preserve their integration-specific protection semantics.\n- Project roots are discovery/default-routing inputs, not authorization boundaries.\n- Runtime JSONL is authoritative for trajectory/recovery; OTLP is an optional external projection.\n`;
 }
 
 function generatedHeader(title) {

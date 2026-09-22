@@ -5,7 +5,7 @@
 The refactor is complete against the agreed product contract:
 
 - Node.js remains the runtime.
-- ChatGPT sees exactly fifteen compact tools.
+- ChatGPT sees exactly nineteen compact tools.
 - There is no model-facing legacy surface.
 - There are no mode, policy, approval, command-denylist, or root-authorization layers.
 - Tool actions execute directly as the local user.
@@ -24,19 +24,20 @@ workspace_exec
 workspace_process
 workspace_git
 workspace_verify
-workspace_agent
 workspace_ui
 workspace_status
 workspace_skill
 figma
 dbeaver
 bruno
+penpot
 coolify
+notion
 lca_input
 notion_page
 ```
 
-The façade contract lives in `server/src/interfaces/mcp/compact-mcp-interface.ts`. A singleton in-memory backend contains 144 internal actions. Every hidden action belongs to exactly one façade, discovery is bounded, and cross-facade dispatch is rejected.
+The façade contract lives in `server/src/interfaces/mcp/compact-mcp-interface.ts`. A singleton in-memory backend retains the richer internal actions. Every hidden action belongs to exactly one façade, discovery is bounded, and cross-facade dispatch is rejected.
 
 ## Mandatory context orchestration
 
@@ -77,7 +78,7 @@ CodeGraph `1.5.0` is pinned in `server/package-lock.json`.
 - concurrent connects deduplicated
 - project paths normalized to absolute paths
 - automatic init/index/sync with changed-file hints forcing refresh
-- internal narrow tools are enabled without changing the public fifteen-tool LCA surface: normal symbol tasks use location-only search, callers/callees and refactors use graph-specific queries, and full `explore` is reserved for architecture/flow work
+- internal narrow tools are enabled without expanding the public nineteen-tool LCA surface: normal symbol tasks use location-only search, callers/callees and refactors use graph-specific queries, and full `explore` is reserved for architecture/flow work
 - graph-query evidence is cached by project + CodeGraph database revision + normalized tool arguments; changed files or revision changes invalidate the cache
 - CodeGraph provider output is independently bounded so it complements current filesystem source instead of duplicating large source bodies on ordinary tasks
 - one reconnect after a retryable transport failure
@@ -120,7 +121,7 @@ AgentMemory `0.9.28` is isolated in `runtime/agentmemory` instead of sharing the
 
 `dbeaver_propose_sql` returns a model-visible artifact and a widget-only run capability in `_meta`. The capability is absent from model-visible content. Preparation and execution require this capability, use the immutable SQL/connection captured at proposal time, and still require DBeaver’s native confirmation. Generic passthrough accepts only upstream tools declaring `readOnlyHint=true`.
 
-## Runtime event spine and agent durability
+## Runtime event spine
 
 All backend actions execute through `ActionExecutionPipeline`. The pipeline emits typed events into an append-only JSONL `RuntimeEventStore`; it does not reintroduce permission or approval checks. `tool/started` is enqueued without delaying action start, while completion/failure remains a durability barrier that preserves ordering.
 
@@ -132,15 +133,11 @@ The runtime event stream drives multiple projections:
 - the trace tree in `lca_input`
 - optional metadata-only OTLP/HTTP export when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured
 
-`AgentRunnerRegistry` persists job and DAG snapshots into the same event stream. A restart reconstructs durable descriptors; jobs that had already finalized an isolated worktree patch become `recoverable`, while interrupted active work without a recoverable patch is reported as `orphaned`. Resume/follow-up/interrupt are optional runner capabilities rather than fake universal behavior.
-
-Codex workers default to `danger-full-access`, network enabled, and isolated Git worktrees. File scopes are optional correctness assertions for isolated workers; shared parallel writers still need disjoint scopes unless overlap is explicitly allowed. Merge remains explicit and conflict-checked.
-
 ## Code Mode and conversation runtime composition
 
-`workspace_exec action=code` runs a TypeScript program in a fresh bounded worker and exposes curated `lca.search/read/edit/exec/git/verify/status/agent/ui` bindings. Every binding resolves back to the existing hidden backend action and therefore re-enters normal tracing, metrics, correctness checks, and integration behavior. Recursive Code Mode calls are rejected.
+`workspace_exec action=code` runs a TypeScript program in a fresh bounded worker and exposes curated `lca.search/read/edit/exec/git/verify/status/ui` bindings. Every binding resolves back to the existing hidden backend action and therefore re-enters normal tracing, metrics, correctness checks, and integration behavior. Recursive Code Mode calls are rejected.
 
-`ConversationRuntimeContext` extends the old project-only scope with conversation/session identity, runner/profile, worktree/shared isolation, network defaults, and correlation state while keeping project roots as discovery inputs rather than authorization boundaries. `RuntimePluginHost` provides a small reversible lifecycle abstraction with reverse-order disposal; LCA does not embed Cordis.
+`ConversationRuntimeContext` extends the old project-only scope with conversation/session identity, profile, and correlation state while keeping project roots as discovery inputs rather than authorization boundaries. `RuntimePluginHost` provides a small reversible lifecycle abstraction with reverse-order disposal; LCA does not embed Cordis.
 
 Generated contracts under `docs/generated/` are produced from source and checked in CI: tool catalog, action catalog, runtime event catalog, provider capabilities, and runtime graph. JSONL remains the local source of truth even when OTLP export is enabled.
 
@@ -188,7 +185,7 @@ Historical baseline from commit `944dcc6` is frozen in `evals/baseline.json`:
 
 The compact benchmark is generated by `npm run benchmark:compact` and written to `evals/compact.json`. The current macOS arm64 measurement is:
 
-- 15 model-facing tools, down 89.51%
+- 19 model-facing tools
 - 10,811 bytes of `tools/list`, down 88.17%
 - 815 instruction characters, down 81.72%
 - 3.73 ms median local `tools/list`
@@ -212,12 +209,11 @@ The Phase 8 runtime benchmark reports a representative local run of roughly 0.2 
 - TypeScript typecheck and unit tests
 - live CodeGraph context integration
 - filesystem, semantic, CodeGraph, and AgentMemory parallel fan-out
-- provider quota and conflict behavior
 - AgentMemory lifecycle, decisions, and supervisor recovery
 - persistent HTTP MCP connection semantics
 - Figma, DBeaver, Bruno, Penpot, Coolify, and Notion contracts
-- twenty-tool schema and complete internal action coverage
-- runtime event ordering, durable agent restart reconstruction, trajectory, Code Mode, and reversible runtime composition
+- nineteen-tool schema and complete internal action coverage
+- runtime event ordering, trajectory, Code Mode, and reversible runtime composition
 - generated architecture contract drift and optional metadata-only OTLP export
 - direct absolute-path, command, Git, delete, and desktop execution
 - auth header handling, origin rejection, body caps, audit redaction, undo isolation, and process cleanup

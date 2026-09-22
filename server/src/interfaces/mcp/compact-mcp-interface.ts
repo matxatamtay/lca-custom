@@ -38,6 +38,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
     aliases: {
       search: "workspace_search",
       text: "search_text",
+      ast: "ast_search",
       files: "find_files",
       symbols: "repo_symbols",
       map: "repo_map",
@@ -52,7 +53,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       organize_imports: "code_organize_imports"
     },
     exact: new Set([
-      "workspace_search", "search_text", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan",
+      "workspace_search", "search_text", "ast_search", "find_files", "repo_symbols", "repo_map", "repo_overview", "important_files", "index_status", "todo_scan",
       "code_definition", "code_references", "code_diagnostics", "code_rename_symbol", "code_organize_imports"
     ])
   },
@@ -102,7 +103,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       knowledge: "knowledge_state"
     },
     exact: new Set([
-      "apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file",
+      "apply_patch", "preview_patch", "validate_patch", "undo_last_patch", "write_file", "replace_in_file", "ast_rewrite",
       "make_dir", "move_path", "delete_path", "save_note", "checkpoint", "decision_log", "task_plan", "task_state",
       "context_pin", "context_remove", "task_brief", "scope_guard", "knowledge_state"
     ])
@@ -145,31 +146,13 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       lint: "run_lint",
       review: "review_diff",
       security: "security_scan",
+      semgrep: "semgrep_scan",
+      regression_rules: "semgrep_rules",
+      mutation: "mutation_test",
       summary: "change_summary",
       session: "session_report"
     },
-    exact: new Set(["verification_plan", "detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "change_summary", "session_report"])
-  },
-  workspace_agent: {
-    defaultAction: "agent_list",
-    aliases: {
-      capabilities: "agent_capabilities",
-      spawn: "agent_spawn",
-      parallel: "agent_spawn_parallel",
-      list: "agent_list",
-      collect: "agent_collect",
-      stop: "agent_stop",
-      merge: "agent_merge",
-      cleanup: "agent_cleanup",
-      recover: "agent_recover",
-      resume: "agent_resume",
-      followup: "agent_followup",
-      interrupt: "agent_interrupt",
-      dag: "agent_dag",
-      dag_collect: "agent_dag_collect",
-      dag_stop: "agent_dag_stop"
-    },
-    prefix: "agent_"
+    exact: new Set(["verification_plan", "detect_test_commands", "quality_gate", "verify_changed", "run_tests", "run_changed_tests", "run_build", "run_lint", "review_diff", "security_scan", "semgrep_scan", "semgrep_rules", "mutation_test", "change_summary", "session_report"])
   },
   workspace_ui: {
     defaultAction: "ui_status",
@@ -192,6 +175,8 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
     aliases: {
       info: "workspace_info",
       performance: "performance_follow",
+      improvements: "improvement_candidates",
+      dependencies: "dependency_feed",
       performance_profile: "performance_profile",
       trace: "tool_trace",
       doctor: "workspace_doctor",
@@ -201,7 +186,7 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       reload_profile: "reload_profile",
       ping: "ping"
     },
-    exact: new Set(["ping", "workspace_info", "performance_follow", "performance_profile", "tool_trace", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
+    exact: new Set(["ping", "workspace_info", "performance_follow", "improvement_candidates", "dependency_feed", "performance_profile", "tool_trace", "lca", "workspace_doctor", "workspace_snapshot", "project_profile", "profile_status", "reload_profile"])
   },
   workspace_skill: {
     defaultAction: "list_skills",
@@ -276,16 +261,15 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
 });
 
 export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, string>> = Object.freeze({
-  workspace_search: "Search files, text, symbols, repository maps, graph-oriented indexes, and TODOs. For multiple related text queries, batch them with action=text and arguments.queries[]. Common actions: search, text, files, symbols, map, todos.",
+  workspace_search: "Search structural AST patterns, files, text, symbols, repository maps, graph-oriented indexes, and TODOs. Prefer action=ast for exact syntax structure, semantic symbol actions next, and action=text for plain text. Batch related text queries with arguments.queries[].",
   workspace_read: "Read one or many files, stat paths, list files or notes, and resume checkpoints. Common actions: one, many, stat, list, notes, resume.",
-  workspace_edit: "Apply, preview, validate, and undo patches; write, replace, move, or delete paths; maintain notes and task state. Use action=batch/apply_patch for related multi-file edits and replace with replacements[] for same-file batches.",
+  workspace_edit: "Apply, preview, validate, and undo patches; run bounded ast-grep structural rewrites; write, replace, move, or delete paths; maintain notes and task state. Use action=ast_rewrite for safe codemods and action=batch/apply_patch for ordinary related edits.",
   workspace_exec: "Run bounded foreground commands. Common actions: one or many.",
   workspace_process: "Start, list, inspect output from, and stop managed background processes.",
   workspace_git: "Run Git commands, compact status/diffs, and LCA-managed isolated worktrees for parallel tasks.",
-  workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, and session-report gates.",
-  workspace_agent: "Run delegated model agents, parallel/DAG execution, isolated worktrees, collection, merge, recovery, and cleanup actions.",
+  workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, local Semgrep regression/invariant scans, learned-rule lifecycle management, incremental mutation testing, and session-report gates.",
   workspace_ui: "Inspect and control trusted-local browser tabs and connected Android devices.",
-  workspace_status: "Inspect workspace, trusted runtime, project profile, dependency health, readiness state, and long-lived performance follow metrics.",
+  workspace_status: "Inspect workspace, trusted runtime, project profile, readiness, long-lived performance metrics, ranked self-improvement candidates, and advisory dependency feeds.",
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
   figma: "Use Figma Remote MCP with OAuth and guarded canvas writes, plus the persistent Desktop fallback. Common actions: status, actions, call, auth, remote_status, remote_actions, remote_call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",

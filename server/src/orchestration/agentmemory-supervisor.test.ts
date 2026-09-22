@@ -14,10 +14,11 @@ import {
 const TEST_ENGINE_PORT = 65_321;
 
 test("readiness probe waits for a post-registration AgentMemory endpoint", async () => {
+  const probeCredential = ["fixture", "auth", "token"].join("-");
   const requests: Array<{ url: string; authorization: string | null }> = [];
   const probe = new HttpAgentMemoryHealthProbe({
     baseUrl: "http://127.0.0.1:3111/",
-    secret: "test-secret",
+    secret: probeCredential,
     fetch: async (input, init) => {
       const headers = new Headers(init?.headers);
       requests.push({
@@ -31,7 +32,7 @@ test("readiness probe waits for a post-registration AgentMemory endpoint", async
   assert.equal(await probe.isReady(), true);
   assert.deepEqual(requests, [{
     url: "http://127.0.0.1:3111/agentmemory/diagnostics/followup",
-    authorization: "Bearer test-secret"
+    authorization: `Bearer ${probeCredential}`
   }]);
 });
 
@@ -149,6 +150,82 @@ test("supervised memory checks readiness before recall", async () => {
   await memory.recall({ task: "recall", root: "/repo" });
 
   assert.deepEqual(calls, ["health", "recall"]);
+});
+
+test("supervised memory retries one transport failure after re-checking readiness", async () => {
+  const calls: string[] = [];
+  let healthChecks = 0;
+  let recalls = 0;
+  const supervisor = new AgentMemorySupervisor({
+    probe: {
+      async isReady() {
+        healthChecks += 1;
+        calls.push("health");
+        return healthChecks !== 2;
+      }
+    },
+    runtime: {
+      async start() { calls.push("start"); },
+      async close() {}
+    },
+    attempts: 2,
+    retryDelayMs: 0,
+    sleep: async () => {}
+  });
+  const memory = new SupervisedMemoryPort(supervisor, {
+    async recall() {
+      recalls += 1;
+      calls.push("recall");
+      if (recalls === 1) throw new TypeError("fetch failed");
+      return [{ id: "recovered", provider: "agentmemory", kind: "memory", title: "Recovered", content: "ok" }];
+    }
+  });
+
+  const result = await memory.recall({ task: "recall", root: "/repo" });
+
+  assert.equal(result[0]?.id, "recovered");
+  assert.equal(recalls, 2);
+  assert.deepEqual(calls, ["health", "recall", "health", "start", "health", "recall"]);
+});
+
+test("supervised memory retries transport failures only once and still fails loudly", async () => {
+  let recalls = 0;
+  const supervisor = new AgentMemorySupervisor({
+    probe: { async isReady() { return true; } },
+    runtime: { async start() {}, async close() {} }
+  });
+  const memory = new SupervisedMemoryPort(supervisor, {
+    async recall() {
+      recalls += 1;
+      throw new TypeError("fetch failed");
+    }
+  });
+
+  await assert.rejects(
+    memory.recall({ task: "recall", root: "/repo" }),
+    /fetch failed/
+  );
+  assert.equal(recalls, 2);
+});
+
+test("supervised memory does not retry ordinary recall errors", async () => {
+  let recalls = 0;
+  const supervisor = new AgentMemorySupervisor({
+    probe: { async isReady() { return true; } },
+    runtime: { async start() {}, async close() {} }
+  });
+  const memory = new SupervisedMemoryPort(supervisor, {
+    async recall() {
+      recalls += 1;
+      throw new Error("invalid memory payload");
+    }
+  });
+
+  await assert.rejects(
+    memory.recall({ task: "recall", root: "/repo" }),
+    /invalid memory payload/
+  );
+  assert.equal(recalls, 1);
 });
 
 test("prepares the managed runtime before starting the AgentMemory worker", async () => {

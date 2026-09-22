@@ -30,6 +30,7 @@ function semanticProvider(items: readonly ContextEvidence[] = []) {
 
 test("queries filesystem, semantic analysis, CodeGraph, and AgentMemory for every task context", async () => {
   const calls: string[] = [];
+  const traces: string[] = [];
   const useCase = new BuildTaskContext({
     filesystem: {
       async search() {
@@ -66,6 +67,10 @@ test("queries filesystem, semantic analysis, CodeGraph, and AgentMemory for ever
         return [evidence("agentmemory", "memory-hit")];
       }
     },
+    async traceSpan(name, operation) {
+      traces.push(name);
+      return operation();
+    },
     now: () => new Date("2026-07-22T00:00:00.000Z"),
     createId: () => "ctx-test"
   });
@@ -89,6 +94,14 @@ test("queries filesystem, semantic analysis, CodeGraph, and AgentMemory for ever
   assert.equal(result.coverage.codegraph.details?.cache_hit, true);
   assert.equal(result.coverage.agentmemory.queried, true);
   assert.equal(result.evidence.length, 4);
+  assert.deepEqual([...traces].sort(), [
+    "workspace_context.agentmemory",
+    "workspace_context.codegraph.ensure_index",
+    "workspace_context.codegraph.query",
+    "workspace_context.filesystem",
+    "workspace_context.merge",
+    "workspace_context.semantic"
+  ].sort());
 });
 
 test("records AgentMemory coverage even when memory has no hits", async () => {

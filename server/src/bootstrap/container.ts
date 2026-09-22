@@ -13,6 +13,7 @@ export interface ApplicationDependencies {
   codegraph: CodeIntelligencePort;
   agentmemory: MemoryPort;
   reranker?: ContextRerankerPort;
+  traceSpan?: <T>(name: string, operation: () => Promise<T> | T) => Promise<T>;
 }
 
 export interface ApplicationContainer {
