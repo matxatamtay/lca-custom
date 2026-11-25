@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 export function createFilesystemCore(options) {
-  const { RG_BIN, SKIP_DIRS, toRel } = options;
+  const { RG_BIN, SKIP_DIRS, toRel, resolveDisplayPath = path.resolve } = options;
 
   async function buildTree(start, maxDepth, maxEntries) {
     const tree = [];
@@ -172,7 +172,7 @@ export function createFilesystemCore(options) {
   async function attachContext(matches, ctx) {
     const cache = new Map();
     for (const m of matches) {
-      const abs = path.isAbsolute(m.path) ? m.path : path.resolve(PRIMARY_ROOT, m.path);
+      const abs = resolveDisplayPath(m.path);
       let lines = cache.get(abs);
       if (!lines) {
         try {

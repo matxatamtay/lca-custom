@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -83,6 +83,34 @@ function createRuntimeFixture(source = originalRuntimeSource()) {
   }
   return { root, dist };
 }
+
+test("locates updated AgentMemory bundles and links data outside node_modules", () => {
+  const { root, dist } = createRuntimeFixture();
+  try {
+    renameSync(path.join(dist, "src-CzgoepGU.mjs"), path.join(dist, "src-G7yt8gGm.mjs"));
+    const applied = applyAgentMemoryRuntimePatches(root);
+    assert.equal(applied.changed, true);
+    assert.equal(inspectAgentMemoryRuntimePatches(root).dataLinked, true);
+    assert.equal(realpathSync(applied.data.path), realpathSync(path.join(root, "data")));
+    assert.match(readFileSync(path.join(dist, "src-G7yt8gGm.mjs"), "utf8"), /zero-llm-deterministic-summary-v3/);
+    assert.equal(applyAgentMemoryRuntimePatches(root).changed, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("refuses to replace a nonempty package database", () => {
+  const { root } = createRuntimeFixture();
+  try {
+    const db = path.join(root, "node_modules", "@agentmemory", "agentmemory", "data");
+    mkdirSync(db, { recursive: true });
+    writeFileSync(path.join(db, "sessions.db"), "existing memory");
+    assert.throws(() => applyAgentMemoryRuntimePatches(root), /Back up and migrate/);
+    assert.equal(readFileSync(path.join(db, "sessions.db"), "utf8"), "existing memory");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("builds a useful deterministic summary from compressed LCA observations", () => {
   const summary = createDeterministicSessionSummary({

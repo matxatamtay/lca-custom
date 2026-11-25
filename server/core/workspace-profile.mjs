@@ -2,11 +2,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 export function createWorkspaceProfile(options) {
-  const { PRIMARY_ROOT, detectTestCommands, jsonResult, log, reg } = options;
-  let profile = null;
+  const { PRIMARY_ROOT, detectTestCommands, jsonResult, log, reg, resolveDefaultRoot = () => PRIMARY_ROOT, projectRootForPath = (root) => root } = options;
+  const profiles = new Map();
 
-  async function loadWorkspaceProfile() {
-    const profilePath = path.join(PRIMARY_ROOT, ".agent", "profile.json");
+  async function loadWorkspaceProfile(root = PRIMARY_ROOT) {
+    const profilePath = path.join(root, ".agent", "profile.json");
+    let profile = null;
     try {
       const raw = await readFile(profilePath, "utf8");
       profile = JSON.parse(raw);
@@ -14,6 +15,13 @@ export function createWorkspaceProfile(options) {
     } catch {
       profile = null;
     }
+    profiles.set(root, profile);
+    return profile;
+  }
+
+  async function profileFor(root) {
+    if (!profiles.has(root)) await loadWorkspaceProfile(root);
+    return profiles.get(root);
   }
 
   function registerProfileTools(mcp) {
@@ -26,10 +34,12 @@ export function createWorkspaceProfile(options) {
         inputSchema: {}
       },
       async () => {
+        const root = projectRootForPath(resolveDefaultRoot());
+        const profile = await profileFor(root);
         if (!profile) {
           return jsonResult({
             loaded: false,
-            path: path.join(PRIMARY_ROOT, ".agent", "profile.json"),
+            path: path.join(root, ".agent", "profile.json"),
             message: "No profile.json found. Create one to configure ignored dirs, conventions, project roots, and optional manual test commands.",
             schema: {
               extraRoots: ["array of extra root paths"],
@@ -40,7 +50,7 @@ export function createWorkspaceProfile(options) {
             }
           });
         }
-        return jsonResult({ loaded: true, profile: profile });
+        return jsonResult({ loaded: true, root, profile: profile });
       }
     );
 
@@ -53,14 +63,16 @@ export function createWorkspaceProfile(options) {
         inputSchema: {}
       },
       async () => {
-        await loadWorkspaceProfile();
-        return jsonResult({ ok: true, loaded: profile !== null, profile: profile });
+        const root = projectRootForPath(resolveDefaultRoot());
+        const profile = await loadWorkspaceProfile(root);
+        return jsonResult({ ok: true, root, loaded: profile !== null, profile: profile });
       }
     );
   }
 
   async function getTestCommandsMerged(rootDir) {
     const detected = await detectTestCommands(rootDir);
+    const profile = await profileFor(projectRootForPath(rootDir));
     if (profile && profile.testCommands) {
       return { ...detected, ...profile.testCommands };
     }

@@ -1,10 +1,27 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { classifyCommandFamily, createPerformanceFollow } from "./performance-follow.mjs";
+
+test("small cache hit rates remain visible rather than rounding to zero", () => {
+  const follow = createPerformanceFollow({ now: () => 1_000 });
+  for (let i = 0; i < 50; i += 1) {
+    follow.recordToolCall({
+      tool: "workspace_context", root: "/repo",
+      trace: { task_id: "ratio", task_class: "user" }, success: true,
+      result: { structuredContent: {
+        coverage: { filesystem: { status: "ok", hits: 1, latencyMs: 1 } },
+        evidence: [{ provider: "filesystem", metadata: { cache_hit: i === 0 } }]
+      } }
+    });
+  }
+  const report = follow.report({ root: "/repo" });
+  assert.equal(report.cache_efficiency.hit_ratio, 0.02);
+  assert.equal(report.provider_cache.filesystem.hit_ratio, 0.02);
+});
 
 test("command family classification is useful without persisting raw command text", () => {
   assert.equal(classifyCommandFamily("npm run typecheck"), "npm:typecheck");
@@ -12,6 +29,44 @@ test("command family classification is useful without persisting raw command tex
   assert.equal(classifyCommandFamily("dart analyze lib"), "dart:analyze");
   assert.equal(classifyCommandFamily("/usr/local/bin/custom-check --token SUPERSECRET"), "other:custom-check");
   assert.doesNotMatch(classifyCommandFamily("/usr/local/bin/custom-check --token SUPERSECRET"), /SUPERSECRET/);
+});
+
+test("provider cache summary counts provider requests rather than evidence items", () => {
+  const follow = createPerformanceFollow({ now: () => 1_000 });
+  follow.recordToolCall({
+    tool: "workspace_context",
+    root: "/repo",
+    trace: { task_id: "warm", task_class: "user", context_temperature: "warm" },
+    success: true,
+    result: {
+      structuredContent: {
+        coverage: { filesystem: { status: "ok", hits: 3, latencyMs: 1 } },
+        evidence: [
+          { provider: "filesystem", metadata: { cache_hit: true } },
+          { provider: "filesystem", metadata: { cache_hit: true } },
+          { provider: "filesystem", metadata: { cache_hit: true } }
+        ]
+      }
+    }
+  });
+  follow.recordToolCall({
+    tool: "workspace_context",
+    root: "/repo",
+    trace: { task_id: "cold", task_class: "user", context_temperature: "cold" },
+    success: true,
+    result: {
+      structuredContent: {
+        coverage: { filesystem: { status: "ok", hits: 2, latencyMs: 10 } },
+        evidence: [
+          { provider: "filesystem", metadata: { cache_hit: false } },
+          { provider: "filesystem", metadata: { cache_hit: false } }
+        ]
+      }
+    }
+  });
+
+  const cache = follow.report({ root: "/repo", taskClass: "user" }).provider_cache.filesystem;
+  assert.deepEqual(cache, { checks: 2, hits: 1, hit_ratio: 0.5 });
 });
 
 test("records privacy-safe long-lived tool/provider/command timings with p50 p95 and bottlenecks", async () => {
@@ -41,7 +96,7 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
           coverage: {
             filesystem: { status: "ok", hits: 4, latencyMs: 40 },
             semantic: { status: "ok", hits: 2, latencyMs: 70 },
-            codegraph: { status: "ok", hits: 1, latencyMs: 310, details: { index_ms: 250, query_ms: 60 } },
+            codegraph: { status: "ok", hits: 1, latencyMs: 310, details: { index_ms: 250, query_ms: 60, index_cache_hit: true, prewarm_cache_hit: false, stage_cache_hits: 2 } },
             agentmemory: { status: "ok", hits: 0, latencyMs: 90 }
           },
           ranking: {
@@ -123,6 +178,11 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
     assert.equal(report.providers.find((item) => item.name === "codegraph")?.p95_ms, 310);
     assert.equal(report.codegraph.index_ms.p95_ms, 250);
     assert.equal(report.codegraph.query_ms.p95_ms, 60);
+    assert.deepEqual(report.codegraph.stage_cache, {
+      sampled_contexts: 1,
+      contexts_with_reuse: 1,
+      total_stage_hits: 2
+    });
     assert.equal(report.commands.find((item) => item.name === "npm:typecheck")?.p50_ms, 1_000);
     assert.equal(report.commands.find((item) => item.name === "flutter:test")?.p95_ms, 3_000);
     assert.equal(report.bottlenecks[0].name, "workspace_exec:many");
@@ -141,7 +201,8 @@ test("records privacy-safe long-lived tool/provider/command timings with p50 p95
     assert.equal(report.workflow_efficiency.bytes_to_model_per_task, 4_500);
     assert.equal(report.test_duration_ms.p95_ms, 3_000);
     assert.equal(report.codegraph.index_ms.calls, 1);
-    assert.equal(report.provider_cache.codegraph.checks, 0);
+    assert.equal(report.provider_cache.codegraph.checks, 1);
+    assert.equal(report.provider_cache.codegraph.hits, 1);
     assert.equal(report.trace_attribution.workspace_context.spans, 2);
     assert.equal(report.trace_attribution.workspace_context.top_contributors[0].component, "codegraph.ensure_index");
     assert.equal(report.trace_attribution.workspace_context.top_contributors[0].p95_ms, 250);
@@ -431,4 +492,28 @@ test("retention is bounded and reports filter cleanly by root and task class", (
   assert.equal(repoUser.tools[0].p95_ms, 68.5);
   assert.equal(repoUser.task_classes.user, 4);
   assert.equal(repoUser.task_classes.internal, undefined);
+});
+
+test("disabled profiling never loads, collects or writes historical samples", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "lca-disabled-profiler-"));
+  const filePath = path.join(root, "performance-follow.json");
+  const previous = '{"version":1,"samples":[{"seq":1,"kind":"tool","name":"old","ts":1000}]}';
+  try {
+    await writeFile(filePath, previous);
+    const follow = createPerformanceFollow({ enabled: false, filePath, now: () => 1000 });
+    await follow.load();
+    follow.recordToolCall({ tool: "workspace_context", root, durationMs: 100 });
+    follow.recordPrewarm({ root, durationMs: 10 });
+    assert.deepEqual(follow.recordRuntimeSpans({root, trace: {task_id:"test"}, spans:[{name:"test"}]}), {recorded:0});
+    await follow.flush();
+    await follow.close();
+    const report = follow.report({taskClass:"all"});
+    assert.equal(report.samples, 0);
+    assert.equal(report.storage.enabled, false);
+    assert.equal(report.storage.persisted, false);
+    assert.equal(report.storage.max_samples, 0);
+    assert.equal(await readFile(filePath, "utf8"), previous);
+  } finally {
+    await rm(root, {recursive:true, force:true});
+  }
 });

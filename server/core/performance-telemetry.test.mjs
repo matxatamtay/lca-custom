@@ -56,6 +56,30 @@ test("labels synthetic/internal/user tasks and classifies cold/warm context trac
   assert.equal(snapshot.aggregate.context_ms.p95, 96);
 });
 
+test("treats CodeGraph index reuse as a real cache signal", () => {
+  const telemetry = createPerformanceTelemetry({ createId: () => "index-hit", now: () => 1_000 });
+  telemetry.recordToolCall({
+    tool: "workspace_context",
+    root: "/repo",
+    task: "Inspect startup",
+    durationMs: 30,
+    result: {
+      structuredContent: {
+        coverage: {
+          codegraph: {
+            status: "ok",
+            hits: 1,
+            latencyMs: 10,
+            details: { index_cache_hit: true, prewarm_cache_hit: false }
+          }
+        },
+        evidence: []
+      }
+    }
+  });
+  assert.equal(telemetry.snapshot().active[0].context_temperature, "warm");
+});
+
 test("tracks one model-facing task across context, read, fused patch verification, and cache signals", () => {
   let id = 0;
   let now = 1_000;

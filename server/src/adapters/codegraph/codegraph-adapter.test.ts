@@ -6,6 +6,7 @@ import path from "node:path";
 
 import {
   CodeGraphAdapter,
+  codeGraphRelevantChangedFiles,
   changedFilesRevisionToken,
   type CodeGraphIndexReceipt
 } from "./codegraph-adapter.js";
@@ -18,6 +19,7 @@ function receipt(root: string, revision = "rev-1"): CodeGraphIndexReceipt {
 function createAdapter(options: {
   responses?: Readonly<Record<string, string>>;
   indexer?: { ensureIndexed(root: string, changedFiles?: readonly string[]): Promise<CodeGraphIndexReceipt> };
+  rootRevision?: (root: string) => { token: string; cacheable: boolean };
 }) {
   const calls: Array<{ name: string; arguments: Readonly<Record<string, unknown>> }> = [];
   const client = new PersistentMcpToolClient(async () => ({
@@ -36,7 +38,15 @@ function createAdapter(options: {
       return receipt(root);
     }
   };
-  return { adapter: new CodeGraphAdapter({ client, indexer }), calls, indexCalls };
+  return {
+    adapter: new CodeGraphAdapter({
+      client,
+      indexer,
+      ...(options.rootRevision ? { rootRevision: options.rootRevision } : {})
+    }),
+    calls,
+    indexCalls
+  };
 }
 
 test("routes structural flow tasks through cheap search and callers before deep exploration", async () => {
@@ -127,14 +137,46 @@ test("reuses CodeGraph evidence only while the graph revision is unchanged", asy
   assert.ok(Number(adapter.telemetry("/repo")?.index_ms) >= 0);
 });
 
+test("reuses staged graph searches across different task wording and refreshes on index change", async () => {
+  let revision = 0;
+  const { adapter, calls } = createAdapter({
+    responses: {
+      codegraph_search: "startup — src/startup.ts:10",
+      codegraph_callers: "Callers of startup\n- src/bootstrap.ts:20\n- src/main.ts:5\nused by 2 symbols"
+    },
+    indexer: {
+      async ensureIndexed(root) {
+        revision += 1;
+        return receipt(root, `rev-${revision}`);
+      }
+    }
+  });
+  await adapter.ensureIndexed("/repo");
+  const first = await adapter.context({ task: "Trace startup flow across modules", root: "/repo" });
+  const second = await adapter.context({ task: "Trace startup flow across apps", root: "/repo" });
+
+  assert.deepEqual(calls.map((call) => call.name), ["codegraph_search", "codegraph_callers"]);
+  assert.equal(first[0]?.metadata?.stage_cache_hits, 0);
+  assert.equal(second[0]?.metadata?.stage_cache_hits, 2);
+  assert.equal(second[0]?.metadata?.cache_hit, false);
+  assert.equal(adapter.telemetry("/repo")?.stage_cache_hits, 2);
+
+  await adapter.ensureIndexed("/repo", ["src/startup.ts"]);
+  const third = await adapter.context({ task: "Trace startup flow across deps", root: "/repo" });
+  assert.equal(calls.length, 4);
+  assert.equal(third[0]?.metadata?.stage_cache_hits, 0);
+});
+
 test("prewarm indexes the project and warms the persistent CodeGraph MCP connection with status", async () => {
   const { adapter, calls } = createAdapter({ responses: { codegraph_status: "CodeGraph ready" } });
 
+  await adapter.prewarm("/repo");
   await adapter.prewarm("/repo");
 
   assert.deepEqual(calls.map((call) => call.name), ["codegraph_status"]);
   assert.equal(calls[0]?.arguments.projectPath, "/repo");
   assert.ok(Number(adapter.telemetry("/repo")?.prewarm_ms) >= 0);
+  assert.equal(adapter.telemetry("/repo")?.prewarm_cache_hit, true);
 });
 
 test("unchanged changed-file refresh receipts preserve hot evidence cache", async () => {
@@ -157,6 +199,119 @@ test("unchanged changed-file refresh receipts preserve hot evidence cache", asyn
   assert.equal(calls.length, 1);
   assert.equal(first[0]?.metadata?.cache_hit, false);
   assert.equal(second[0]?.metadata?.cache_hit, true);
+});
+
+test("skips repeated index checks while the workspace revision is unchanged", async () => {
+  let generation = 0;
+  let checks = 0;
+  const { adapter } = createAdapter({
+    rootRevision: () => ({ token: String(generation), cacheable: true }),
+    indexer: {
+      async ensureIndexed(root) {
+        checks += 1;
+        return receipt(root, `rev-${checks}`);
+      }
+    }
+  });
+
+  await adapter.ensureIndexed("/repo");
+  await adapter.ensureIndexed("/repo");
+  assert.equal(checks, 1);
+  assert.equal(adapter.telemetry("/repo")?.index_cache_hit, true);
+
+  generation += 1;
+  await adapter.ensureIndexed("/repo");
+  assert.equal(checks, 2);
+
+  await adapter.ensureIndexed("/repo", ["src/a.ts"]);
+  assert.equal(checks, 3);
+});
+
+test("coalesces concurrent index checks for the same workspace revision", async () => {
+  let generation = 0;
+  let checks = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const { adapter } = createAdapter({
+    rootRevision: () => ({ token: String(generation), cacheable: true }),
+    indexer: {
+      async ensureIndexed(root) {
+        checks += 1;
+        await gate;
+        return receipt(root, "shared-revision");
+      }
+    }
+  });
+
+  const first = adapter.ensureIndexed("/repo", ["src/a.ts"]);
+  const second = adapter.ensureIndexed("/repo");
+  release();
+  await Promise.all([first, second]);
+
+  assert.equal(checks, 1);
+  assert.equal(adapter.telemetry("/repo")?.index_cache_hit, true);
+  assert.equal(adapter.telemetry("/repo")?.index_skip_reason, "inflight_join");
+});
+
+test("serializes a newer workspace revision behind an older in-flight index", async () => {
+  let generation = 0;
+  let checks = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const { adapter } = createAdapter({
+    rootRevision: () => ({ token: String(generation), cacheable: true }),
+    indexer: {
+      async ensureIndexed(root) {
+        checks += 1;
+        if (checks === 1) await gate;
+        return receipt(root, `rev-${checks}`);
+      }
+    }
+  });
+
+  const first = adapter.ensureIndexed("/repo", ["src/a.ts"]);
+  generation = 1;
+  const second = adapter.ensureIndexed("/repo", ["src/b.ts"]);
+  release();
+  await Promise.all([first, second]);
+
+  assert.equal(checks, 2);
+  assert.equal(adapter.telemetry("/repo")?.index_cache_hit, false);
+  assert.equal(adapter.telemetry("/repo")?.index_skip_reason, undefined);
+});
+
+test("skips CodeGraph sync for docs and runtime-only edits after initial indexing", async () => {
+  let generation = 0;
+  let checks = 0;
+  const { adapter } = createAdapter({
+    rootRevision: () => ({ token: String(generation), cacheable: true }),
+    indexer: {
+      async ensureIndexed(root) {
+        checks += 1;
+        return receipt(root, "stable-graph");
+      }
+    }
+  });
+
+  await adapter.ensureIndexed("/repo");
+  generation += 1;
+  await adapter.ensureIndexed("/repo", ["README.md", ".agent/state/current-task.json"]);
+  assert.equal(checks, 1);
+  assert.equal(adapter.telemetry("/repo")?.index_cache_hit, true);
+  assert.equal(adapter.telemetry("/repo")?.index_skip_reason, "non_graph_changes");
+
+  await adapter.ensureIndexed("/repo");
+  assert.equal(checks, 1);
+});
+
+test("CodeGraph changed-file filter is conservative for source and config files", () => {
+  assert.deepEqual(codeGraphRelevantChangedFiles([
+    "README.md",
+    "docs/architecture.png",
+    "src/app.ts",
+    "package.json",
+    "config/custom.json"
+  ]), ["src/app.ts", "package.json", "config/custom.json"]);
 });
 
 test("changed-file revision token stays stable until file metadata changes", async () => {

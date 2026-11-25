@@ -18,13 +18,16 @@ export function createCommandRuntime(options) {
       return { file, args: ["-NoProfile", "-NonInteractive", "-Command", command], opts: {} };
     }
     if (s === "bash") {
-      return { file: "bash", args: ["-lc", command], opts: {} };
+      // The daemon already inherits the user's environment. Avoid login-shell
+      // startup files on every command; they add latency and can inject noisy
+      // interactive tooling into otherwise deterministic foreground work.
+      return { file: "bash", args: ["-c", command], opts: {} };
     }
     if (s === "sh") {
       return { file: "sh", args: ["-c", command], opts: {} };
     }
     if (s === "zsh") {
-      return { file: "zsh", args: ["-lc", command], opts: {} };
+      return { file: "zsh", args: ["-c", command], opts: {} };
     }
     // cmd / default: rely on the OS shell so pipes/redirects work.
     return { file: command, args: [], opts: { shell: true } };
@@ -37,6 +40,20 @@ export function createCommandRuntime(options) {
       detached: process.platform !== "win32",
       ...(env ? { env } : {}),
       ...opts
+    };
+  }
+
+  function childEnvironment(cwd, overrides = {}) {
+    const env = { ...process.env };
+    const inheritedNodeOptions = String(env.NODE_OPTIONS || "");
+    if (/(?:ms-vscode\.js-debug|js-debug.*bootloader|bootloader\.js)/i.test(inheritedNodeOptions)) {
+      delete env.NODE_OPTIONS;
+      delete env.VSCODE_INSPECTOR_OPTIONS;
+    }
+    return {
+      ...env,
+      AGENT_WORKSPACE: cwd,
+      ...overrides
     };
   }
 
@@ -55,19 +72,24 @@ export function createCommandRuntime(options) {
     }
   }
 
-  function runShellCommand(command, cwd, shell, timeoutMs) {
+  function runShellCommand(command, cwd, shell, timeoutMs, runtimeOptions = {}) {
     const { file, args, opts } = buildSpawn(command, shell);
+    const secretValues = Array.isArray(runtimeOptions.redactValues)
+      ? runtimeOptions.redactValues.filter(Boolean).map(String)
+      : [];
+    const redact = (value) => redactSecretText(value, secretValues);
     return new Promise((resolve) => {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
       let child;
       try {
-        child = spawn(file, args, spawnOptions(cwd, opts, { ...process.env, AGENT_WORKSPACE: PRIMARY_ROOT }));
+        child = spawn(file, args, spawnOptions(cwd, opts, childEnvironment(cwd, runtimeOptions.env || {})));
       } catch (err) {
-        resolve({ exit_code: null, timed_out: false, stdout: "", stderr: String(err?.message || err) });
+        resolve({ exit_code: null, timed_out: false, stdout: "", stderr: redact(String(err?.message || err)) });
         return;
       }
+      child.stdin?.end(runtimeOptions.stdin == null ? undefined : String(runtimeOptions.stdin));
       const timer = setTimeout(() => {
         timedOut = true;
         terminateChildTree(child, "SIGTERM");
@@ -76,11 +98,11 @@ export function createCommandRuntime(options) {
       child.stderr?.on("data", (c) => (stderr = appendLimited(stderr, c.toString(), MAX_COMMAND_OUTPUT)));
       child.on("error", (err) => {
         clearTimeout(timer);
-        resolve({ exit_code: null, timed_out: timedOut, stdout, stderr: stderr + String(err?.message || err) });
+        resolve({ exit_code: null, timed_out: timedOut, stdout: redact(stdout), stderr: redact(stderr + String(err?.message || err)) });
       });
       child.on("close", (code) => {
         clearTimeout(timer);
-        resolve({ exit_code: code, timed_out: timedOut, stdout, stderr });
+        resolve({ exit_code: code, timed_out: timedOut, stdout: redact(stdout), stderr: redact(stderr) });
       });
     });
   }
@@ -116,7 +138,7 @@ export function createCommandRuntime(options) {
 
   function startBackground(command, cwd, shell, name) {
     const { file, args, opts } = buildSpawn(command, shell);
-    const child = spawn(file, args, spawnOptions(cwd, opts, { ...process.env, AGENT_WORKSPACE: PRIMARY_ROOT }));
+    const child = spawn(file, args, spawnOptions(cwd, opts, childEnvironment(cwd)));
     const proc = {
       id: randomUUID(),
       name: name || command.slice(0, 40),
@@ -156,4 +178,11 @@ export function createCommandRuntime(options) {
 
 
   return { defaultShell, killProcessTree, runShellCommand, spawnCapture, startBackground };
+}
+
+function redactSecretText(value, secrets) {
+  let safe = String(value ?? "");
+  const ordered = [...new Set(secrets.filter(Boolean))].sort((left, right) => right.length - left.length);
+  for (const secret of ordered) safe = safe.split(secret).join("[redacted secret]");
+  return safe;
 }

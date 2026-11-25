@@ -286,8 +286,8 @@ export async function installManagedRuntime(options) {
     await run(npmCommand, ["ci"], { cwd: paths.serverDirectory, timeoutMs: 600_000 });
   }
   if (plan.installAgentMemory) {
-    log("Installing lean AgentMemory companion runtime");
-    await run(npmCommand, ["ci", "--ignore-scripts"], { cwd: paths.memoryDirectory, timeoutMs: 600_000 });
+    log("Installing AgentMemory companion runtime with native embedding dependencies");
+    await run(npmCommand, ["ci"], { cwd: paths.memoryDirectory, timeoutMs: 600_000 });
   }
   if (plan.patchAgentMemory) {
     log("Applying managed AgentMemory compatibility patches");

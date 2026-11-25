@@ -325,7 +325,11 @@ export function parseArgs(argv) {
         break;
       case "--limit":
         flags.limit = Number(next());
-        if (!Number.isInteger(flags.limit) || flags.limit < 1 || flags.limit > 100) {
+        if (
+          !Number.isInteger(flags.limit) ||
+          flags.limit < 1 ||
+          flags.limit > 100
+        ) {
           throw new Error("--limit must be an integer between 1 and 100");
         }
         break;
@@ -855,6 +859,8 @@ const { ensureFigmaDesktopConnected, figmaCommand, memoryCommand } =
   });
 
 const { setup, installCliCommand, cliWrapperContents } = createSetupCommands({
+  normalize,
+  status,
   CLI_NAME,
   CONFIG_PATH,
   DEFAULT_PORT,
@@ -1004,9 +1010,9 @@ const { improveCommand } = createImproveCommand({
       clientName: "lca-custom-improve",
       clientVersion: LCA_VERSION,
       timeoutMs: 60_000,
-      ...(headers ? { requestInit: { headers } } : {})
+      ...(headers ? { requestInit: { headers } } : {}),
     });
-  }
+  },
 });
 
 const { skillsCommand, tuiCommand } = createSkillsTuiCommands({

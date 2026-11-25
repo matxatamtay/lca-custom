@@ -96,7 +96,7 @@ export class BuildTaskContext {
       this.trace("workspace_context.semantic", () => this.runSemanticProvider(normalizedRequest)),
       this.runCodegraphProvider(normalizedRequest),
       this.trace("workspace_context.agentmemory", () =>
-        this.runProvider("agentmemory", () => this.dependencies.agentmemory.recall(normalizedRequest)))
+        this.runMemoryProvider(normalizedRequest))
     ]);
 
     const providerResults = [filesystem, semantic, codegraph, agentmemory] as const;
@@ -171,6 +171,23 @@ export class BuildTaskContext {
       };
     } catch (error) {
       throw new ContextProviderUnavailableError("codegraph", error);
+    }
+  }
+
+  private async runMemoryProvider(request: TaskContextRequest): Promise<ProviderResult> {
+    const startedAt = performance.now();
+    try {
+      const evidence = await this.dependencies.agentmemory.recall(request);
+      const telemetry = this.dependencies.agentmemory.telemetry?.(request.root);
+      return {
+        provider: "agentmemory",
+        evidence,
+        latencyMs: Math.max(0, Math.round((performance.now() - startedAt) * 100) / 100),
+        status: "ok",
+        ...(telemetry ? { details: telemetry } : {})
+      };
+    } catch (error) {
+      throw new ContextProviderUnavailableError("agentmemory", error);
     }
   }
 

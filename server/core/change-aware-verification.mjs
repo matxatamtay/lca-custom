@@ -15,6 +15,8 @@ const PLAN_MANIFESTS = [
 export function createChangeAwareVerification(options) {
   const { getTestCommandsMerged, runGatedCommand, cachePathForRoot, readState = readPathState, now = () => Date.now() } = options;
   const planCache = new Map();
+  const activeGates = new Map();
+  const cacheWrites = new Map();
 
   async function plan(root, changedFiles) {
     const normalizedRoot = path.resolve(root);
@@ -36,6 +38,7 @@ export function createChangeAwareVerification(options) {
     const impactedTests = await discoverImpactedTests(normalizedRoot, files);
     const runner = await detectTargetedRunner(normalizedRoot, commands);
     const targetedTestCommand = buildTargetedTestCommand(runner, impactedTests);
+    const typecheckRelevant = await isTypecheckRelevant(normalizedRoot, files, commands);
     const gates = [];
 
     if (!classification.docsOnly) {
@@ -46,7 +49,7 @@ export function createChangeAwareVerification(options) {
       } else if (classification.source > 0 && commands.test && impactedTests.length === 0) {
         gates.push({ name: "test", command: commands.test, scope: "package", reason: "source changed without a confidently targeted test" });
       }
-      if (classification.source > 0 && commands.typecheck) gates.push({ name: "typecheck", command: commands.typecheck, scope: "package", reason: "source files changed" });
+      if (classification.source > 0 && commands.typecheck && typecheckRelevant) gates.push({ name: "typecheck", command: commands.typecheck, scope: "package", reason: "source files changed within typecheck scope" });
       if (classification.source > 0 && commands.lint) gates.push({ name: "lint", command: commands.lint, scope: "package", reason: "source files changed" });
       if (classification.config > 0) {
         if (commands.typecheck && !gates.some((gate) => gate.name === "typecheck")) gates.push({ name: "typecheck", command: commands.typecheck, scope: "package", reason: "configuration changed" });
@@ -97,7 +100,26 @@ export function createChangeAwareVerification(options) {
     }
 
     const runGate = async ({ index, gate }) => {
-      const result = await runGatedCommand(gate.command, planned.root, timeoutMs);
+      const key = `${planned.root}\0${planned.fingerprint}\0${gate.command}\0${timeoutMs}`;
+      const existing = !fresh ? activeGates.get(key) : null;
+      if (existing) {
+        const result = await existing;
+        results[index] = { name: gate.name, command: gate.command, ...result, status: result.ok ? "shared" : "fail", cached: false, shared: true };
+        return results[index];
+      }
+      const operation = Promise.resolve().then(async () => {
+        const result = await runGatedCommand(gate.command, planned.root, timeoutMs);
+        // Coalesce through durable cache persistence, not just child-process exit.
+        if (result.ok) await recordCacheSuccess(planned.root, planned.fingerprint, gate.command, gate.name);
+        return result;
+      });
+      if (!fresh) activeGates.set(key, operation);
+      let result;
+      try {
+        result = await operation;
+      } finally {
+        if (activeGates.get(key) === operation) activeGates.delete(key);
+      }
       results[index] = { name: gate.name, status: result.ok ? "pass" : "fail", cached: false, ...result };
       return results[index];
     };
@@ -120,12 +142,6 @@ export function createChangeAwareVerification(options) {
     }
 
     const completed = results.filter(Boolean);
-    for (const entry of completed) {
-      if (entry.status === "pass" && entry.cached === false) {
-        const gate = planned.gates.find((candidate) => candidate.name === entry.name && candidate.command === entry.command);
-        if (gate) await recordCacheSuccess(planned.root, planned.fingerprint, gate.command, gate.name);
-      }
-    }
 
     const failed = completed.filter((result) => result.ok === false);
     return {
@@ -137,6 +153,7 @@ export function createChangeAwareVerification(options) {
       ok: failed.length === 0,
       ran: completed.filter((result) => result.status === "pass" || result.status === "fail").length,
       reused: completed.filter((result) => result.status === "cached").length,
+      shared: completed.filter((result) => result.shared === true).length,
       failed: failed.length,
       stopped_early: completed.length < planned.gates.length,
       results: completed
@@ -164,12 +181,21 @@ export function createChangeAwareVerification(options) {
 
   async function recordCacheSuccess(root, fingerprint, command, name) {
     const file = cachePathForRoot(root);
-    const cache = await readCache(root);
-    const key = cacheKey(fingerprint, command);
-    const next = cache.entries.filter((entry) => entry.key !== key);
-    next.push({ key, fingerprint, command, name, ok: true, verified_at: new Date(now()).toISOString() });
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFileAtomic(file, Buffer.from(`${JSON.stringify({ version: 1, entries: next.slice(-MAX_CACHE_ENTRIES) }, null, 2)}\n`, "utf8"));
+    const previous = cacheWrites.get(file) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(async () => {
+      const cache = await readCache(root);
+      const key = cacheKey(fingerprint, command);
+      const next = cache.entries.filter((entry) => entry.key !== key);
+      next.push({ key, fingerprint, command, name, ok: true, verified_at: new Date(now()).toISOString() });
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFileAtomic(file, Buffer.from(`${JSON.stringify({ version: 1, entries: next.slice(-MAX_CACHE_ENTRIES) }, null, 2)}\n`, "utf8"));
+    });
+    cacheWrites.set(file, operation);
+    try {
+      await operation;
+    } finally {
+      if (cacheWrites.get(file) === operation) cacheWrites.delete(file);
+    }
   }
 
   function touchPlanCache(key, value) {
@@ -335,5 +361,21 @@ function isSourceFile(file) { return /\.(?:dart|java|[cm]?[jt]sx?|py|go|rs|cs)$/
 function isTestFile(file) { return /(?:^|\/)(?:test|tests|__tests__|spec)(?:\/|$)/i.test(file) || /\.(?:test|spec)\.(?:[cm]?[jt]sx?)$/i.test(file) || /_test\.(?:dart|py|go|rs)$/i.test(file) || /(?:^|\/)test_.*\.py$/i.test(file); }
 function isDocsFile(file) { const base = path.posix.basename(file); return /\.(?:md|mdx|rst)$/i.test(file) || /^(?:readme|changelog|contributing|architecture)(?:\.|$)/i.test(base) || file.startsWith("docs/"); }
 function isConfigFile(file) { const base = path.posix.basename(file); return /^(?:package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|pubspec\.yaml|pubspec\.lock|analysis_options\.yaml|tsconfig.*\.json|jsconfig\.json|pyproject\.toml|go\.mod|cargo\.toml|pom\.xml|build\.gradle(?:\.kts)?|settings\.gradle(?:\.kts)?|dockerfile|docker-compose.*\.ya?ml|\.eslintrc.*|eslint\.config\..*|\.prettierrc.*)$/i.test(base) || file.startsWith(".github/workflows/"); }
+async function isTypecheckRelevant(root, files, commands) {
+  if (!commands.typecheck || !files.length) return true;
+  if (!files.every((file) => /\.[cm]?jsx?$/i.test(file))) return true;
+  if (files.some((file) => path.relative(root, file).startsWith(".."))) return true;
+  try {
+    const pkg = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+    const script = String(pkg?.scripts?.typecheck || "");
+    if (/[;&|]/.test(script) || !/^tsc\s+(?:--noEmit\b|-p\b|--project\b|$)/.test(script)) return true;
+    const config = JSON.parse(await readFile(path.join(root, "tsconfig.json"), "utf8"));
+    // Do not guess allowJs/checkJs values inherited from an extended configuration.
+    if (config?.extends) return true;
+    return config?.compilerOptions?.allowJs === true || config?.compilerOptions?.checkJs === true;
+  } catch {
+    return true; // Unknown project configuration: retain the safe existing gate.
+  }
+}
 function cacheKey(fingerprint, command) { return createHash("sha256").update(`${fingerprint}\0${command}`).digest("hex"); }
 function shellQuote(value) { const text = String(value); if (process.platform === "win32") return `"${text.replace(/"/g, '""')}"`; return `'${text.replace(/'/g, `'\\''`)}'`; }

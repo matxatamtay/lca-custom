@@ -5,6 +5,34 @@ import path from "node:path";
 import test from "node:test";
 import { createPostEditIntelligence } from "./post-edit-intelligence.mjs";
 
+test("post-edit prewarm is recorded without blocking the edit result", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "lca-post-edit-warm-"));
+  const file = path.join(root, "demo.ts");
+  await writeFile(file, "export const demo = true;\n");
+  let notify;
+  const observed = new Promise((resolve) => { notify = resolve; });
+  const receipts = { codegraph: { status: "fulfilled" }, semantic: { status: "fulfilled" }, agentmemory: { status: "fulfilled" } };
+  const postEdit = createPostEditIntelligence({
+    resolveProjectRoot: () => root,
+    resolveFormatter: async () => ({ reason: "none" }),
+    runShellCommand: async () => { throw new Error("unexpected"); },
+    getTestCommandsMerged: async () => ({}),
+    getNextApplicationRuntime: async () => ({
+      application: { semantic: {} },
+      invalidateContext: async () => receipts
+    }),
+    onContextPrewarm: (warmRoot, paths, result) => notify({ warmRoot, paths, result })
+  });
+  try {
+    const output = await postEdit.analyze([file]);
+    const event = await observed;
+    assert.equal(output.summary.files, 1);
+    assert.equal(event.warmRoot, root);
+    assert.deepEqual(event.paths, [file]);
+    assert.equal(event.result, receipts);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("post-edit intelligence formats, re-reads, reports semantic diagnostics, and only recommends gates", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "lca-post-edit-"));
   const file = path.join(root, "src", "a.ts");

@@ -78,12 +78,25 @@ async function startServer(workspace, extraRoots = []) {
 
 async function stopServer(child) {
   if (!child?.pid) return;
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("close", resolve));
   if (process.platform === "win32") {
     spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
   } else {
     child.kill("SIGTERM");
   }
-  await wait(300);
+  const stopped = await Promise.race([
+    exited.then(() => true),
+    wait(2_000).then(() => false)
+  ]);
+  if (!stopped && child.exitCode === null && child.signalCode === null) {
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+    } else {
+      child.kill("SIGKILL");
+    }
+    await Promise.race([exited, wait(1_000)]);
+  }
 }
 
 async function connect(port) {
@@ -106,7 +119,10 @@ function runLocal(command, args, cwd) {
 }
 
 async function callJson(client, name, args = {}) {
-  const result = await callCompactTool(client, name, args);
+  const requiresRoot = new Set(["workspace_snapshot","repo_map","repo_symbols","workspace_doctor","detect_test_commands","quality_gate","review_diff","session_report"]);
+  const input = compactCallInput(name, args);
+  if (requiresRoot.has(name) && !args.path && !args.cwd) input.arguments.project = base;
+  const result = await client.callTool(input);
   const text = result.content?.[0]?.text ?? "";
   if (result.isError) throw new Error(`${name} failed: ${text}`);
   return JSON.parse(text);
@@ -127,6 +143,13 @@ const extraRoot = path.join(tempRoot, "secondary-project");
 const secondaryFile = path.join(extraRoot, "lib", "secondary.js");
 await mkdir(path.dirname(secondaryFile), { recursive: true });
 await writeFile(secondaryFile, "export function secondaryOnly(){ return 'secondary'; }\n", "utf8");
+const universalSkillDir = path.join(base, ".agents", "skills", "universal-test");
+await mkdir(universalSkillDir, { recursive: true });
+await writeFile(
+  path.join(universalSkillDir, "SKILL.md"),
+  "---\nname: universal-test\ndescription: Universal Agent Standard discovery regression skill.\n---\n\n# Universal test\n",
+  "utf8"
+);
 let server;
 let client;
 try {
@@ -143,6 +166,12 @@ try {
   const info = await callJson(client, "workspace_info");
   check("workspace_info exposes pro tier", info.tier === "pro", `tier=${info.tier}`);
   check("workspace_info exposes trusted compact runtime", info.runtime === "trusted-local" && info.tool_surface === "compact" && info.policy === undefined && info.mode === undefined, JSON.stringify(info));
+  const discoveredSkills = await callJson(client, "list_skills");
+  check(
+    "list_skills discovers Universal Agent Standard .agents/skills",
+    discoveredSkills.skills?.some((skill) => skill.name === "universal-test"),
+    JSON.stringify(discoveredSkills.skills)
+  );
 
   const snap = await callJson(client, "workspace_snapshot", { depth: 3, max_entries: 120, include_symbols: true, refresh: true });
   check("snapshot kind is workspace_snapshot", snap.kind === "workspace_snapshot");

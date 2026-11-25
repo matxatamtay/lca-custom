@@ -55,7 +55,7 @@ test("applies Jev score decisions as bounded boosts without dropping evidence", 
   assert.equal(result.ranking.status, "applied");
   assert.equal(result.ranking.sufficiency, "sufficient");
   assert.equal(result.ranking.sufficiencyConfidence, 0.88);
-  assert.equal(result.ranking.candidateCap, 24);
+  assert.equal(result.ranking.candidateCap, 12);
   assert.ok(Number(result.ranking.stateChars) > 0);
   assert.equal(result.evidence.length, 2);
   assert.equal(result.evidence[0]?.score, 80);
@@ -66,6 +66,43 @@ test("applies Jev score decisions as bounded boosts without dropping evidence", 
   );
   assert.equal(requestBody?.model, "jev-latest");
   assert.ok(String(requestBody?.state).includes("[candidate_0]"));
+});
+
+test("reuses exact Jev decisions and preserves fresh provider cache metadata", async () => {
+  let calls = 0;
+  const reranker = new JevContextReranker({
+    apiToken: "test-token",
+    fetch: (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        answers: {
+          candidate_0: { type: "score", score: 2, confidence: 1 },
+          candidate_1: { type: "score", score: 1, confidence: 0.9 },
+          context_sufficiency: { type: "score", score: 2, confidence: 0.9 }
+        }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch
+  });
+  const request = { task: "Fix cached rerank", root: "/repo", intent: "implement" as const };
+  const firstItems = [evidence("a", 30), evidence("b", 20)];
+  const secondItems = firstItems.map((item) => ({
+    ...item,
+    metadata: { ...(item.metadata ?? {}), cache_hit: true, cache_layer: "root-revision" }
+  }));
+
+  const first = await reranker.rerank(request, firstItems);
+  const second = await reranker.rerank(request, secondItems);
+
+  assert.equal(calls, 1);
+  assert.equal(first.ranking.status, "applied");
+  assert.equal(second.ranking.status, "applied");
+  assert.equal(second.ranking.latencyMs, 0);
+  assert.equal(second.evidence[0]?.metadata?.cache_hit, true);
+  assert.equal(second.evidence[0]?.metadata?.cache_layer, "root-revision");
+  assert.equal(
+    (second.evidence[0]?.metadata?.jevRerank as { cache_hit?: boolean } | undefined)?.cache_hit,
+    true
+  );
 });
 
 test("HTTP failures fall back to unchanged rule ranking", async () => {

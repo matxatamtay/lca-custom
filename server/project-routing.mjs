@@ -1,4 +1,5 @@
 import path from "node:path";
+import { statSync } from "node:fs";
 
 const GENERIC_PROJECT_TOKENS = new Set([
   "admin",
@@ -17,18 +18,62 @@ const GENERIC_PROJECT_TOKENS = new Set([
   "web"
 ]);
 
-export function resolveTaskProjectRoot(task, roots, primaryRoot = roots?.[0]) {
+export function resolveProjectSelection(project, roots) {
+  if (typeof project !== "string" || !project.trim()) return undefined;
+  const value = project.trim();
   const normalizedRoots = uniqueRoots(roots);
-  const fallback = path.resolve(primaryRoot || normalizedRoots[0] || process.cwd());
-  if (!normalizedRoots.length || !String(task || "").trim()) return fallback;
+  let target;
+  if (path.isAbsolute(value)) {
+    target = path.resolve(value);
+  } else {
+    const label = normalizeText(value).replace(/\/$/, "");
+    const labels = uniqueSuffixLabels(normalizedRoots);
+    const matches = normalizedRoots.filter((root) =>
+      normalizeText(path.basename(root)) === label ||
+      normalizeText(labels.get(comparePath(root))) === label
+    );
+    if (matches.length !== 1) {
+      throw new Error(matches.length
+        ? `Ambiguous project '${value}': ${matches.join(", ")}. Use an absolute path.`
+        : `Unknown project '${value}'. Use a configured project name or an existing absolute directory.`);
+    }
+    target = matches[0];
+  }
+  if (!statSync(target, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error(`Project directory does not exist or is not a directory: ${target}`);
+  }
+  return target;
+}
 
-  const aliasesByRoot = projectAliases(normalizedRoots);
+export function resolveTaskProjectRoot(task, roots, scopedRoot) {
+  if (scopedRoot) return scopedRoot;
+  const normalizedRoots = uniqueRoots(roots);
   const normalizedTask = normalizeText(task);
-  const matchedRoots = normalizedRoots.filter((root) =>
-    aliasesByRoot.get(comparePath(root))?.some((alias) => containsAlias(normalizedTask, alias))
+  const labels = uniqueSuffixLabels(normalizedRoots);
+  // Exact repo names and path labels outrank incidental distinctive words.
+  const specific = normalizedRoots.filter((root) => {
+    const label = labels.get(comparePath(root)) || "";
+    return containsAlias(normalizedTask, normalizeText(root)) ||
+      (label.includes("/") && containsAlias(normalizedTask, normalizeText(label)));
+  });
+  const specificBasenames = new Set(specific.map(root => normalizeText(path.basename(root))));
+  const matches = normalizedRoots.filter((root) => specific.includes(root) ||
+    (!specificBasenames.has(normalizeText(path.basename(root))) &&
+      containsAlias(normalizedTask, normalizeText(path.basename(root))))
   );
-
-  return matchedRoots.length === 1 ? matchedRoots[0] : fallback;
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) throw new Error(
+    `Ambiguous project in task: ${matches.join(", ")}. Pass project or path explicitly.`
+  );
+  const aliases = projectAliases(normalizedRoots);
+  const tokenMatches = normalizedRoots.filter((root) =>
+    aliases.get(comparePath(root))?.some((alias) => containsAlias(normalizedTask, alias))
+  );
+  if (tokenMatches.length === 1) return tokenMatches[0];
+  if (normalizedRoots.length === 1) return normalizedRoots[0];
+  throw new Error(tokenMatches.length > 1
+    ? `Ambiguous project in task: ${tokenMatches.join(", ")}. Pass project or path explicitly.`
+    : "Project not selected. Pass project or an explicit path; all configured projects are peers.");
 }
 
 export function projectAliases(roots) {
@@ -122,7 +167,7 @@ function containsAlias(normalizedTask, alias) {
 }
 
 function isAlphaNumeric(value) {
-  return Boolean(value && /[a-z0-9]/.test(value));
+  return Boolean(value && /[a-z0-9_-]/.test(value));
 }
 
 function normalizeText(value) {

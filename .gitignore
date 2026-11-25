@@ -8,7 +8,7 @@
 config.json
 
 # ---- Proprietary binaries (do NOT redistribute) ----
-tools/
+/tools/
 **/tunnel-client*.exe
 **/tunnel-client*.zip
 *.exe

@@ -2,7 +2,8 @@ export function buildRuntimeWaterfall(events = [], {
   correlationId = null,
   traceLimit = 5,
   spanLimit = 200,
-  otelEnabled = false
+  otelEnabled = false,
+  profilingEnabled = true
 } = {}) {
   const source = Array.isArray(events) ? events : [];
   const byCorrelation = new Map();
@@ -24,7 +25,8 @@ export function buildRuntimeWaterfall(events = [], {
   return {
     kind: "runtime_trace_waterfall",
     source: "RuntimeEventStore",
-    authoritative_history: "performance_follow",
+    authoritative_history: profilingEnabled ? "performance_follow" : "RuntimeEventStore",
+    performance_profiling_enabled: Boolean(profilingEnabled),
     otel_export_enabled: Boolean(otelEnabled),
     correlations: groups.length,
     groups

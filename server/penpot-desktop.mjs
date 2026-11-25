@@ -10,6 +10,7 @@ import {
 } from "./persistent-http-mcp-client.mjs";
 
 export const DEFAULT_PENPOT_MCP_URL = "http://127.0.0.1:9001/mcp/stream";
+export const DEFAULT_PENPOT_CLOUD_MCP_URL = "https://design.penpot.app/mcp/stream";
 const DEFAULT_TIMEOUT_MS = 120_000;
 const READ_ONLY_TOOLS = new Set(["high_level_overview", "penpot_api_info", "export_shape"]);
 const DESTRUCTIVE_CODE_PATTERN = /(?:\.\s*(?:remove|delete|destroy|clear|detach|unlink)\s*\(|\b(?:remove|delete|destroy|clear|detach|unlink)[A-Za-z0-9_$]*\s*\()/i;
@@ -40,7 +41,7 @@ export function penpotConnectionEndpoint(endpoint, userToken) {
 
 export function redactPenpotSecrets(message, secrets = []) {
   let redacted = String(message || "");
-  const candidates = [process.env.PENPOT_USER_TOKEN, ...secrets]
+  const candidates = [process.env.PENPOT_USER_TOKEN, process.env.PENPOT_CLOUD_USER_TOKEN, ...secrets]
     .filter((value) => typeof value === "string" && value.length > 0);
   for (const secret of candidates) redacted = redacted.replaceAll(secret, "[REDACTED]");
   return redacted.replace(/([?&]userToken=)[^\s&#]+/gi, "$1[REDACTED]");
@@ -49,10 +50,10 @@ export function redactPenpotSecrets(message, secrets = []) {
 export function friendlyPenpotError(error, endpoint = DEFAULT_PENPOT_MCP_URL, userToken = "") {
   const message = redactPenpotSecrets(error?.cause?.message || error?.message || error || "Unknown error", [userToken]);
   if (/401|403|Unauthorized|Forbidden|authentication failed/i.test(message)) {
-    return new Error("Penpot MCP rejected authentication. Create a fresh MCP user token in Penpot and update PENPOT_USER_TOKEN in .env.local.");
+    return new Error("Penpot MCP rejected authentication. Create a fresh MCP user token in Penpot and update the corresponding token in .env.local.");
   }
   if (/ECONNREFUSED|fetch failed|Failed to open SSE stream|socket hang up|timed out/i.test(message)) {
-    return new Error(`Penpot MCP is unavailable at ${normalizePenpotEndpoint(endpoint)}. Keep the local Penpot stack running and connect MCP from the active design file.`);
+    return new Error(`Penpot MCP is unavailable at ${normalizePenpotEndpoint(endpoint)}. Check the MCP connection in the active Penpot design file and ensure the endpoint is reachable.`);
   }
   return new Error(`Penpot MCP error: ${message}`);
 }
@@ -193,6 +194,7 @@ export async function inspectPenpotSelection(options = {}) {
 export async function penpotStatus(options = {}) {
   const rawEndpoint = String(options.endpoint ?? process.env.PENPOT_MCP_URL ?? DEFAULT_PENPOT_MCP_URL);
   const authConfigured = Boolean(String(options.userToken ?? process.env.PENPOT_USER_TOKEN ?? "").trim());
+  const cloud = /^https:\/\/design\.penpot\.app(?:\/|$)/i.test(rawEndpoint);
   let endpoint = rawEndpoint;
   try {
     endpoint = normalizePenpotEndpoint(rawEndpoint);
@@ -218,7 +220,10 @@ export async function penpotStatus(options = {}) {
       tools: [],
       surface: "design",
       error: mapped.message,
-      enable_steps: [
+      enable_steps: cloud ? [
+        "Open the target Penpot Cloud design file and connect its MCP server.",
+        "Set PENPOT_CLOUD_MCP_URL and PENPOT_CLOUD_USER_TOKEN in .env.local, then restart LCA."
+      ] : [
         "Keep the local Penpot Docker stack running.",
         "Open the target Penpot design file and connect its MCP server.",
         "Set PENPOT_MCP_URL and PENPOT_USER_TOKEN in .env.local, then restart LCA."

@@ -276,11 +276,19 @@ Enable Bruno Desktop MCP and configure its local bearer token. LCA exposes colle
 
 ### Penpot
 
-Run the Penpot stack, open the target design file, and connect MCP from Penpot. Keep the endpoint token-free in `PENPOT_MCP_URL` and store the generated credential separately in `PENPOT_USER_TOKEN`. The single `penpot` facade provides page/selection inspection, Plugin API lookup, PNG/SVG export, and direct drawing/edit/delete execution in trusted-local mode. Read/mutate/destructive aliases remain compatibility labels, not LCA permission gates.
+Penpot **Local and Cloud** can be connected at the same time. For local Docker, set `PENPOT_MCP_URL` and `PENPOT_USER_TOKEN`; for Penpot Cloud, set `PENPOT_CLOUD_MCP_URL=https://design.penpot.app/mcp/stream` and `PENPOT_CLOUD_USER_TOKEN`. Store secrets only in the Git-ignored `.env.local` (mode 0600), never in endpoint URLs or Git. Open the relevant design file and connect its MCP server.
+
+The `penpot` facade accepts `arguments: {source: "cloud"}` or `{source: "local"}` for any action. Omitting `source` on design operations preserves the existing **local** default; `status` without a source reports **both** connections independently. For example, `penpot({action:"inspect", arguments:{source:"cloud"}})` targets Cloud. The facade supports page/selection inspection, Plugin API lookup, PNG/SVG export, and drawing/edit/delete. Read/mutate/destructive aliases remain compatibility labels, not LCA permission gates.
 
 ### Coolify
 
 Set `COOLIFY_BASE_URL` and `COOLIFY_ACCESS_TOKEN` in `.env.local`. LCA starts the pinned `@masonator/coolify-mcp` package over local stdio and exposes it through the single `coolify` facade. All live upstream operations can execute directly in trusted-local mode; `read`, `mutate`, and `destructive` remain compatibility aliases and classification metadata rather than LCA approval barriers. Upstream Coolify roles/scopes still apply normally.
+
+### Blender
+
+LCA pins `kleer001/blender-mcp` and launches it as a persistent local stdio child. The upstream server exposes 175 typed tools across scene/object/material/shader/geometry-node/modifier/animation/rigging/physics/compositing/sculpt/UV/render/import-export domains, plus Blender Python execution. To keep the public LCA surface at 19 tools, access it through `workspace_ui`: `blender` / `blender_status`, `blender_actions`, and `blender_call`.
+
+Install and enable the pinned upstream Blender addon, then start its local MCP socket on `127.0.0.1:9334` from **View3D → Sidebar → MCP**. LCA never exposes the Blender socket beyond loopback. `BLENDER_MCP_SOURCE`, `BLENDER_MCP_HOST`, `BLENDER_MCP_PORT`, `BLENDER_MCP_TIMEOUT_MS`, and `BLENDER_MCP_UVX_BIN` can override the pinned defaults.
 
 ## Runtime trajectory, recovery, and Code Mode
 

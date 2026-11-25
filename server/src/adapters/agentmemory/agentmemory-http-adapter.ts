@@ -66,6 +66,10 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
   private readonly maxRecallCacheEntries: number;
   private readonly recallCache = new Map<string, { expiresAt: number; evidence: readonly ContextEvidence[] }>();
   private readonly recallInFlight = new Map<string, Promise<readonly ContextEvidence[]>>();
+  private readonly recallTelemetryByRoot = new Map<string, Readonly<Record<string, unknown>>>();
+  private readonly recallGenerationByProject = new Map<string, number>();
+  private recallGlobalGeneration = 0;
+  private readonly sessionProjectById = new Map<string, string>();
   private sessionProjectCache: { expiresAt: number; projects: Map<string, string> } | undefined;
 
   constructor(private readonly options: AgentMemoryHttpAdapterOptions = {}) {
@@ -73,8 +77,8 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
     this.timeoutMs = options.timeoutMs ?? 10_000;
     this.fetchImpl = options.fetch ?? fetch;
     this.projectId = options.projectId ?? defaultProjectId;
-    this.recallCacheTtlMs = Math.max(0, options.recallCacheTtlMs ?? 5_000);
-    this.maxRecallCacheEntries = Math.max(1, options.maxRecallCacheEntries ?? 64);
+    this.recallCacheTtlMs = Math.max(0, options.recallCacheTtlMs ?? 90_000);
+    this.maxRecallCacheEntries = Math.max(1, options.maxRecallCacheEntries ?? 256);
   }
 
   projectForRoot(root: string): string {
@@ -98,7 +102,10 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
       method: "POST",
       body: JSON.stringify(input)
     });
-    this.invalidateRecallCache(input.project);
+    // Creating an empty session must not discard another session's reusable
+    // project results. Observations and durable decisions are written separately.
+    this.sessionProjectById.set(input.sessionId, input.project);
+    this.sessionProjectCache = undefined;
   }
 
   async observe(input: AgentMemoryObservationInput): Promise<void> {
@@ -106,7 +113,15 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
       method: "POST",
       body: JSON.stringify(input)
     });
-    this.invalidateRecallCache(input.project);
+    // Read-only tool observations are still persisted as session history, but
+    // do not immediately invalidate a project query cache. The short TTL
+    // bounds how long newly observed read metadata may be absent from a hit.
+    const readOnlyTools = new Set(["workspace_context", "workspace_read", "workspace_search", "workspace_status"]);
+    if (!(input.hookType === "post_tool_use"
+      && readOnlyTools.has(String(input.data.tool_name ?? ""))
+      && input.data.success === true)) {
+      this.invalidateRecallCache(input.project);
+    }
   }
 
   async remember(input: AgentMemoryRememberInput): Promise<void> {
@@ -122,35 +137,64 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
       method: "POST",
       body: JSON.stringify({ sessionId })
     });
-    this.recallCache.clear();
-    this.recallInFlight.clear();
+    // Session closure may produce a new session summary. Refresh this project,
+    // but leave unrelated project caches and all persisted memories untouched.
+    const project = this.sessionProjectById.get(sessionId);
+    this.sessionProjectById.delete(sessionId);
+    this.invalidateRecallCache(project);
     this.sessionProjectCache = undefined;
   }
 
   async recall(request: TaskContextRequest): Promise<readonly ContextEvidence[]> {
+    const normalizedRoot = path.resolve(request.root);
     const project = this.projectId(request.root);
     const sessionId = await this.options.sessionIdForRoot?.(request.root);
-    const cacheKey = this.recallCacheKey(request, project, sessionId);
+    const cacheKey = this.recallCacheKey(request, project);
+    const projectGeneration = this.recallGenerationByProject.get(project) ?? 0;
+    const globalGeneration = this.recallGlobalGeneration;
     const now = this.options.now?.() ?? Date.now();
     const cached = this.recallCache.get(cacheKey);
     if (cached && cached.expiresAt > now) {
       this.touchRecallCache(cacheKey, cached);
+      this.recallTelemetryByRoot.set(normalizedRoot, {
+        cache_hit: true,
+        cache_layer: "agentmemory-project-query"
+      });
       return markMemoryCacheHit(cached.evidence);
     }
     const pending = this.recallInFlight.get(cacheKey);
-    if (pending) return markMemoryCacheHit(await pending);
+    if (pending) {
+      this.recallTelemetryByRoot.set(normalizedRoot, {
+        cache_hit: true,
+        cache_layer: "agentmemory-project-query-inflight"
+      });
+      return markMemoryCacheHit(await pending);
+    }
 
     const operation = this.recallFresh(request, project, sessionId);
     this.recallInFlight.set(cacheKey, operation);
     try {
       const evidence = await operation;
-      if (this.recallCacheTtlMs > 0) {
-        this.storeRecallCache(cacheKey, { expiresAt: now + this.recallCacheTtlMs, evidence });
+      if (this.recallCacheTtlMs > 0
+        && globalGeneration === this.recallGlobalGeneration
+        && projectGeneration === (this.recallGenerationByProject.get(project) ?? 0)) {
+        this.storeRecallCache(cacheKey, {
+          expiresAt: (this.options.now?.() ?? Date.now()) + this.recallCacheTtlMs,
+          evidence
+        });
       }
-      return evidence;
+      this.recallTelemetryByRoot.set(normalizedRoot, {
+        cache_hit: false,
+        cache_layer: "agentmemory-project-query"
+      });
+      return markMemoryCacheMiss(evidence);
     } finally {
-      this.recallInFlight.delete(cacheKey);
+      if (this.recallInFlight.get(cacheKey) === operation) this.recallInFlight.delete(cacheKey);
     }
+  }
+
+  telemetry(root: string): Readonly<Record<string, unknown>> | undefined {
+    return this.recallTelemetryByRoot.get(path.resolve(root));
   }
 
   private async recallFresh(
@@ -202,15 +246,14 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
     return ranked.items.map((entry, index) => toEvidence(entry, index, project, maxCharsPerItem, telemetry));
   }
 
-  private recallCacheKey(request: TaskContextRequest, project: string, sessionId?: string): string {
-    const changed = [...(request.changedFiles ?? [])].map((file) => path.resolve(request.root, file)).sort();
+  private recallCacheKey(request: TaskContextRequest, project: string): string {
+    // Session IDs, intent and changed files do not filter AgentMemory's
+    // smart-search results. Keeping them in this key fragmented reuse across
+    // sessions and edits even when the effective search was identical.
     return [
       project,
-      sessionId ?? "",
-      request.intent ?? "",
       request.task.trim(),
-      changed.join("\u001f"),
-      String(request.budget?.maxItems ?? ""),
+      String(Math.max(1, Math.min(50, request.budget?.maxItems ?? 12))),
       String(request.budget?.maxChars ?? "")
     ].join("\u0000");
   }
@@ -238,10 +281,12 @@ export class AgentMemoryHttpAdapter implements MemoryPort {
 
   private invalidateRecallCache(project?: string): void {
     if (!project) {
+      this.recallGlobalGeneration += 1;
       this.recallCache.clear();
       this.recallInFlight.clear();
       return;
     }
+    this.recallGenerationByProject.set(project, (this.recallGenerationByProject.get(project) ?? 0) + 1);
     const prefix = `${project}\u0000`;
     for (const key of this.recallCache.keys()) {
       if (key.startsWith(prefix)) this.recallCache.delete(key);
@@ -376,7 +421,18 @@ function markMemoryCacheHit(evidence: readonly ContextEvidence[]): readonly Cont
     metadata: {
       ...(item.metadata ?? {}),
       cache_hit: true,
-      cache_layer: "agentmemory-exact-query"
+      cache_layer: "agentmemory-project-query"
+    }
+  }));
+}
+
+function markMemoryCacheMiss(evidence: readonly ContextEvidence[]): readonly ContextEvidence[] {
+  return evidence.map((item) => ({
+    ...item,
+    metadata: {
+      ...(item.metadata ?? {}),
+      cache_hit: false,
+      cache_layer: "agentmemory-project-query"
     }
   }));
 }

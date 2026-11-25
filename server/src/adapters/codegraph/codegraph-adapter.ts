@@ -39,6 +39,7 @@ export interface CodeGraphIndexer {
 export interface CodeGraphAdapterOptions {
   client: PersistentMcpToolClient;
   indexer: CodeGraphIndexer;
+  rootRevision?: (root: string) => { token: string; cacheable: boolean };
 }
 
 interface CodeGraphRoute {
@@ -51,7 +52,13 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
   private readonly revisionByRoot = new Map<string, string | null>();
   private readonly cache = new Map<string, readonly ContextEvidence[]>();
   private readonly inFlight = new Map<string, Promise<readonly ContextEvidence[]>>();
+  private readonly stageCache = new Map<string, string>();
+  private readonly stageInFlight = new Map<string, Promise<string>>();
+  private readonly cacheEpochByRoot = new Map<string, number>();
   private readonly telemetryByRoot = new Map<string, Readonly<Record<string, unknown>>>();
+  private readonly workspaceRevisionByRoot = new Map<string, string>();
+  private readonly indexInFlightByRoot = new Map<string, { token: string | null; promise: Promise<CodeGraphIndexReceipt> }>();
+  private readonly prewarmedRoots = new Set<string>();
 
   constructor(private readonly options: CodeGraphAdapterOptions) {}
 
@@ -59,14 +66,86 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     const normalizedRoot = path.resolve(root);
     const previousRevision = this.revisionByRoot.get(normalizedRoot);
     const startedAt = performance.now();
-    const receipt = await this.options.indexer.ensureIndexed(normalizedRoot, changedFiles);
-    this.mergeTelemetry(normalizedRoot, {
-      index_ms: elapsedMs(startedAt),
-      index_synced: receipt.synced
-    });
-    this.revisionByRoot.set(normalizedRoot, receipt.revision);
-    if ((changedFiles.length > 0 && receipt.synced) || previousRevision !== undefined && previousRevision !== receipt.revision) {
-      this.evictRoot(normalizedRoot);
+    const workspaceRevisionBefore = this.options.rootRevision?.(normalizedRoot);
+    const relevantChangedFiles = codeGraphRelevantChangedFiles(changedFiles);
+    if (previousRevision !== undefined && changedFiles.length > 0 && relevantChangedFiles.length === 0) {
+      if (workspaceRevisionBefore?.cacheable) {
+        this.workspaceRevisionByRoot.set(normalizedRoot, workspaceRevisionBefore.token);
+      }
+      this.mergeTelemetry(normalizedRoot, {
+        index_ms: elapsedMs(startedAt),
+        index_synced: false,
+        index_cache_hit: true,
+        index_skip_reason: "non_graph_changes"
+      });
+      return;
+    }
+    if (
+      relevantChangedFiles.length === 0 &&
+      workspaceRevisionBefore?.cacheable &&
+      previousRevision !== undefined &&
+      this.workspaceRevisionByRoot.get(normalizedRoot) === workspaceRevisionBefore.token
+    ) {
+      this.mergeTelemetry(normalizedRoot, {
+        index_ms: elapsedMs(startedAt),
+        index_synced: false,
+        index_cache_hit: true,
+        index_skip_reason: "workspace_revision_unchanged"
+      });
+      return;
+    }
+    const pending = this.indexInFlightByRoot.get(normalizedRoot);
+    if (pending) {
+      const sameRevision = Boolean(
+        workspaceRevisionBefore?.cacheable
+        && pending.token !== null
+        && pending.token === workspaceRevisionBefore.token
+      );
+      await pending.promise;
+      if (sameRevision) {
+        this.mergeTelemetry(normalizedRoot, {
+          index_ms: elapsedMs(startedAt),
+          index_synced: false,
+          index_cache_hit: true,
+          index_skip_reason: "inflight_join"
+        });
+        return;
+      }
+      return this.ensureIndexed(normalizedRoot, changedFiles);
+    }
+
+    const token = workspaceRevisionBefore?.cacheable ? workspaceRevisionBefore.token : null;
+    const operation = (async () => {
+      const receipt = await this.options.indexer.ensureIndexed(normalizedRoot, relevantChangedFiles);
+      this.revisionByRoot.set(normalizedRoot, receipt.revision);
+      const workspaceRevisionAfter = this.options.rootRevision?.(normalizedRoot);
+      if (
+        workspaceRevisionBefore?.cacheable &&
+        workspaceRevisionAfter?.cacheable &&
+        workspaceRevisionBefore.token === workspaceRevisionAfter.token
+      ) {
+        this.workspaceRevisionByRoot.set(normalizedRoot, workspaceRevisionAfter.token);
+      } else {
+        this.workspaceRevisionByRoot.delete(normalizedRoot);
+      }
+      if ((relevantChangedFiles.length > 0 && receipt.synced) || previousRevision !== undefined && previousRevision !== receipt.revision) {
+        this.evictRoot(normalizedRoot);
+      }
+      return receipt;
+    })();
+    this.indexInFlightByRoot.set(normalizedRoot, { token, promise: operation });
+    try {
+      const receipt = await operation;
+      this.mergeTelemetry(normalizedRoot, {
+        index_ms: elapsedMs(startedAt),
+        index_synced: receipt.synced,
+        index_cache_hit: false,
+        index_skip_reason: undefined
+      });
+    } finally {
+      if (this.indexInFlightByRoot.get(normalizedRoot)?.promise === operation) {
+        this.indexInFlightByRoot.delete(normalizedRoot);
+      }
     }
   }
 
@@ -74,9 +153,17 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     const normalizedRoot = path.resolve(root);
     const startedAt = performance.now();
     await this.ensureIndexed(normalizedRoot);
+    if (this.prewarmedRoots.has(normalizedRoot)) {
+      this.mergeTelemetry(normalizedRoot, {
+        prewarm_ms: elapsedMs(startedAt),
+        prewarm_cache_hit: true
+      });
+      return;
+    }
     const result = await this.options.client.callTool("codegraph_status", { projectPath: normalizedRoot });
     if (result.isError) throw new Error(extractText(result) || "CodeGraph status prewarm failed.");
-    this.mergeTelemetry(normalizedRoot, { prewarm_ms: elapsedMs(startedAt) });
+    this.prewarmedRoots.add(normalizedRoot);
+    this.mergeTelemetry(normalizedRoot, { prewarm_ms: elapsedMs(startedAt), prewarm_cache_hit: false });
   }
 
   telemetry(root: string): Readonly<Record<string, unknown>> | undefined {
@@ -86,8 +173,14 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
   close(): Promise<void> {
     this.cache.clear();
     this.inFlight.clear();
+    this.stageCache.clear();
+    this.stageInFlight.clear();
+    this.cacheEpochByRoot.clear();
     this.revisionByRoot.clear();
     this.telemetryByRoot.clear();
+    this.workspaceRevisionByRoot.clear();
+    this.indexInFlightByRoot.clear();
+    this.prewarmedRoots.clear();
     return this.options.client.close();
   }
 
@@ -97,6 +190,7 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     const route = routeCodeGraphRequest(request, projectPath);
     const revision = this.revisionByRoot.get(projectPath) ?? null;
     const cacheKey = revision ? this.cacheKey(projectPath, revision, route) : null;
+    const cacheEpoch = this.cacheEpochByRoot.get(projectPath) ?? 0;
 
     if (cacheKey) {
       const cached = this.cache.get(cacheKey);
@@ -124,11 +218,13 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     this.inFlight.set(cacheKey, operation);
     try {
       const evidence = await operation;
-      this.storeCache(cacheKey, evidence);
-      this.recordContextTelemetry(projectPath, route, startedAt, false);
+      if ((this.cacheEpochByRoot.get(projectPath) ?? 0) === cacheEpoch) {
+        this.storeCache(cacheKey, evidence);
+      }
+      this.recordContextTelemetry(projectPath, route, startedAt, false, Number(evidence[0]?.metadata?.stage_cache_hits ?? 0));
       return evidence;
     } finally {
-      this.inFlight.delete(cacheKey);
+      if (this.inFlight.get(cacheKey) === operation) this.inFlight.delete(cacheKey);
     }
   }
 
@@ -160,25 +256,25 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
       mode: "search",
       args: { query: primary, limit, projectPath }
     };
-    const search = await this.callRoute(searchRoute);
+    const search = await this.callRoute(searchRoute, revision);
     const escalationPath: string[] = ["search"];
     if (relationshipSignal(search.content) >= 3) {
-      return this.evidenceFromContent(request, projectPath, revision, searchRoute, search.content, escalationPath);
+      return this.evidenceFromContent(request, projectPath, revision, searchRoute, search.content, escalationPath, Number(search.cacheHit));
     }
 
     if (!isEmptyGraphResult(search.content)) {
       const relationRoute = stagedRelationRoute(request, primary, projectPath, limit);
       escalationPath.push(relationRoute.mode);
-      const relation = await this.callRoute(relationRoute);
+      const relation = await this.callRoute(relationRoute, revision);
       if (relationshipSignal(relation.content) >= 2) {
-        return this.evidenceFromContent(request, projectPath, revision, relationRoute, relation.content, escalationPath);
+        return this.evidenceFromContent(request, projectPath, revision, relationRoute, relation.content, escalationPath, Number(search.cacheHit) + Number(relation.cacheHit));
       }
     }
 
     escalationPath.push("deep");
-    const deep = await this.callRoute(deepRoute);
+    const deep = await this.callRoute(deepRoute, revision);
     if (!deep.content.trim()) return [];
-    return this.evidenceFromContent(request, projectPath, revision, deepRoute, deep.content, escalationPath);
+    return this.evidenceFromContent(request, projectPath, revision, deepRoute, deep.content, escalationPath, Number(search.cacheHit) + Number(deep.cacheHit));
   }
 
   private async executeSingleRoute(
@@ -188,15 +284,46 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     route: CodeGraphRoute,
     escalationPath: readonly string[]
   ): Promise<readonly ContextEvidence[]> {
-    const result = await this.callRoute(route);
+    const result = await this.callRoute(route, revision);
     if (!result.content.trim()) return [];
-    return this.evidenceFromContent(request, projectPath, revision, route, result.content, escalationPath);
+    return this.evidenceFromContent(request, projectPath, revision, route, result.content, escalationPath, Number(result.cacheHit));
   }
 
-  private async callRoute(route: CodeGraphRoute): Promise<{ content: string }> {
-    const result = await this.options.client.callTool(route.tool, route.args);
-    if (result.isError) throw new Error(extractText(result) || `CodeGraph ${route.tool} failed.`);
-    return { content: extractText(result).trim() };
+  private async callRoute(route: CodeGraphRoute, revision: string | null): Promise<{ content: string; cacheHit: boolean }> {
+    const root = path.resolve(String(route.args.projectPath));
+    const key = revision ? this.cacheKey(root, revision, route) : null;
+    if (key) {
+      const cached = this.stageCache.get(key);
+      if (cached !== undefined) {
+        this.stageCache.delete(key);
+        this.stageCache.set(key, cached);
+        return { content: cached, cacheHit: true };
+      }
+      const pending = this.stageInFlight.get(key);
+      if (pending) return { content: await pending, cacheHit: true };
+    }
+    const epoch = this.cacheEpochByRoot.get(root) ?? 0;
+    const operation = (async () => {
+      const result = await this.options.client.callTool(route.tool, route.args);
+      if (result.isError) throw new Error(extractText(result) || `CodeGraph ${route.tool} failed.`);
+      return extractText(result).trim();
+    })();
+    if (key) this.stageInFlight.set(key, operation);
+    try {
+      const content = await operation;
+      if (key && this.revisionByRoot.get(root) === revision && (this.cacheEpochByRoot.get(root) ?? 0) === epoch) {
+        this.stageCache.delete(key);
+        this.stageCache.set(key, content);
+        while (this.stageCache.size > 256) {
+          const oldest = this.stageCache.keys().next().value;
+          if (oldest === undefined) break;
+          this.stageCache.delete(oldest);
+        }
+      }
+      return { content, cacheHit: false };
+    } finally {
+      if (key && this.stageInFlight.get(key) === operation) this.stageInFlight.delete(key);
+    }
   }
 
   private evidenceFromContent(
@@ -205,7 +332,8 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     revision: string | null,
     route: CodeGraphRoute,
     content: string,
-    escalationPath: readonly string[]
+    escalationPath: readonly string[],
+    stageCacheHits = 0
   ): readonly ContextEvidence[] {
     const compacted = compactCodeGraphContent(content, route.mode);
     const providerCap = route.mode === "deep" ? 6_000 : 4_000;
@@ -223,6 +351,7 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
         mode: route.mode,
         revision,
         cache_hit: false,
+        stage_cache_hits: stageCacheHits,
         cold_router_v2: escalationPath.length > 1,
         escalation_path: escalationPath,
         source_omitted: compacted.sourceOmitted,
@@ -231,11 +360,12 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
     }];
   }
 
-  private recordContextTelemetry(root: string, route: CodeGraphRoute, startedAt: number, cacheHit: boolean): void {
+  private recordContextTelemetry(root: string, route: CodeGraphRoute, startedAt: number, cacheHit: boolean, stageCacheHits = 0): void {
     this.mergeTelemetry(root, {
       query_ms: elapsedMs(startedAt),
       route: route.mode,
-      cache_hit: cacheHit
+      cache_hit: cacheHit,
+      stage_cache_hits: stageCacheHits
     });
   }
 
@@ -267,11 +397,18 @@ export class CodeGraphAdapter implements CodeIntelligencePort {
   }
 
   private evictRoot(root: string): void {
+    this.cacheEpochByRoot.set(root, (this.cacheEpochByRoot.get(root) ?? 0) + 1);
     for (const key of this.cache.keys()) {
       if (key.startsWith(`${root}\u0000`)) this.cache.delete(key);
     }
     for (const key of this.inFlight.keys()) {
       if (key.startsWith(`${root}\u0000`)) this.inFlight.delete(key);
+    }
+    for (const key of this.stageCache.keys()) {
+      if (key.startsWith(`${root}\u0000`)) this.stageCache.delete(key);
+    }
+    for (const key of this.stageInFlight.keys()) {
+      if (key.startsWith(`${root}\u0000`)) this.stageInFlight.delete(key);
     }
   }
 }
@@ -360,7 +497,9 @@ export class CodeGraphCliIndexer implements CodeGraphIndexer {
   }
 }
 
-export function createDefaultCodeGraphAdapter(): CodeGraphAdapter {
+export function createDefaultCodeGraphAdapter(options: {
+  rootRevision?: (root: string) => { token: string; cacheable: boolean };
+} = {}): CodeGraphAdapter {
   const packageJson = require.resolve("@colbymchenry/codegraph/package.json");
   const shimPath = path.join(path.dirname(packageJson), "npm-shim.js");
   const command = process.execPath;
@@ -380,7 +519,8 @@ export function createDefaultCodeGraphAdapter(): CodeGraphAdapter {
 
   return new CodeGraphAdapter({
     client,
-    indexer: new CodeGraphCliIndexer({ command, prefixArgs })
+    indexer: new CodeGraphCliIndexer({ command, prefixArgs }),
+    ...(options.rootRevision ? { rootRevision: options.rootRevision } : {})
   });
 }
 
@@ -550,6 +690,16 @@ function stableStringify(value: Readonly<Record<string, unknown>>): string {
 
 function shortHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+export function codeGraphRelevantChangedFiles(changedFiles: readonly string[]): readonly string[] {
+  return changedFiles.filter((file) => !isDefinitelyNonGraphFile(file));
+}
+
+function isDefinitelyNonGraphFile(file: string): boolean {
+  const normalized = file.replaceAll("\\", "/").toLowerCase();
+  if (/(?:^|\/)(?:\.git|\.codegraph|\.agent\/state|runtime\/agentmemory)(?:\/|$)/.test(normalized)) return true;
+  return /\.(?:md|mdx|rst|adoc|txt|log|png|jpe?g|gif|webp|ico|pdf|woff2?|ttf|otf|mp3|wav|mp4|mov|webm)$/i.test(normalized);
 }
 
 export async function changedFilesRevisionToken(root: string, changedFiles: readonly string[]): Promise<string> {

@@ -1,6 +1,10 @@
 # Local Browser Agent
 
-Local Browser Agent is a Chromium visual-review, Cheerio-scraping, and control connector for ChatGPT and other MCP clients. It combines a loopback MCP server with a Manifest V3 extension to capture screenshots, sanitized live HTML, DOM snapshots, computed CSS, box geometry, console output, network metadata, performance metrics, accessibility state, and observable DevTools state from a user-approved tab. It can also navigate, inspect, click, hover, focus, type, press keys, scroll, select options, query page markup with Cheerio, and click the Nth scraped match.
+The browser sidecar now uses **browser-use/jev-ultrafast + Browser Harness** as its default agent/control path while preserving the existing loopback MCP endpoint on port 8791. That keeps the LCA-facing contract stable: the browser sidecar can be rebuilt/restarted independently without restarting the main LCA process.
+
+`browser_agent` runs a natural-language goal through Jev Ultrafast. Browser Harness owns the CDP/browser session and exposes direct browser primitives through `browser_harness_call`. LCA should resolve test-case input data first and pass it as `inputValues` (for example `{"email":"qa@example.com","search":"promo"}`). Jev chooses the field/action, while the actual text comes deterministically from those supplied values. A separate text-model API key is not required. In `LBA_BROWSER_MODE=auto`, the sidecar first attempts the user's remote-debug-enabled Chromium session; if that is unavailable it automatically starts a persistent isolated headless Chrome profile on port 9223.
+
+The previous Manifest V3 extension/CDP implementation remains available as a **diagnostic fallback** for rich captures such as sanitized HTML, DOM snapshots, computed CSS, box geometry, console output, network metadata, performance metrics, accessibility state, and observable DevTools state.
 
 ## Current milestone
 
@@ -14,7 +18,10 @@ The repository starts with a technical-spike architecture:
 - Chrome DevTools Protocol capture and trusted input automation;
 - a DevTools companion path that coexists with another coding extension;
 - full-screen review bundles containing screenshot, sanitized `page.html`, DOM, computed styles, layout and debug signals;
-- server-side Cheerio selectors, extraction, stable selector generation, and scrape-then-click actions.
+- server-side Cheerio selectors, extraction, stable selector generation, and scrape-then-click actions;
+- Browser Harness MCP as the default browser transport;
+- Jev Ultrafast for low-latency observed-element action selection;
+- isolated-browser fallback so normal browser automation does not require enabling remote debugging on the user's main Chrome profile.
 
 ## Quick start
 
@@ -26,7 +33,9 @@ lba start --background --no-tunnel
 lba pairing
 ```
 
-Load `apps/extension/dist` as an unpacked extension in Chromium, enter the pairing code, then choose **Allow full control for active tab**. Approval follows that tab across HTTP/HTTPS navigation for eight hours and is revoked when the tab closes.
+For Jev/Browser Harness automation, the extension is not required. With `LBA_BROWSER_MODE=auto`, Browser Harness uses a remote-debug-enabled real Chromium session when available and otherwise starts the isolated persistent browser profile automatically.
+
+Load `apps/extension/dist` only when legacy rich capture/review/debugging is needed. The extension bridge remains compatible with the same sidecar.
 
 Full setup instructions are in [`docs/SETUP.md`](docs/SETUP.md). Security boundaries and residual risks are documented in [`SECURITY.md`](SECURITY.md).
 
@@ -56,6 +65,9 @@ This is not a browser sandbox. The `debugger` permission is powerful and should 
 
 - `browser_status`
 - `browser_list_tabs`
+- `browser_agent` — Jev Ultrafast natural-language browser goal
+- `browser_harness_actions` — live Browser Harness tool catalog
+- `browser_harness_call` — direct Browser Harness primitive/CDP access
 - `browser_capture`
 - `browser_review`
 - `browser_scrape`
@@ -67,6 +79,16 @@ This is not a browser sandbox. The `debugger` permission is powerful and should 
 - `browser_capture_delete`
 
 Capture artifacts are also available through `browser://capture/{captureId}/{artifact}` MCP resources.
+
+## Restart behavior
+
+The LCA main process talks to this sidecar over `http://127.0.0.1:8791/mcp`. Browser tools are discovered dynamically, so changing/rebuilding the sidecar does **not** require an LCA restart. Restart only the sidecar when TypeScript code changes.
+
+Jev credentials are re-read from the parent repository's `.env.local` for each `browser_agent` call. Adding or rotating `JEV_API_TOKEN` or `TYPESAFE_API_KEY` therefore does not require restarting LCA or the browser sidecar.
+
+There is no separate text model. If Jev chooses `TYPE_TEXT`, the runner matches the selected field against caller-provided `inputValues` using exact/normalized field labels and deterministic label matching. If LCA did not provide the required value, the action fails explicitly instead of generating or guessing text.
+
+Jev Ultrafast is pinned to a tested Git commit and runs under Python 3.12. Browser Harness is pinned to 0.1.13.
 
 ## UI review workflow
 

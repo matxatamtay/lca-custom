@@ -5,6 +5,16 @@ import { BridgeServer } from "../bridge/bridge-server.js";
 import { ArtifactStore } from "../captures/artifact-store.js";
 import { scrapeHtml, selectScrapeMatch } from "../scrape/cheerio-scrape.js";
 import { audit } from "../security/audit.js";
+import {
+  browserHarnessStatus,
+  browserMcpStatus,
+  callBrowserHarnessTool,
+  callBrowserMcpTool,
+  jevRuntimeStatus,
+  listBrowserHarnessTools,
+  listBrowserMcpTools,
+  runJevBrowserAgent
+} from "../jev/jev-browser.js";
 import { redactDeep } from "../security/redaction.js";
 import {
   BrowserActionSchema,
@@ -30,7 +40,7 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
     { name: "Local Browser Agent", version: VERSION },
     {
       instructions:
-        "Chromium visual review, Cheerio scraping, and control agent for a trusted local runtime. Start with browser_status and browser_list_tabs. Use browser_review for screenshot, HTML, DOM, computed CSS, layout, console, network, performance, accessibility, and DevTools state. Use browser_scrape to query the live page markup with Cheerio selectors, and browser_click_match to select the Nth Cheerio match and click it with trusted CDP input when available. Ordinary HTTP/HTTPS tabs are directly controllable without a per-tab approval round-trip. Read browser://capture/{captureId}/{artifact} resources or call browser_capture_read for large artifacts."
+        "Jev Ultrafast + Browser Harness is the default browser-agent path. Browser MCP is kept as a persistent sidecar for the user's already-authenticated browser tab: use browser_mcp_call for Browser MCP snapshot/click/type/screenshot operations. Use browser_agent for a natural-language browser goal, browser_list_tabs for Browser Harness tabs, and browser_harness_call for raw Browser Harness helpers. Legacy extension capture/review/debug tools remain available as a fallback for rich diagnostics. Read browser://capture/{captureId}/{artifact} resources or call browser_capture_read for large legacy capture artifacts."
     }
   );
 
@@ -55,27 +65,106 @@ export function createBrowserMcpServer(bridge: BridgeServer, artifacts: Artifact
 
   register(mcp, "browser_status", {
     title: "Browser status",
-    description: "Return local bridge state and connected Chromium extension capabilities.",
+    description: "Return Jev Ultrafast, Browser Harness, and legacy extension fallback state.",
     inputSchema: {}
-  }, async () => ({
-    version: VERSION,
-    bridge: bridge.status(),
-    capturePolicy: {
-      readOnly: false,
-      fullTabControl: true,
-      approvalScope: "trusted-local automatic HTTP/HTTPS tab control",
-      bodiesDefault: "none",
-      redactionDefault: true,
-      incognitoDefault: false
-    }
-  }));
+  }, async () => {
+    const [harness, browserMcp, agent] = await Promise.all([
+      browserHarnessStatus(),
+      browserMcpStatus(),
+      jevRuntimeStatus()
+    ]);
+    return {
+      version: VERSION,
+      provider: "jev-ultrafast",
+      agent: {
+        name: "browser-use/jev-ultrafast",
+        ...agent
+      },
+      harness,
+      browserMcp,
+      legacyFallback: {
+        enabled: true,
+        bridge: bridge.status(),
+        purpose: "rich capture/review/debug fallback"
+      },
+      restartPolicy: {
+        lcaRestartRequired: false,
+        browserSidecarIsolated: true
+      }
+    };
+  });
 
   register(mcp, "browser_list_tabs", {
     title: "List browser tabs",
-    description: "List HTTP/HTTPS tabs available for visual capture and browser control in trusted-local mode.",
+    description: "List browser tabs through Browser Harness; falls back to the legacy Chromium extension only if Harness is unavailable.",
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
     inputSchema: {}
-  }, async () => await bridge.sendCommand("listTabs"));
+  }, async () => {
+    try {
+      const tabs = await callBrowserHarnessTool("browser_list_tabs");
+      return { tabs: Array.isArray(tabs) ? tabs : tabs };
+    } catch (error) {
+      const legacy = bridge.status();
+      if ((legacy as any)?.connected) return { tabs: await bridge.sendCommand("listTabs") };
+      throw error;
+    }
+  });
+
+  register(mcp, "browser_agent", {
+    title: "Run Jev Ultrafast browser agent",
+    description: "Run one natural-language goal through browser-use/jev-ultrafast on Browser Harness. Jev selects operations and observed targets. For typing, LCA must pass deterministic pre-resolved values in inputValues; no text-generation model or TEXT_MODEL_API_KEY is used. The resulting tab stays open by default.",
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    inputSchema: {
+      url: z.string().min(1).max(20_000),
+      goal: z.string().min(1).max(20_000),
+      inputValues: z.record(z.string().max(20_000)).refine((value) => Object.keys(value).length <= 100).optional(),
+      keepOpen: z.boolean().optional(),
+      maxSteps: z.number().int().min(1).max(50).optional(),
+      timeoutMs: z.number().int().min(5_000).max(600_000).optional()
+    }
+  }, async ({ url, goal, inputValues = {}, keepOpen = true, maxSteps = 20, timeoutMs = 180_000 }) => {
+    return await runJevBrowserAgent({ url, goal, inputValues, keepOpen, maxSteps, timeoutMs });
+  });
+
+  register(mcp, "browser_harness_actions", {
+    title: "List Browser Harness actions",
+    description: "List the live browser_* tools exposed by the pinned Browser Harness MCP sidecar.",
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    inputSchema: { refresh: z.boolean().optional() }
+  }, async ({ refresh = false }) => ({ tools: await listBrowserHarnessTools(refresh) }));
+
+  register(mcp, "browser_harness_call", {
+    title: "Call Browser Harness action",
+    description: "Call one raw browser_* Browser Harness MCP tool. Use this for direct CDP, JS, tab, screenshot, navigation, upload, or input primitives when browser_agent is not the right abstraction.",
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    inputSchema: {
+      tool: z.string().regex(/^browser_[a-z0-9_]+$/i),
+      arguments: z.record(z.unknown()).optional()
+    }
+  }, async ({ tool, arguments: args = {} }) => ({
+    tool,
+    result: await callBrowserHarnessTool(tool, args)
+  }));
+
+  register(mcp, "browser_mcp_actions", {
+    title: "List Browser MCP actions",
+    description: "List the browser_* tools exposed by the persistent @browsermcp/mcp sidecar connected to the user's selected browser tab.",
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    inputSchema: { refresh: z.boolean().optional() }
+  }, async ({ refresh = false }) => ({ tools: await listBrowserMcpTools(refresh) }));
+
+  register(mcp, "browser_mcp_call", {
+    title: "Call Browser MCP action",
+    description: "Call one raw browser_* Browser MCP tool against the user's selected authenticated browser tab. The Browser MCP server remains alive across calls so the extension and selected tab do not disconnect between review steps.",
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+    inputSchema: {
+      tool: z.string().regex(/^browser_[a-z0-9_]+$/i),
+      arguments: z.record(z.unknown()).optional()
+    }
+  }, async ({ tool, arguments: args = {} }) => ({
+    tool,
+    result: await callBrowserMcpTool(tool, args)
+  }));
 
   register(mcp, "browser_capture", {
     title: "Capture browser context",

@@ -89,3 +89,26 @@ test("Penpot status and errors never reveal the user token", async () => {
   assert.equal(redactPenpotSecrets("failed ?userToken=top-secret-token", ["top-secret-token"]), "failed ?userToken=[REDACTED]");
   assert.doesNotMatch(friendlyPenpotError(new Error("401 top-secret-token"), status.endpoint, "top-secret-token").message, /top-secret-token/);
 });
+
+test("Penpot Cloud uses a separate authenticated HTTPS endpoint without token leakage", async () => {
+  const endpoint = "https://design.penpot.app/mcp/stream";
+  const token = "cloud-secret-token";
+  const url = penpotConnectionEndpoint(endpoint, token);
+  assert.equal(normalizePenpotEndpoint(url), endpoint);
+  assert.equal(new URL(url).searchParams.get("userToken"), token);
+  const status = await penpotStatus({ client: fakeClient(), endpoint, userToken: token });
+  assert.equal(status.connected, true);
+  assert.equal(status.endpoint, endpoint);
+  assert.equal(status.transport_secure, true);
+  assert.doesNotMatch(JSON.stringify(status), /cloud-secret-token/);
+  assert.equal(redactPenpotSecrets(`failed ${url}`, [token]), `failed ${endpoint}?userToken=[REDACTED]`);
+});
+
+test("Missing Cloud credential produces Cloud-specific recovery instructions", async () => {
+  const status = await penpotStatus({ endpoint: "https://design.penpot.app/mcp/stream", userToken: "" });
+  assert.equal(status.connected, false);
+  assert.equal(status.auth_configured, false);
+  assert.match(status.error, /PENPOT_USER_TOKEN is required/);
+  assert.match(status.enable_steps.join(" "), /PENPOT_CLOUD_USER_TOKEN/);
+  assert.doesNotMatch(status.enable_steps.join(" "), /Docker/);
+});

@@ -13,6 +13,13 @@ import { selectBackupRetention } from "./runtime-recovery.mjs";
 
 export function createPatchCore(options) {
   const { BACKUPS_DIR, PATCH_HISTORY_PATH, editTransaction, isoNow, resolvePath, toRel, transactionJournal } = options;
+  let historyQueue = Promise.resolve();
+  function withHistoryLock(operation) {
+    const pending = historyQueue.then(operation, operation);
+    historyQueue = pending.catch(() => {});
+    return pending;
+  }
+
   const runEdit = (paths, operation) => editTransaction?.run
     ? editTransaction.run(paths, operation)
     : operation({ paths, preState: new Map() });
@@ -292,7 +299,7 @@ export function createPatchCore(options) {
 
   async function writePatchHistory(history) {
     await mkdir(path.dirname(PATCH_HISTORY_PATH), { recursive: true });
-    await writeFile(PATCH_HISTORY_PATH, JSON.stringify(history, null, 2), "utf8");
+    await writeFileAtomic(PATCH_HISTORY_PATH, JSON.stringify(history, null, 2));
   }
 
   async function createBackupBatch(tool, filePaths) {
@@ -322,23 +329,31 @@ export function createPatchCore(options) {
     }
 
     const record = { id: batchId, ts: isoNow(), tool, batchDir, files };
-    const history = await readPatchHistory();
-    history.push(record);
-    await writePatchHistory(history);
+    await withHistoryLock(async () => {
+      const history = await readPatchHistory();
+      history.push(record);
+      await writePatchHistory(history);
+    });
     await pruneBackupHistory(50);
     return record;
   }
 
   async function discardBackupBatch(batch) {
     if (!batch?.id) return { ok: true, discarded: false };
-    const history = await readPatchHistory();
-    const next = history.filter((record) => record.id !== batch.id);
-    if (next.length !== history.length) await writePatchHistory(next);
+    await withHistoryLock(async () => {
+      const history = await readPatchHistory();
+      const next = history.filter((record) => record.id !== batch.id);
+      if (next.length !== history.length) await writePatchHistory(next);
+    });
     if (batch.batchDir) await rm(batch.batchDir, { recursive: true, force: true }).catch(() => {});
     return { ok: true, discarded: true, id: batch.id };
   }
 
   async function pruneBackupHistory(limit = 50) {
+    return withHistoryLock(() => pruneBackupHistoryLocked(limit));
+  }
+
+  async function pruneBackupHistoryLocked(limit) {
     const history = await readPatchHistory();
     const protectedIds = transactionJournal?.protectedBackupIds
       ? await transactionJournal.protectedBackupIds().catch(() => new Set())

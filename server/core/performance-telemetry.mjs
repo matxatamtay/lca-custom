@@ -482,7 +482,7 @@ function countCacheSignals(value) {
       return;
     }
     for (const [key, item] of Object.entries(node)) {
-      if ((key === "cache_hit" || key === "prefetch_hit") && typeof item === "boolean") {
+      if (["cache_hit", "prefetch_hit", "index_cache_hit"].includes(key) && typeof item === "boolean") {
         checks += 1;
         if (item) hits += 1;
       } else if (key === "cached" && typeof item === "boolean") {

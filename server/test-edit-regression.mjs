@@ -10,7 +10,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { callCompactTool } from "./compact-test-client.mjs";
+import { callCompactTool, compactCallInput } from "./compact-test-client.mjs";
 
 const SERVER = path.resolve("server.mjs");
 
@@ -81,8 +81,10 @@ async function connect(port) {
   return client;
 }
 
-async function callJson(client, name, args = {}) {
-  const result = await callCompactTool(client, name, args);
+async function callJson(client, name, args = {}, project) {
+  const input = compactCallInput(name, args);
+  if (project) input.arguments.project = project;
+  const result = await client.callTool(input);
   const text = result.content?.[0]?.text ?? "";
   if (result.isError) throw new Error(`${name} failed: ${text}`);
   return JSON.parse(text);
@@ -109,7 +111,7 @@ test("patch/edit behavior remains stable before transactional refactor", async (
     server = await startServer(primary, [secondary]);
     client = await connect(server.port);
 
-    await callJson(client, "task_plan", { goal: "Exercise transactional edit state", steps: ["edit files", "verify state"] });
+    await callJson(client, "task_plan", { goal: "Exercise transactional edit state", steps: ["edit files", "verify state"], cwd: primary });
     await callJson(client, "task_plan", {
       goal: "Exercise peer transactional edit state",
       steps: ["edit peer files", "verify peer state"],
@@ -126,7 +128,7 @@ test("patch/edit behavior remains stable before transactional refactor", async (
     assert.equal(await readFile(path.join(secondary, "lib", "generated.txt"), "utf8"), "generated\n");
     assert.equal(generatedWrite.post_edit?.summary?.files, 1);
     assert.equal(generatedWrite.post_edit?.roots?.[0]?.verification?.auto_run, false);
-    const primaryCheckpoint = await callJson(client, "resume");
+    const primaryCheckpoint = await callJson(client, "resume", { cwd: primary });
     assert.equal(primaryCheckpoint.reason, "task_plan");
     assert.equal(primaryCheckpoint.task.goal, "Exercise transactional edit state");
     assert.equal(primaryCheckpoint.task.changed_files.some((file) => file.endsWith("secondary-project/lib/generated.txt")), false);
@@ -197,14 +199,14 @@ test("patch/edit behavior remains stable before transactional refactor", async (
       new_text: "peer-three"
     });
     assert.equal(await readFile(path.join(secondary, "lib", "peer.txt"), "utf8"), "peer-three\n");
-    const undoUpdate = await callJson(client, "undo_last_patch");
+    const undoUpdate = await callJson(client, "undo_last_patch", {}, secondary);
     assert.equal(undoUpdate.ok, true);
     assert.equal(await readFile(path.join(secondary, "lib", "peer.txt"), "utf8"), "peer-two\n");
 
     // Undo also removes a path that did not exist before the write.
     await callJson(client, "write_file", { path: "primary-project/src/temporary.txt", content: "temporary\n" });
     assert.equal(await readFile(path.join(primary, "src", "temporary.txt"), "utf8"), "temporary\n");
-    const undoCreate = await callJson(client, "undo_last_patch");
+    const undoCreate = await callJson(client, "undo_last_patch", {}, primary);
     assert.equal(undoCreate.ok, true);
     await assert.rejects(readFile(path.join(primary, "src", "temporary.txt"), "utf8"));
 

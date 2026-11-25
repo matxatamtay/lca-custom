@@ -105,5 +105,5 @@ export async function createStdioMcpConnection(
 
 function isRetryableTransportError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /closed|disconnect|connection|econn|broken pipe|transport|socket/i.test(message);
+  return /not connected|closed|disconnect|connection|econn|broken pipe|transport|socket/i.test(message);
 }

@@ -31,7 +31,7 @@ Use `workspace_context` first for coding tasks. It always fans out to current fi
 Actions execute directly without mode, policy, or approval turns. Project roots support discovery and relative paths; absolute paths are accepted. LCA is not an OS sandbox.
 
 
-`lca_input` can select a conversation-scoped primary project. The widget persists that selection for its rendered chat UI, and compact tools accept a top-level `project` envelope field. Scoped calls resolve relative paths and default discovery from that folder while explicit absolute paths can still reach another configured project. Omitting `project` preserves the existing multi-root behavior and never changes the daemon/TUI global primary root.
+`lca_input` can select a conversation-scoped primary project. The widget persists that selection for its rendered chat UI, and compact tools accept a top-level `project` envelope field. Scoped calls resolve relative paths and default discovery from that folder while explicit absolute paths can still reach another configured project. The first configured root remains an internal bootstrap/data anchor for compatibility, but is **not** a default target in peer-root mode. With multiple projects, a context task with a uniquely named project is routed to it; ambiguous or unnamed tasks and bare project-specific commands fail with an actionable error. Use the exact configured project name or an existing absolute project directory in the top-level `project` field on every workspace call. Unscoped multi-project discovery and uniquely resolved relative file paths remain supported; ambiguous relative paths fail. Explicit absolute paths remain available for intentional cross-project work. The MCP HTTP transport is stateless, so a tool call never changes another chat's scope. `workspace_status` reports `effective_primary_root: null` when no project is selected in peer-root mode.
 
 ## Terminal UI
 
@@ -191,7 +191,7 @@ Missing Semgrep, Stryker, or Renovate data is reported as `available=false`; it 
 |---|---:|---|
 | `PORT` | `8790` | Local MCP HTTP port. |
 | `AGENT_HOST` | `127.0.0.1` | Bind address. Keep loopback for normal use. |
-| `AGENT_WORKSPACE` | managed config | Default project when a tool omits its target; configured roots otherwise participate as peer workspaces. |
+| `AGENT_WORKSPACE` | managed config | Bootstrap/data anchor; implicit target only when exactly one root is configured. |
 | `AGENT_EXTRA_ROOTS_JSON` | `[]` | Additional peer project roots for cross-project read/edit/exec/context routing. |
 | `MCP_AUTH_TOKEN` | empty | Optional bearer token for `/mcp`. Header only. |
 | `MCP_ALLOWED_ORIGINS` | empty | Browser origins allowed to call `/mcp`; empty denies browser-origin calls. |
@@ -208,8 +208,15 @@ Missing Semgrep, Stryker, or Renovate data is reported as `available=false`; it 
 | `DBEAVER_DESKTOP_MCP_URL` | `http://127.0.0.1:3846/mcp` | DBeaver Desktop MCP. |
 | `BRUNO_DESKTOP_MCP_URL` | `http://127.0.0.1:3847/mcp` | Bruno Desktop MCP. |
 | `PENPOT_MCP_URL` | `http://127.0.0.1:9001/mcp/stream` | Local Penpot MCP endpoint without credentials. |
-| `PENPOT_USER_TOKEN` | empty | Generated Penpot MCP user token; store only in `.env.local`. |
+| `PENPOT_USER_TOKEN` | empty | Local Penpot MCP user token; store only in `.env.local`. |
+| `PENPOT_CLOUD_MCP_URL` | `https://design.penpot.app/mcp/stream` | Hosted Penpot Cloud MCP endpoint (token-free). |
+| `PENPOT_CLOUD_USER_TOKEN` | empty | Independent Penpot Cloud MCP user token; store only in `.env.local`. |
 | `PENPOT_MCP_TIMEOUT_MS` | `120000` | Penpot tool timeout. |
+| `BLENDER_MCP_HOST` | `127.0.0.1` | Loopback host for the Blender addon socket. |
+| `BLENDER_MCP_PORT` | `9334` | Blender addon socket port. |
+| `BLENDER_MCP_TIMEOUT_MS` | `120000` | Blender MCP tool timeout. |
+| `BLENDER_MCP_UVX_BIN` | `uvx` | uvx executable used for the pinned Blender MCP stdio child. |
+| `BLENDER_MCP_SOURCE` | pinned Git commit | Blender MCP source revision. |
 | `AST_GREP_BIN` | auto-detect | Optional ast-grep binary override. |
 | `SEMGREP_BIN` | auto-detect | Optional Semgrep binary override. |
 | `STRYKER_BIN` | auto-detect | Optional StrykerJS binary override. |
@@ -242,3 +249,7 @@ npm run docs:check
 ```
 
 Focused gates include `test:protocol`, `test:tui`, `test:compact`, `test:integration:context`, `test:persistent-http`, `test:figma`, `test:dbeaver`, `test:bruno`, `test:penpot`, `test:coolify`, `test:notion`, `test:notion:widget`, `test:pro`, `test:trusted-runtime`, `test:hardening`, and `eval`.
+
+### Optional performance profiling
+
+Detailed performance-follow samples and persistent task telemetry are disabled by default. Bounded task metrics remain in memory for adaptive workflow and correlation. Set `AGENT_PERFORMANCE_PROFILING=1` in the server launch environment to enable historical sampling and persistence; restart to apply. Old files are preserved but not read or written in default mode. Audit, runtime events, and recovery remain enabled as configured. Historical performance queries return empty rollups with `storage.enabled: false` when disabled; recent-project prewarm and autotuning no longer have persisted task history across restarts.

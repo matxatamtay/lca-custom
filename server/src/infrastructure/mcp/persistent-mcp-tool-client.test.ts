@@ -53,6 +53,27 @@ test("reconnects once after a transport failure", async () => {
   assert.equal(firstClosed, true);
 });
 
+test("reconnects when MCP SDK reports Not connected after a provider restart", async () => {
+  let connections = 0;
+  const client = new PersistentMcpToolClient(async () => {
+    connections += 1;
+    if (connections === 1) {
+      return {
+        async callTool() { throw new Error("Not connected"); },
+        async close() {}
+      };
+    }
+    return {
+      async callTool() { return { content: [{ type: "text", text: "new provider ready" }] }; },
+      async close() {}
+    };
+  });
+
+  const result = await client.callTool("codegraph_search", { projectPath: "/repo" });
+  assert.equal(result.content?.[0]?.text, "new provider ready");
+  assert.equal(connections, 2);
+});
+
 test("does not reconnect for ordinary tool errors", async () => {
   let connectionCount = 0;
   const client = new PersistentMcpToolClient(async () => {

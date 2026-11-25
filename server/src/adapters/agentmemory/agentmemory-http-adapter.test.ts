@@ -244,9 +244,9 @@ test("reuses exact-query recall briefly and invalidates it after memory mutation
   const first = await adapter.recall(request);
   const second = await adapter.recall(request);
   assert.equal(smartSearches, 1);
-  assert.equal(first[0]?.metadata?.cache_hit, undefined);
+  assert.equal(first[0]?.metadata?.cache_hit, false);
   assert.equal(second[0]?.metadata?.cache_hit, true);
-  assert.equal(second[0]?.metadata?.cache_layer, "agentmemory-exact-query");
+  assert.equal(second[0]?.metadata?.cache_layer, "agentmemory-project-query");
 
   await adapter.remember({ content: "new fact", project: "project-one" });
   await adapter.recall(request);
@@ -257,15 +257,203 @@ test("reuses exact-query recall briefly and invalidates it after memory mutation
   assert.equal(smartSearches, 3, "expired recall cache must refresh from AgentMemory");
 });
 
-test("returns empty evidence for a successful search with no memories", async () => {
+test("keeps repeated recall hot across context observations, but invalidates on substantive tool writes", async () => {
+  let now = 1_000;
+  let smartSearches = 0;
   const adapter = new AgentMemoryHttpAdapter({
-    fetch: (async () => new Response(JSON.stringify({ results: [] }), {
-      status: 200,
-      headers: { "content-type": "application/json" }
-    })) as typeof fetch
+    now: () => now,
+    projectId: () => "project-one",
+    fetch: (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/agentmemory/smart-search")) {
+        smartSearches += 1;
+        return new Response(JSON.stringify({
+          results: [{ id: "stable-fact", content: "Keep durable context" }]
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch
+  });
+  const request = { task: "Keep durable context", root: "/repo" } as const;
+  await adapter.recall(request);
+  now += 20_000; // Far beyond the old 5s default TTL.
+  await adapter.observe({
+    hookType: "post_tool_use",
+    sessionId: "session-one",
+    project: "project-one",
+    cwd: "/repo",
+    timestamp: "2026-10-26T00:00:00Z",
+    data: { tool_name: "workspace_context", success: true }
+  });
+  const hot = await adapter.recall(request);
+  assert.equal(hot[0]?.metadata?.cache_hit, true);
+  assert.equal(smartSearches, 1);
+
+  await adapter.observe({
+    hookType: "post_tool_use",
+    sessionId: "session-one",
+    project: "project-one",
+    cwd: "/repo",
+    timestamp: "2026-10-26T00:00:01Z",
+    data: { tool_name: "workspace_edit", success: true }
+  });
+  await adapter.recall(request);
+  assert.equal(smartSearches, 2);
+});
+
+test("cannot resurrect an invalidated recall after a concurrent memory mutation", async () => {
+  let release!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const entered = new Promise<void>((resolve) => { started = resolve; });
+  let smartSearches = 0;
+  const adapter = new AgentMemoryHttpAdapter({
+    projectId: () => "project-one",
+    fetch: (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/agentmemory/smart-search")) {
+        smartSearches += 1;
+        if (smartSearches === 1) {
+          started();
+          await gate;
+        }
+        return new Response(JSON.stringify({
+          results: [{ id: "fact", content: "current fact" }]
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch
+  });
+  const request = { task: "current fact", root: "/repo" } as const;
+  const oldRecall = adapter.recall(request);
+  await entered;
+  await adapter.remember({ content: "updated", project: "project-one" });
+  release();
+  await oldRecall;
+  await adapter.recall(request);
+  assert.equal(smartSearches, 2);
+});
+
+test("shares project-level recall across sessions and task-only parameters without mixing projects", async () => {
+  const starts: string[] = [];
+  const searches: string[] = [];
+  const currentSession = new Map<string, string>();
+  const adapter = new AgentMemoryHttpAdapter({
+    projectId: (root) => root === "/project-one" ? "project-one" : "project-two",
+    sessionIdForRoot: (root) => currentSession.get(root),
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      const endpoint = String(url);
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      if (endpoint.endsWith("/agentmemory/session/start")) starts.push(body.sessionId);
+      if (endpoint.endsWith("/agentmemory/smart-search")) {
+        searches.push(body.project);
+        return new Response(JSON.stringify({
+          results: [{ id: `fact-${body.project}`, project: body.project, content: "Stable project decision" }]
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch
   });
 
-  assert.deepEqual(await adapter.recall({ task: "new task", root: "/repo" }), []);
+  const begin = async (root: string, sessionId: string) => {
+    const project = root === "/project-one" ? "project-one" : "project-two";
+    await adapter.startSession({ sessionId, project, cwd: root });
+    currentSession.set(root, sessionId);
+  };
+  await begin("/project-one", "session-A");
+  const first = await adapter.recall({ root: "/project-one", task: "Check authentication flow", intent: "understand" });
+  await begin("/project-one", "session-B");
+  const second = await adapter.recall({
+    root: "/project-one",
+    task: "Check authentication flow",
+    intent: "refactor",
+    changedFiles: ["lib/auth.ts"],
+    budget: { maxItems: 12 }
+  });
+  assert.equal(first[0]?.metadata?.cache_hit, false);
+  assert.equal(second[0]?.metadata?.cache_hit, true);
+  assert.equal(second[0]?.metadata?.cache_layer, "agentmemory-project-query");
+  assert.deepEqual(starts, ["session-A", "session-B"]);
+  assert.deepEqual(searches, ["project-one"]);
+
+  await begin("/project-two", "session-C");
+  await adapter.recall({ root: "/project-two", task: "Check authentication flow" });
+  assert.deepEqual(searches, ["project-one", "project-two"]);
+  await adapter.remember({
+    content: "Decision: preserve old login retry",
+    project: "project-one",
+    type: "fact",
+    concepts: ["architectural-decision"]
+  });
+  await adapter.recall({ root: "/project-two", task: "Check authentication flow" });
+  assert.equal(searches.length, 2, "a new decision in another project must not evict this project");
+  await adapter.recall({ root: "/project-one", task: "Check authentication flow" });
+  assert.deepEqual(searches, ["project-one", "project-two", "project-one"]);
+
+  await adapter.endSession("session-B");
+  await adapter.recall({ root: "/project-two", task: "Check authentication flow" });
+  assert.equal(searches.length, 3, "ending a session must not evict unrelated projects");
+  await adapter.recall({ root: "/project-one", task: "Check authentication flow" });
+  assert.equal(searches.length, 4, "session summaries must be visible after ending that project session");
+});
+
+test("persists architectural decisions independently of the cache and retrieves them after invalidation", async () => {
+  const durable: string[] = [];
+  let searches = 0;
+  const adapter = new AgentMemoryHttpAdapter({
+    projectId: () => "project-one",
+    fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+      const endpoint = String(url);
+      if (endpoint.endsWith("/agentmemory/remember")) {
+        const body = JSON.parse(String(init?.body));
+        assert.equal(body.type, "fact");
+        assert.deepEqual(body.concepts, ["architectural-decision"]);
+        durable.push(body.content);
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      if (endpoint.endsWith("/agentmemory/smart-search")) {
+        searches += 1;
+        return new Response(JSON.stringify({
+          results: durable.map((content, index) => ({
+            id: `decision-${index}`, content, project: "project-one", type: "fact"
+          }))
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch
+  });
+  const request = { task: "Why keep retry?", root: "/repo" } as const;
+  await adapter.recall(request);
+  await adapter.remember({
+    project: "project-one",
+    content: "Decision: keep the retry mechanism for legacy clients",
+    type: "fact",
+    concepts: ["architectural-decision"]
+  });
+  const fresh = await adapter.recall(request);
+  const cached = await adapter.recall(request);
+  assert.equal(durable.length, 1);
+  assert.equal(searches, 2);
+  assert.match(fresh[0]?.content ?? "", /keep the retry mechanism/);
+  assert.equal(cached[0]?.metadata?.cache_hit, true);
+});
+
+test("returns empty evidence for a successful search with no memories and still reports cache telemetry", async () => {
+  let searches = 0;
+  const adapter = new AgentMemoryHttpAdapter({
+    fetch: (async () => {
+      searches += 1;
+      return new Response(JSON.stringify({ results: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch
+  });
+
+  const request = { task: "new task", root: "/repo" } as const;
+  assert.deepEqual(await adapter.recall(request), []);
+  assert.equal(adapter.telemetry("/repo")?.cache_hit, false);
+  assert.deepEqual(await adapter.recall(request), []);
+  assert.equal(adapter.telemetry("/repo")?.cache_hit, true);
+  assert.equal(searches, 1);
 });
 
 test("surfaces AgentMemory HTTP failures", async () => {

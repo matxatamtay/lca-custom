@@ -6,7 +6,7 @@ export function createCompanionMcp(options) {
     DBEAVER_SQL_ARTIFACT_LEGACY_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, DBEAVER_SQL_ARTIFACT_URI,
     NOTION_PAGE_WIDGET_LEGACY_URI, NOTION_PAGE_WIDGET_MIME_TYPE, NOTION_PAGE_WIDGET_RESOURCE, NOTION_PAGE_WIDGET_URI,
     CONVERSATION_RUNTIME, PRIMARY_ROOT, ROOTS, WORKFLOW_COMMANDS, activeDiscoveryRoots,
-    composeLcaPrompt, reg, resolvePath, slashCommandData, structuredJsonResult, workspaceSearchData
+    composeLcaPrompt, reg, resolvePath, resolveProjectSelection, slashCommandData, structuredJsonResult, workspaceSearchData
   } = options;
 
   function widgetResourcePayload(uri, resource, description, {
@@ -184,7 +184,7 @@ export function createCompanionMcp(options) {
         }
       },
       async ({ initial_input = "", primary_project }) => {
-        const primaryProject = CONVERSATION_RUNTIME.normalize(primary_project);
+        const primaryProject = resolveProjectSelection(primary_project);
         const payload = {
           initial_input,
           workspace: PRIMARY_ROOT,

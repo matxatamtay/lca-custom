@@ -210,10 +210,12 @@ function normalizeTask(task) {
 }
 
 function readCall(likelyReads, reason) {
+  const paths = likelyReads.slice(0, 5).map((entry) => entry.path).filter(Boolean);
   return {
     tool: "workspace_read",
     action: "many",
-    paths: likelyReads.slice(0, 5).map((entry) => entry.path).filter(Boolean),
+    paths,
+    ...(paths.length > 1 ? { concurrency: Math.min(6, paths.length) } : {}),
     reason
   };
 }
@@ -230,10 +232,20 @@ function batchEditCall(hasVerification) {
 }
 
 function result(mode, calls, reasons, telemetry, roundtripTarget) {
+  const highRoundtrips = telemetry.avg_roundtrips >= 6;
   return {
     mode,
     recommended_calls: calls.slice(0, 2),
     roundtrip_target: Math.max(1, roundtripTarget),
+    batching: {
+      read_many: true,
+      exec_many: true,
+      parallel_independent_exec: true,
+      dependency_dag: true,
+      edit_batch: true,
+      fuse_changed_verification: true,
+      avoid_exec_one: highRoundtrips
+    },
     reasons: [...new Set(reasons)].slice(0, 8),
     telemetry,
     loop_guard: {

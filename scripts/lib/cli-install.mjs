@@ -9,7 +9,11 @@ export function createCliInstaller(options) {
   function defaultCliBinDir() {
     const home = process.env.HOME || process.env.USERPROFILE || ".";
     if (process.platform === "win32") {
-      return join(process.env.LOCALAPPDATA || join(home, "AppData", "Local"), "LocalCodingAgentCustom", "bin");
+      return join(
+        process.env.LOCALAPPDATA || join(home, "AppData", "Local"),
+        "LocalCodingAgentCustom",
+        "bin",
+      );
     }
     return join(home, ".local", "bin");
   }
@@ -33,7 +37,7 @@ export function createCliInstaller(options) {
     return [
       defaultCliBinDir(),
       join(home, "bin"),
-      join(dirname(CONFIG_PATH), "bin")
+      join(dirname(CONFIG_PATH), "bin"),
     ];
   }
 
@@ -45,7 +49,10 @@ export function createCliInstaller(options) {
   }
 
   function pathEnvKey() {
-    return Object.keys(process.env).find((key) => key.toLowerCase() === "path") || "PATH";
+    return (
+      Object.keys(process.env).find((key) => key.toLowerCase() === "path") ||
+      "PATH"
+    );
   }
 
   function getProcessPath() {
@@ -84,10 +91,15 @@ export function createCliInstaller(options) {
     if (shell === "zsh") return [join(home, ".zshrc")];
     if (shell === "fish") return [join(home, ".config", "fish", "config.fish")];
     if (shell === "bash") {
-      if (process.platform === "darwin") return [join(home, ".bash_profile"), join(home, ".bashrc")];
+      if (process.platform === "darwin")
+        return [join(home, ".bash_profile"), join(home, ".bashrc")];
       return [join(home, ".bashrc"), join(home, ".profile")];
     }
-    return [join(home, ".zshrc"), join(home, ".bashrc"), join(home, ".profile")];
+    return [
+      join(home, ".zshrc"),
+      join(home, ".bashrc"),
+      join(home, ".profile"),
+    ];
   }
 
   function pathExportLine(dir, profilePath) {
@@ -115,14 +127,28 @@ export function createCliInstaller(options) {
     Write-Output 'exists'
   }
   `;
-    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, binDir];
+    const args = [
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      script,
+      binDir,
+    ];
     let result = await capture("powershell.exe", args);
-    if (result.code !== 0) result = await capture("pwsh", ["-NoProfile", "-Command", script, binDir]);
+    if (result.code !== 0)
+      result = await capture("pwsh", [
+        "-NoProfile",
+        "-Command",
+        script,
+        binDir,
+      ]);
     return result;
   }
 
   async function configureShellPath(binDir) {
-    if (pathHasDir(binDir)) return { changed: false, active: true, profile: "" };
+    if (pathHasDir(binDir))
+      return { changed: false, active: true, profile: "" };
     if (process.platform === "win32") {
       prependProcessPath(binDir);
       const result = await setWindowsUserPath(binDir);
@@ -132,14 +158,14 @@ export function createCliInstaller(options) {
           changed,
           active: false,
           profile: "User PATH",
-          message: `${changed ? "Added" : "Already present in"} Windows User PATH: ${binDir}. Open a new terminal before running lca-custom.`
+          message: `${changed ? "Added" : "Already present in"} Windows User PATH: ${binDir}. Open a new terminal before running lca-custom.`,
         };
       }
       return {
         changed: false,
         active: false,
         profile: "",
-        message: `Could not update Windows User PATH automatically. Add this directory manually: ${binDir}`
+        message: `Could not update Windows User PATH automatically. Add this directory manually: ${binDir}`,
       };
     }
 
@@ -152,15 +178,25 @@ export function createCliInstaller(options) {
       writeFileSync(profile, `${existing.replace(/\s*$/, "")}${block}`, "utf8");
     }
     prependProcessPath(binDir);
-    return { changed: true, active: false, profile, message: `Added ${binDir} to ${profile}. Restart your terminal or run: source ${profile}` };
+    return {
+      changed: true,
+      active: false,
+      profile,
+      message: `Added ${binDir} to ${profile}. Restart your terminal or run: source ${profile}`,
+    };
   }
 
   async function verifyCliShim(cliPath) {
-    const result = process.platform === "win32"
-      ? await capture("cmd.exe", ["/d", "/c", `call "${cliPath}" --help`], { cwd: REPO_ROOT })
-      : await capture(cliPath, ["--help"], { cwd: REPO_ROOT });
+    const result =
+      process.platform === "win32"
+        ? await capture("cmd.exe", ["/d", "/c", `call "${cliPath}" --help`], {
+            cwd: REPO_ROOT,
+          })
+        : await capture(cliPath, ["--help"], { cwd: REPO_ROOT });
     if (result.code !== 0) {
-      throw new Error(`Installed ${CLI_NAME} wrapper failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
+      throw new Error(
+        `Installed ${CLI_NAME} wrapper failed: ${result.stderr || result.stdout || `exit ${result.code}`}`,
+      );
     }
     console.log(`OK ${CLI_NAME} wrapper: ${cliPath}`);
   }
@@ -189,19 +225,25 @@ export function createCliInstaller(options) {
     const wrapper = cliWrapperContents({
       marker,
       scriptPath: join(SCRIPT_DIR, "local-coding-agent.mjs"),
-      configPath: CONFIG_PATH
+      configPath: CONFIG_PATH,
     });
-    const preferredBinDir = process.env.LCA_CUSTOM_BIN_DIR || defaultCliBinDir();
+    const preferredBinDir =
+      process.env.LCA_CUSTOM_BIN_DIR || defaultCliBinDir();
     const binDir = chooseCliBinDir();
     if (binDir !== preferredBinDir) {
-      console.log(`WARN ${preferredBinDir} is not writable; installing ${CLI_NAME} into ${binDir} instead.`);
+      console.log(
+        `WARN ${preferredBinDir} is not writable; installing ${CLI_NAME} into ${binDir} instead.`,
+      );
     }
     mkdirSync(binDir, { recursive: true });
     if (process.platform === "win32") {
       const cmdPath = join(binDir, `${CLI_NAME}.cmd`);
       const psPath = join(binDir, `${CLI_NAME}.ps1`);
       for (const target of [cmdPath, psPath]) {
-        if (existsSync(target) && !readFileSync(target, "utf8").includes(marker)) {
+        if (
+          existsSync(target) &&
+          !readFileSync(target, "utf8").includes(marker)
+        ) {
           throw new Error(`Refusing to overwrite: ${target}`);
         }
       }
@@ -210,7 +252,8 @@ export function createCliInstaller(options) {
       console.log(`Installed: ${cmdPath}`);
       const pathResult = await configureShellPath(binDir);
       if (pathResult.message) console.log(pathResult.message);
-      if (!pathResult.active) console.log(`Current terminal fallback: "${cmdPath}"`);
+      if (!pathResult.active)
+        console.log(`Current terminal fallback: "${cmdPath}"`);
       return cmdPath;
     }
     const target = join(binDir, CLI_NAME);
@@ -225,6 +268,5 @@ export function createCliInstaller(options) {
     return target;
   }
 
-
-  return { cliWrapperContents, installCliCommand };
+  return { cliWrapperContents, installCliCommand, verifyCliShim };
 }

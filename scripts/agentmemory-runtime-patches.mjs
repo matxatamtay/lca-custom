@@ -4,9 +4,15 @@
 
 import {
   existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  rmSync,
   statSync,
+  symlinkSync,
   writeFileSync
 } from "node:fs";
 import path from "node:path";
@@ -27,10 +33,7 @@ const PREVIOUS_PATCH_MARKERS = [
   "lca-patch:zero-llm-summarize-otel-v2",
   "lca-patch:zero-llm-summarize-otel-v1"
 ];
-const TARGET_FILES = [
-  path.join("dist", "index.mjs"),
-  path.join("dist", "src-CzgoepGU.mjs")
-];
+const CORE_ENTRY = path.join("dist", "index.mjs");
 
 const SUMMARIZE_SIGNATURE = "function registerSummarizeFunction(sdk, kv, provider, metricsStore) {";
 const DETERMINISTIC_SUMMARY_SIGNATURE = "function createDeterministicSessionSummary(session, observations, now";
@@ -80,11 +83,49 @@ const ZERO_LLM_SUMMARY_BRANCH = [
 
 export function agentMemoryPatchTargets(memoryDirectory) {
   const packageRoot = path.join(memoryDirectory, "node_modules", "@agentmemory", "agentmemory");
-  return TARGET_FILES.map((relativePath) => path.join(packageRoot, relativePath));
+  const dist = path.join(packageRoot, "dist");
+  const bundledSources = existsSync(dist) ? readdirSync(dist)
+    .filter((name) => /^src-[\w-]+\.mjs$/.test(name))
+    .filter((name) => readFileSync(path.join(dist, name), "utf8").includes(SUMMARIZE_SIGNATURE)) : [];
+  if (bundledSources.length !== 1) {
+    throw new Error(`Expected one AgentMemory runtime source bundle, found ${bundledSources.length} in ${dist}`);
+  }
+  return [path.join(packageRoot, CORE_ENTRY), path.join(dist, bundledSources[0])];
+}
+
+// AgentMemory runs inside its npm package. Keep its data outside node_modules
+// so npm ci/upgrades cannot delete sessions or observations.
+export function linkAgentMemoryPersistentData(memoryDirectory) {
+  const stableData = path.join(memoryDirectory, "data");
+  const packageData = path.join(memoryDirectory, "node_modules", "@agentmemory", "agentmemory", "data");
+  mkdirSync(stableData, { recursive: true });
+  if (existsSync(packageData)) {
+    if (lstatSync(packageData).isSymbolicLink() && realpathSync(packageData) === realpathSync(stableData)) {
+      return { changed: false, path: packageData, target: stableData };
+    }
+    if (!lstatSync(packageData).isDirectory() || readdirSync(packageData).length !== 0) {
+      throw new Error(`AgentMemory has data inside node_modules at ${packageData}. Back up and migrate it to ${stableData} before upgrading.`);
+    }
+    rmSync(packageData, { recursive: true });
+  }
+  symlinkSync(process.platform === "win32" ? stableData : path.relative(path.dirname(packageData), stableData), packageData, process.platform === "win32" ? "junction" : "dir");
+  return { changed: true, path: packageData, target: stableData };
 }
 
 export function inspectAgentMemoryRuntimePatches(memoryDirectory) {
-  const targets = agentMemoryPatchTargets(memoryDirectory).map((file) => {
+  let files;
+  try {
+    files = agentMemoryPatchTargets(memoryDirectory);
+  } catch (error) {
+    return {
+      ok: false,
+      patchId: ZERO_LLM_DETERMINISTIC_SUMMARY_PATCH_ID,
+      targets: [],
+      dataLinked: false,
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+  const targets = files.map((file) => {
     if (!existsSync(file)) return { file, exists: false, patched: false, detail: "missing" };
     const content = readFileSync(file, "utf8");
     const patched = content.includes(PATCH_MARKER)
@@ -97,21 +138,28 @@ export function inspectAgentMemoryRuntimePatches(memoryDirectory) {
       && PREVIOUS_PATCH_MARKERS.every((marker) => !content.includes(marker));
     return { file, exists: true, patched, detail: patched ? "patched" : "unpatched" };
   });
-  const ok = targets.length > 0 && targets.every((target) => target.patched);
+  const packageData = path.join(memoryDirectory, "node_modules", "@agentmemory", "agentmemory", "data");
+  const stableData = path.join(memoryDirectory, "data");
+  const dataLinked = existsSync(packageData) && lstatSync(packageData).isSymbolicLink()
+    && realpathSync(packageData) === realpathSync(stableData);
+  const ok = targets.length > 0 && targets.every((target) => target.patched) && dataLinked;
   return {
     ok,
     patchId: ZERO_LLM_DETERMINISTIC_SUMMARY_PATCH_ID,
     targets,
-    detail: targets.map((target) => `${path.basename(target.file)}:${target.detail}`).join(", ")
+    dataLinked,
+    detail: [...targets.map((target) => `${path.basename(target.file)}:${target.detail}`), `data:${dataLinked ? "linked" : "unlinked"}`].join(", ")
   };
 }
 
 export function applyAgentMemoryRuntimePatches(memoryDirectory) {
   const results = agentMemoryPatchTargets(memoryDirectory).map((file) => patchTarget(file));
+  const data = linkAgentMemoryPersistentData(memoryDirectory);
   return {
     patchId: ZERO_LLM_DETERMINISTIC_SUMMARY_PATCH_ID,
-    changed: results.some((result) => result.changed),
-    targets: results
+    changed: results.some((result) => result.changed) || data.changed,
+    targets: results,
+    data
   };
 }
 

@@ -7,6 +7,26 @@ import {
 
 const PROVIDERS = ["filesystem", "semantic", "codegraph", "agentmemory"];
 
+// Preserve evidence and source locations; omit repetitive internal ranking diagnostics.
+// Callers can explicitly request the full, unmodified payload when debugging.
+export function compactTaskContextForModel(context) {
+  const omit = new Set(["jevRerank", "reranked_score", "rerankReasons", "retrievalScore", "raw_score", "adjusted_score", "selection_reasons", "escalation_path"]);
+  return {
+    ...context,
+    evidence: (context.evidence || []).map((item) => item.metadata
+      ? { ...item, metadata: Object.fromEntries(Object.entries(item.metadata).filter(([key]) => !omit.has(key))) }
+      : item),
+    ...(context.project_resolution ? { project_resolution: {
+      ...context.project_resolution,
+      candidates: (context.project_resolution.candidates || []).slice(0, 5)
+    } } : {}),
+    ...(context.execution_hints?.workflow ? { execution_hints: {
+      ...context.execution_hints,
+      workflow: { ...context.execution_hints.workflow, telemetry: undefined }
+    } } : {})
+  };
+}
+
 export function composeTaskContext(options) {
   const {
     context,
@@ -18,7 +38,9 @@ export function composeTaskContext(options) {
   } = options;
 
   const rawEvidence = dedupeEvidence(Array.isArray(context?.evidence) ? context.evidence : []);
-  const sourceEvidence = compactProviderEvidence(rawEvidence);
+  const providerEvidence = compactProviderEvidence(rawEvidence);
+  const duplicateCompaction = compactCrossProviderDuplicates(providerEvidence);
+  const sourceEvidence = duplicateCompaction.evidence;
   const providersWithEvidence = PROVIDERS.filter((provider) => sourceEvidence.some((item) => item.provider === provider));
   const hasLocalState = Boolean(taskState || checkpoint);
   const budget = createContextBudget({
@@ -77,7 +99,8 @@ export function composeTaskContext(options) {
       compaction: {
         input_items: rawEvidence.length,
         candidate_items: sourceEvidence.length,
-        dropped_items: Math.max(0, rawEvidence.length - sourceEvidence.length)
+        dropped_items: Math.max(0, rawEvidence.length - providerEvidence.length),
+        duplicate_references: duplicateCompaction.references
       },
       providers: providerItems,
       truncated: evidence.length < sourceEvidence.length
@@ -213,6 +236,33 @@ function compactProviderEvidence(evidence) {
   }
 
   return [...filesystem, ...[...semantic.values()].slice(0, 4), ...codegraph, ...agentmemory, ...other];
+}
+
+function compactCrossProviderDuplicates(evidence) {
+  const canonical = new Map();
+  let references = 0;
+  const compacted = evidence.map((item) => {
+    const contentKey = normalizedEvidenceContent(item?.content);
+    if (contentKey.length < 160) return item;
+    const first = canonical.get(contentKey);
+    if (!first) {
+      canonical.set(contentKey, { provider: item.provider, id: item.id });
+      return item;
+    }
+    if (first.provider === item.provider) return item;
+    references += 1;
+    const ref = `${first.provider}:${first.id}`;
+    return {
+      ...item,
+      content: `[duplicate evidence; see ${ref}]`,
+      metadata: { ...(item.metadata || {}), context_duplicate_of: ref }
+    };
+  });
+  return { evidence: compacted, references };
+}
+
+function normalizedEvidenceContent(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 function semanticQuality(item) {

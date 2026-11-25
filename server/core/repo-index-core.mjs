@@ -4,21 +4,22 @@ import path from "node:path";
 export function createRepoIndexCore(options) {
   const {
     INDEX_PATH, REPO_INDEX_TTL_MS, RG_BIN, buildTreeFast, collectImportantFiles, compactGitStatus,
-    detectProjectProfile, isoNow, scanSymbols, toRel
+    detectProjectProfile, isoNow, scanSymbols, toRel, cachePath = () => INDEX_PATH, resolveDisplayPath
   } = options;
 
-  async function readRepoIndex() {
+  async function readRepoIndex(rootDir) {
     try {
-      const raw = await readFile(INDEX_PATH, "utf8");
+      const raw = await readFile(cachePath(rootDir), "utf8");
       return JSON.parse(raw);
     } catch {
       return null;
     }
   }
 
-  async function writeRepoIndex(data) {
-    await mkdir(path.dirname(INDEX_PATH), { recursive: true });
-    await writeFile(INDEX_PATH, JSON.stringify(data, null, 2), "utf8");
+  async function writeRepoIndex(data, rootDir = data.rootDir || data.profile?.rootDir) {
+    const indexPath = cachePath(rootDir);
+    await mkdir(path.dirname(indexPath), { recursive: true });
+    await writeFile(indexPath, JSON.stringify(data, null, 2), "utf8");
   }
 
   function indexFresh(idx) {
@@ -45,11 +46,11 @@ export function createRepoIndexCore(options) {
   }
 
   function relEntriesToAbs(rootDir, entries = []) {
-    return entries.filter((entry) => !entry.endsWith("/")).map((entry) => path.resolve(rootDir, entry));
+    return entries.filter((entry) => !entry.endsWith("/")).map((entry) => resolveDisplayPath ? resolveDisplayPath(entry) : path.resolve(rootDir, entry));
   }
 
   async function buildRepoIndex(rootDir, { depth = 3, maxEntries = 800, includeSymbols = false, symbolMaxFiles = 500, symbolMaxMatches = 2000, refresh = false } = {}) {
-    const cached = await readRepoIndex();
+    const cached = await readRepoIndex(rootDir);
     if (!refresh && indexMatches(cached, rootDir) && treeCovers(cached, { depth, maxEntries })) {
       if (includeSymbols && !symbolsCover(cached, { maxFiles: symbolMaxFiles, maxMatches: symbolMaxMatches })) {
         const seeded = relEntriesToAbs(rootDir, cached.tree?.entries || []);

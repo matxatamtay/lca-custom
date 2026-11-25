@@ -7,6 +7,7 @@ import { BridgeServer } from "./bridge/bridge-server.js";
 import { createBrowserMcpServer } from "./mcp/create-mcp-server.js";
 import { PairingManager } from "./security/pairing.js";
 import { audit } from "./security/audit.js";
+import { closeBrowserHarnessClients } from "./jev/jev-browser.js";
 import { DATA_DIR, HOST, MAX_BODY_BYTES, MCP_AUTH_TOKEN, PORT, VERSION } from "./config.js";
 
 await mkdir(DATA_DIR, { recursive: true });
@@ -29,7 +30,8 @@ const server = http.createServer(async (request, response) => {
         host: HOST,
         port: PORT,
         auth: MCP_AUTH_TOKEN ? "bearer" : "none",
-        bridge: bridge.status()
+        bridge: bridge.status(),
+        browserProvider: "jev-ultrafast"
       });
     }
     if (url.pathname === "/mcp") {
@@ -72,7 +74,9 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     clearInterval(cleanupTimer);
     bridge.close();
-    server.close(() => process.exit(0));
+    server.close(() => {
+      void closeBrowserHarnessClients().finally(() => process.exit(0));
+    });
     setTimeout(() => process.exit(0), 1_500).unref();
   });
 }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -277,6 +277,7 @@ test("does not opt into Docker unless the caller explicitly requests it", async 
     "cli.mjs"
   );
   const capturePath = path.join(runtimeDirectory, "docker-mode.txt");
+  const cwdCapturePath = path.join(runtimeDirectory, "cwd.txt");
   const previousUseDocker = process.env.AGENTMEMORY_USE_DOCKER;
   try {
     delete process.env.AGENTMEMORY_USE_DOCKER;
@@ -286,20 +287,24 @@ test("does not opt into Docker unless the caller explicitly requests it", async 
       "const command = process.argv[2];",
       "if (command) process.exit(0);",
       "writeFileSync(process.env.LCA_CAPTURE_PATH, process.env.AGENTMEMORY_USE_DOCKER ?? '<unset>');",
+      "writeFileSync(process.env.LCA_CWD_CAPTURE_PATH, process.cwd());",
       "setInterval(() => {}, 1_000);",
       ""
     ].join("\n"));
 
+    const packageDirectory = path.dirname(path.dirname(cliPath));
     const controller = new AgentMemoryCliController({
       runtimeDirectory,
       enginePort: TEST_ENGINE_PORT,
       installIfMissing: false,
-      env: { LCA_CAPTURE_PATH: capturePath }
+      env: { LCA_CAPTURE_PATH: capturePath, LCA_CWD_CAPTURE_PATH: cwdCapturePath }
     });
 
     await controller.start();
     await waitForFile(capturePath);
+    await waitForFile(cwdCapturePath);
     assert.equal(await readFile(capturePath, "utf8"), "<unset>");
+    assert.equal(await readFile(cwdCapturePath, "utf8"), await realpath(packageDirectory));
     await controller.close();
   } finally {
     if (previousUseDocker === undefined) delete process.env.AGENTMEMORY_USE_DOCKER;

@@ -2,19 +2,21 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export function createNotesSkills(options) {
-  const { NOTES_PATH, PRIMARY_ROOT, ROOTS, SKILLS_DIRS } = options;
+  const { NOTES_PATH, PRIMARY_ROOT, ROOTS, SKILLS_DIRS, resolveDefaultRoot = () => PRIMARY_ROOT, resolveNotesPath = () => NOTES_PATH, resolveSkillDirs = () => SKILLS_DIRS } = options;
 
   async function readNotes() {
+    const notesPath = resolveNotesPath();
     try {
-      return JSON.parse(await readFile(NOTES_PATH, "utf8"));
+      return JSON.parse(await readFile(notesPath, "utf8"));
     } catch {
       return [];
     }
   }
 
   async function writeNotes(notes) {
-    await mkdir(path.dirname(NOTES_PATH), { recursive: true });
-    await writeFile(NOTES_PATH, `${JSON.stringify(notes, null, 2)}\n`, "utf8");
+    const notesPath = resolveNotesPath();
+    await mkdir(path.dirname(notesPath), { recursive: true });
+    await writeFile(notesPath, `${JSON.stringify(notes, null, 2)}\n`, "utf8");
   }
 
   // ----------------------------------------------------------------------------
@@ -23,7 +25,7 @@ export function createNotesSkills(options) {
   async function discoverSkills() {
     const found = [];
     const seen = new Set();
-    for (const base of SKILLS_DIRS) {
+    for (const base of resolveSkillDirs()) {
       let entries;
       try {
         entries = await readdir(base, { withFileTypes: true });
@@ -79,7 +81,7 @@ export function createNotesSkills(options) {
 
 
   function defaultSkillsDir() {
-    return path.join(PRIMARY_ROOT, ".claude", "skills");
+    return path.join(resolveDefaultRoot(), ".claude", "skills");
   }
 
   // Skill folder names: keep them simple path segments (no separators / traversal).
@@ -91,15 +93,18 @@ export function createNotesSkills(options) {
   }
 
   // A path is "inside a skills directory" if any segment of its parent chain is a
-  // known skills dir (from SKILLS_DIRS) or matches the .claude/skills | .agent/skills
-  // convention under a root. Used to confine create/delete to skills areas.
+  // known skills dir (from SKILLS_DIRS) or matches the .claude/skills |
+  // .agent/skills | .agents/skills conventions under a root. Used to confine
+  // create/delete to skills areas.
   function isWithinSkillsDir(p) {
     const parent = path.dirname(p);
     const candidates = new Set(SKILLS_DIRS.map((d) => path.resolve(d)));
-    candidates.add(path.resolve(defaultSkillsDir()));
+    // Explicit skill directories remain usable without a default project.
+    try { candidates.add(path.resolve(defaultSkillsDir())); } catch { /* no project selected */ }
     for (const root of ROOTS) {
       candidates.add(path.resolve(path.join(root, ".claude", "skills")));
       candidates.add(path.resolve(path.join(root, ".agent", "skills")));
+      candidates.add(path.resolve(path.join(root, ".agents", "skills")));
     }
     return candidates.has(path.resolve(parent));
   }

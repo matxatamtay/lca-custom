@@ -39,13 +39,15 @@ export function createExecAccelerator(options) {
     return getRevision(root);
   }
 
-  async function run(command, cwd, shell, timeoutMs, { reuse = "auto" } = {}) {
+  async function run(command, cwd, shell, timeoutMs, runtimeOptions = {}) {
+    const { reuse = "auto", env, stdin, redactValues } = runtimeOptions;
     const normalizedCommand = normalizeCommand(command);
     const normalizedRoot = path.resolve(cwd);
     const setup = isSetupCommand(normalizedCommand);
-    const eligible = reuse !== "never" && isReusableDeterministicCommand(normalizedCommand);
+    const carriesSecrets = Boolean((env && Object.keys(env).length) || stdin != null || (redactValues && redactValues.length));
+    const eligible = !carriesSecrets && reuse !== "never" && isReusableDeterministicCommand(normalizedCommand);
 
-    if (setup) {
+    if (setup && !carriesSecrets) {
       const setupKey = `setup\0${normalizedRoot}\0${shell || ""}\0${normalizedCommand}`;
       const pending = commandInFlight.get(setupKey);
       if (pending) {
@@ -63,13 +65,13 @@ export function createExecAccelerator(options) {
     }
 
     if (!eligible) {
-      const result = await runShellCommand(command, normalizedRoot, shell, timeoutMs);
+      const result = await runShellCommand(command, normalizedRoot, shell, timeoutMs, { env, stdin, redactValues });
       return withAcceleration(result, {
         mode: "direct",
         cache_hit: false,
         in_flight_join: false,
         reusable: false,
-        reason: reuse === "never" ? "reuse_disabled" : "command_not_analysis_only"
+        reason: carriesSecrets ? "secret_input" : reuse === "never" ? "reuse_disabled" : "command_not_analysis_only"
       });
     }
 

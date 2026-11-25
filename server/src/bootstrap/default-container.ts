@@ -56,7 +56,7 @@ export interface ContextPrewarmReceipt {
 export interface ManagedApplicationContainer {
   application: ApplicationContainer;
   memorySessions: AgentMemorySessionManager;
-  invalidateContext(root: string, changedFiles?: readonly string[]): void;
+  invalidateContext(root: string, changedFiles?: readonly string[]): Promise<ContextPrewarmReceipt>;
   prewarmContext(root: string, changedFiles?: readonly string[]): Promise<ContextPrewarmReceipt>;
   close(): Promise<void>;
 }
@@ -80,8 +80,18 @@ async function settlePrewarm(operation: () => Promise<unknown>): Promise<Prewarm
 export function createDefaultApplicationContainer(
   options: DefaultContainerOptions = {}
 ): ManagedApplicationContainer {
-  const codegraph: CodeGraphAdapter = createDefaultCodeGraphAdapter();
-  const revisions = new WorkspaceRevisionTracker();
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const lcaServerRoot = path.join(repoRoot, "server");
+  const revisions = new WorkspaceRevisionTracker({
+    ignore: (root, filename) => {
+      const normalized = String(filename ?? "").replaceAll("\\", "/");
+      return path.resolve(root) === lcaServerRoot
+        && (normalized === "data" || normalized.startsWith("data/"));
+    }
+  });
+  const codegraph: CodeGraphAdapter = createDefaultCodeGraphAdapter({
+    rootRevision: (root) => revisions.revision(root)
+  });
   const filesystem = new RevisionAwareFilesystemContextPort(new RipgrepFilesystemContextAdapter(), revisions);
   const semanticBase: SemanticContextAdapter = createDefaultSemanticContextAdapter();
   const semantic = new RevisionAwareSemanticContextPort(semanticBase, revisions);
@@ -92,7 +102,6 @@ export function createDefaultApplicationContainer(
     ...(options.agentMemorySecret ? { secret: options.agentMemorySecret } : {}),
     sessionIdForRoot: (root) => memorySessions?.currentSessionId(root)
   });
-  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const runtimeDirectory = options.agentMemoryRuntimeDirectory
     ?? path.join(repoRoot, "runtime", "agentmemory");
   const patchModuleUrl = pathToFileURL(
@@ -130,6 +139,35 @@ export function createDefaultApplicationContainer(
     ...(options.jevMaxStateChars !== undefined ? { maxStateChars: options.jevMaxStateChars } : {})
   };
   const reranker = createOptionalJevContextReranker(jevOptions);
+  const prewarmInFlight = new Map<string, Promise<ContextPrewarmReceipt>>();
+
+  function warmContext(root: string, changedFiles: readonly string[]): Promise<ContextPrewarmReceipt> {
+    const key = `${path.resolve(root)}\0${revisions.revision(root).token}`;
+    const running = prewarmInFlight.get(key);
+    if (running) return running;
+    const operation = Promise.all([
+      settlePrewarm(() => changedFiles.length
+        ? codegraph.ensureIndexed(root, changedFiles)
+        : (codegraph.prewarm?.(root) ?? codegraph.ensureIndexed(root))),
+      settlePrewarm(() => memorySessions!.currentSessionId(root)
+        ? Promise.resolve(memorySessions!.currentSessionId(root))
+        : memorySessions!.ensureSession(root, "Prewarm project context")),
+      settlePrewarm(() => semanticBase.context({
+        task: "Warm project semantic state",
+        root,
+        ...(changedFiles.length ? { changedFiles } : {}),
+        budget: { maxItems: 3, maxChars: 2000 }
+      }))
+    ]).then(([codegraphReceipt, memoryReceipt, semanticReceipt]) => ({
+      codegraph: codegraphReceipt,
+      agentmemory: memoryReceipt,
+      semantic: semanticReceipt
+    })).finally(() => {
+      if (prewarmInFlight.get(key) === operation) prewarmInFlight.delete(key);
+    });
+    prewarmInFlight.set(key, operation);
+    return operation;
+  }
 
   return {
     application: createApplicationContainer({
@@ -142,37 +180,13 @@ export function createDefaultApplicationContainer(
     }),
     memorySessions,
     invalidateContext(root, changedFiles = []) {
-      revisions.bump(root);
+      revisions.bump(root, changedFiles);
       filesystem.invalidate(root);
       semantic.invalidate(root);
-      void Promise.allSettled([
-        codegraph.ensureIndexed(root, changedFiles),
-        semantic.context({
-          task: "Warm semantic project state after local edits",
-          root,
-          ...(changedFiles.length ? { changedFiles } : {}),
-          budget: { maxItems: 3, maxChars: 2000 }
-        })
-      ]);
+      return warmContext(root, changedFiles);
     },
-    async prewarmContext(root, changedFiles = []) {
-      const [codegraphReceipt, memoryReceipt, semanticReceipt] = await Promise.all([
-        settlePrewarm(() => changedFiles.length
-          ? codegraph.ensureIndexed(root, changedFiles)
-          : (codegraph.prewarm?.(root) ?? codegraph.ensureIndexed(root))),
-        settlePrewarm(() => memorySessions.ensureSession(root, "Prewarm project context")),
-        settlePrewarm(() => semantic.context({
-          task: "Warm project semantic state",
-          root,
-          ...(changedFiles.length ? { changedFiles } : {}),
-          budget: { maxItems: 3, maxChars: 2000 }
-        }))
-      ]);
-      return {
-        codegraph: codegraphReceipt,
-        agentmemory: memoryReceipt,
-        semantic: semanticReceipt
-      };
+    prewarmContext(root, changedFiles = []) {
+      return warmContext(root, changedFiles);
     },
     async close() {
       const errors: unknown[] = [];

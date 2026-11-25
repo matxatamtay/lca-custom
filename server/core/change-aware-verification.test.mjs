@@ -5,6 +5,51 @@ import path from "node:path";
 import test from "node:test";
 import { createChangeAwareVerification, buildVerificationFingerprint, discoverImpactedTests } from "./change-aware-verification.mjs";
 
+test("TS-only typecheck is skipped for JavaScript outside tsconfig scope", async () => {
+  const root = await makeRoot("lca-verify-ts-scope-");
+  try {
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src", "thing.mjs"), "export const thing = 1;\n");
+    await writeFile(path.join(root, "src", "thing.ts"), "export const thing = 1;\n");
+    await writeFile(path.join(root, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit" } }));
+    await writeFile(path.join(root, "tsconfig.json"), JSON.stringify({ include: ["src/**/*.ts"] }));
+    const verify = createChangeAwareVerification({
+      getTestCommandsMerged: async () => ({ test: null, lint: null, build: null, typecheck: "npm run typecheck" }),
+      runGatedCommand: async () => ({ ok: true }),
+      cachePathForRoot: () => path.join(root, "verification.json")
+    });
+    assert.equal((await verify.plan(root, ["src/thing.mjs"])).gates.some((gate) => gate.name === "typecheck"), false);
+    assert.equal((await verify.plan(root, ["src/thing.ts"])).gates.some((gate) => gate.name === "typecheck"), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("concurrent identical verification gates share the executing command", async () => {
+  const root = await makeRoot("lca-verify-coalesce-");
+  let runs = 0;
+  let release;
+  try {
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src", "thing.ts"), "export const thing = 1;\n");
+    const barrier = new Promise((resolve) => { release = resolve; });
+    const verify = createChangeAwareVerification({
+      getTestCommandsMerged: async () => ({ test: null, lint: null, build: null, typecheck: "npm run typecheck" }),
+      runGatedCommand: async () => { runs += 1; await barrier; return { ok: true, exit_code: 0, summary: "ok" }; },
+      cachePathForRoot: () => path.join(root, "verification.json")
+    });
+    const first = verify.execute(root, ["src/thing.ts"]);
+    const second = verify.execute(root, ["src/thing.ts"]);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    release();
+    const results = await Promise.all([first, second]);
+    assert.equal(runs, 1);
+    assert.equal(results.reduce((sum, result) => sum + result.shared, 0), 1);
+    assert.equal(results.every((result) => result.ok), true);
+  } finally {
+    release?.();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function makeRoot(prefix) {
   return mkdtemp(path.join(os.tmpdir(), prefix));
 }

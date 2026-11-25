@@ -1,6 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { composeTaskContext } from "./context-composer.mjs";
+import { composeTaskContext, compactTaskContextForModel } from "./context-composer.mjs";
+
+test("compact model context retains source locations and removes ranking diagnostics", () => {
+  const full = {
+    evidence: [{ id: "a", path: "/repo/src/a.ts", content: "important code",
+      metadata: { line: 10, cache_hit: true, jevRerank: { payload: "x".repeat(4000) }, reranked_score: 75 } }],
+    project_resolution: { candidates: Array.from({ length: 20 }, (_, i) => i) },
+    execution_hints: { workflow: { mode: "fast_path", telemetry: { payload: "x".repeat(1000) } } }
+  };
+  const compact = compactTaskContextForModel(full);
+  assert.equal(compact.evidence[0].content, "important code");
+  assert.equal(compact.evidence[0].metadata.line, 10);
+  assert.equal(compact.evidence[0].metadata.cache_hit, true);
+  assert.equal(compact.evidence[0].metadata.jevRerank, undefined);
+  assert.equal(compact.project_resolution.candidates.length, 5);
+  assert.equal(compact.execution_hints.workflow.mode, "fast_path");
+  assert.equal(compact.execution_hints.workflow.telemetry, undefined);
+  assert.ok(JSON.stringify(compact).length < JSON.stringify(full).length / 2);
+  assert.ok(full.evidence[0].metadata.jevRerank);
+});
 
 const providers = ["filesystem", "semantic", "codegraph", "agentmemory"];
 
@@ -109,4 +128,24 @@ test("compacts duplicate semantic symbols and bounds noisy provider candidates",
   assert.equal(result.evidence.find((item) => item.provider === "semantic")?.path, "src/retry.ts");
   assert.ok(result.evidence.filter((item) => item.provider === "filesystem").length <= 8);
   assert.ok(result.composition.compaction.dropped_items >= 5);
+});
+
+test("cross-provider duplicate bodies become lightweight references without losing provider coverage", () => {
+  const shared = "same implementation evidence ".repeat(120);
+  const result = composeTaskContext({
+    context: baseContext([
+      { ...evidence("filesystem", 0, 100), path: "src/a.ts", content: shared },
+      { ...evidence("semantic", 0, 300), symbol: "A", path: "src/a.ts" },
+      { ...evidence("codegraph", 0, 100), content: shared },
+      { ...evidence("agentmemory", 0, 100), content: shared }
+    ]),
+    maxItems: 10,
+    maxChars: 12_000
+  });
+
+  assert.deepEqual(new Set(result.evidence.map((item) => item.provider)), new Set(providers));
+  assert.equal(result.composition.compaction.duplicate_references, 2);
+  assert.equal(result.evidence.filter((item) => item.content === shared).length, 1);
+  assert.equal(result.evidence.filter((item) => item.metadata?.context_duplicate_of).length, 2);
+  assert.ok(result.composition.budget.evidence_used_chars < shared.length * 2);
 });

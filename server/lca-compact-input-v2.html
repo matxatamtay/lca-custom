@@ -382,7 +382,7 @@
 
     function conversationScopeText() {
       if (!primaryProject) {
-        return 'LCA conversation project scope is unset. Omit the top-level project field on LCA calls and preserve normal multi-project discovery.';
+        return 'All projects are peers. For coding, identify the project from the task and pass its exact name or absolute path on every LCA workspace call. If unclear, ask or use multi-project search; never assume the first folder.';
       }
       return `LCA conversation primary folder is ${primaryProject}. For every LCA tool call in this conversation, pass project: ${JSON.stringify(primaryProject)} at the top level. Resolve relative paths and default discovery from it. Other projects remain available through explicit absolute paths.`;
     }
@@ -862,8 +862,11 @@
       const widgetState = window.openai?.widgetState || {};
       const privateState = widgetState.privateContent || widgetState.private_content || {};
       const initial = output.initial_input || inputArgs.initial_input || '';
-      const storedProject = privateState.primaryProject || widgetState.primaryProject || widgetState.primary_project;
-      const requestedProject = storedProject || output.primary_project || inputArgs.primary_project || null;
+      // A persisted null is a deliberate "All projects" selection, not missing state.
+      const requestedProject = Object.hasOwn(privateState, 'primaryProject') ? privateState.primaryProject
+        : Object.hasOwn(widgetState, 'primaryProject') ? widgetState.primaryProject
+        : Object.hasOwn(widgetState, 'primary_project') ? widgetState.primary_project
+        : output.primary_project ?? inputArgs.primary_project ?? null;
       populateProjectSelect(output.projects || [], requestedProject);
       if (initial && !input.value) input.value = initial;
       syncInputUi();

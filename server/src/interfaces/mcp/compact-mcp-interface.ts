@@ -6,9 +6,9 @@ import { TARGET_TOOL_CATALOG } from "./tool-catalog.js";
 export const COMPACT_SERVER_INSTRUCTIONS = [
   "For every coding task call workspace_context first. It always queries current files, native semantic analysis, CodeGraph, and AgentMemory and returns a coverage receipt.",
   "Use the compact facade tools. Each facade accepts a short action alias or an exact hidden backend tool name plus an arguments object. Call action=discover only when you need facade action discovery.",
-  "Actions execute directly in the trusted local runtime without policy or approval round-trips. Project roots are discovery defaults, not authorization boundaries.",
-  "Batch work, keep outputs bounded, and avoid repeating reads, searches, or commands. For related text lookups, use workspace_search action=text with queries[] in one round-trip. For two or more related edits, prefer one workspace_edit action=batch/apply_patch call; replace_in_file also accepts an ordered replacements array for same-file edits. Use workspace_verify before declaring code changes complete.",
-  "Use figma, dbeaver, and bruno for desktop integrations, and coolify for the configured remote Coolify MCP. Use lca_input for the ChatGPT companion UI."
+  "Actions execute directly in the trusted local runtime. Configured projects are peers, not authorization boundaries. For a multi-project task pass the exact project name or absolute project directory on every workspace call. After workspace_context, reuse its project_resolution.workspace_root; never assume the first root. If selection is ambiguous, use an explicit project or path.",
+  "Batch work, keep outputs bounded, and avoid repeating reads, searches, or commands. For related text lookups, use workspace_search action=text with queries[] in one round-trip. For two or more reads use workspace_read action=many. For two or more independent foreground commands use workspace_exec action=many with parallel=true; use id + depends_on when command order matters, and reserve action=one for a genuinely single command. For two or more related edits, prefer one workspace_edit action=batch/apply_patch call; replace_in_file also accepts an ordered replacements array for same-file edits. Use workspace_verify before declaring code changes complete.",
+  "Use figma, dbeaver, and bruno for desktop integrations; use workspace_ui blender_* actions for Blender; and coolify for the configured remote Coolify MCP. Use lca_input for the ChatGPT companion UI."
 ].join("\n");
 
 export interface BackendToolDefinition {
@@ -110,8 +110,16 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
   },
   workspace_exec: {
     defaultAction: "run_commands",
-    aliases: { one: "run_command", many: "run_commands", parallel: "parallel_tasks", code: "run_code" },
-    exact: new Set(["run_command", "run_commands", "parallel_tasks", "run_code"])
+    aliases: {
+      one: "run_command",
+      many: "run_commands",
+      parallel: "parallel_tasks",
+      code: "run_code",
+      secret: "secret_prompt",
+      secrets: "secret_status",
+      forget_secret: "secret_forget"
+    },
+    exact: new Set(["run_command", "run_commands", "parallel_tasks", "run_code", "secret_prompt", "secret_status", "secret_forget"])
   },
   workspace_process: {
     defaultAction: "proc_list",
@@ -166,8 +174,17 @@ export const COMPACT_GROUP_DEFINITIONS: Readonly<Record<CompactFacadeName, Compa
       hierarchy: "ui_android_hierarchy",
       input: "ui_android_input",
       logcat: "ui_android_logcat",
-      record: "ui_android_record"
+      record: "ui_android_record",
+      blender: "blender_status",
+      blender_status: "blender_status",
+      blender_actions: "blender_list_tools",
+      blender_call: "blender_call_tool"
     },
+    exact: new Set([
+      "blender_status",
+      "blender_list_tools",
+      "blender_call_tool"
+    ]),
     prefix: "ui_"
   },
   workspace_status: {
@@ -264,17 +281,17 @@ export const COMPACT_TOOL_DESCRIPTIONS: Readonly<Record<CompactFacadeName, strin
   workspace_search: "Search structural AST patterns, files, text, symbols, repository maps, graph-oriented indexes, and TODOs. Prefer action=ast for exact syntax structure, semantic symbol actions next, and action=text for plain text. Batch related text queries with arguments.queries[].",
   workspace_read: "Read one or many files, stat paths, list files or notes, and resume checkpoints. Common actions: one, many, stat, list, notes, resume.",
   workspace_edit: "Apply, preview, validate, and undo patches; run bounded ast-grep structural rewrites; write, replace, move, or delete paths; maintain notes and task state. Use action=ast_rewrite for safe codemods and action=batch/apply_patch for ordinary related edits.",
-  workspace_exec: "Run bounded foreground commands. Common actions: one or many.",
+  workspace_exec: "Run bounded foreground commands. Default to action=many for related commands; set parallel=true for independent work and use id + depends_on for dependency DAGs. Reserve action=one for a genuinely single command.",
   workspace_process: "Start, list, inspect output from, and stop managed background processes.",
   workspace_git: "Run Git commands, compact status/diffs, and LCA-managed isolated worktrees for parallel tasks.",
   workspace_verify: "Detect and run focused lint, typecheck, test, build, review, security, local Semgrep regression/invariant scans, learned-rule lifecycle management, incremental mutation testing, and session-report gates.",
-  workspace_ui: "Inspect and control trusted-local browser tabs and connected Android devices.",
+  workspace_ui: "Inspect and control trusted-local browser tabs, connected Android devices, and the pinned Blender MCP integration. Blender actions: blender, blender_status, blender_actions, blender_call.",
   workspace_status: "Inspect workspace, trusted runtime, project profile, readiness, long-lived performance metrics, ranked self-improvement candidates, and advisory dependency feeds.",
   workspace_skill: "Discover, read, create, and delete reusable skills, or compose companion prompts.",
   figma: "Use Figma Remote MCP with OAuth and guarded canvas writes, plus the persistent Desktop fallback. Common actions: status, actions, call, auth, remote_status, remote_actions, remote_call, or an exact figma_* backend action.",
   dbeaver: "Use the persistent DBeaver Desktop integration. Common actions: status, actions, call, propose, or an exact dbeaver_* backend action.",
   bruno: "Use the persistent Bruno Desktop integration. Common actions: status, actions, call, run, or an exact bruno_* backend action.",
-  penpot: "Use the local Penpot MCP integration. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.",
+  penpot: "Use Penpot Cloud and local MCP concurrently. Pass arguments.source=cloud or local for any action; status without source shows both; other actions default to local. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.",
   coolify: "Use the pinned local Coolify MCP stdio integration. Common actions: status, actions, read, mutate, destructive, call, or an exact coolify_* backend action.",
   notion: "Use the Notion REST API integration. Common actions: status, actions, search, fetch, create, update, replace, call, or an exact notion_* backend action. AI-generated edits must be staged through notion_page for preview and explicit Apply approval before update/replace is used."
 });
@@ -305,7 +322,7 @@ export function registerCompactMcpTools(
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true },
       inputSchema: {
         task: z.string().min(1).describe("Concrete coding task or question."),
-        project: z.string().optional().describe("Conversation-scoped primary project or folder selected in lca_input."),
+        project: z.string().optional().describe("Exact configured project name or existing absolute directory. Takes precedence over task inference."),
         path: z.string().optional().describe("Root or subdirectory to inspect. When omitted, the backend may select a uniquely mentioned configured project from the task."),
         intent: z.enum(["understand", "debug", "implement", "refactor", "review"]).optional(),
         changed_files: z.array(z.string()).optional(),
@@ -329,7 +346,7 @@ export function registerCompactMcpTools(
         description: `${COMPACT_TOOL_DESCRIPTIONS[facade]} Use action=discover to list exact backend actions and their input keys.`,
         inputSchema: {
           action: z.string().optional().describe(`Short alias or exact backend tool name. Default: ${definition.defaultAction}. Use discover for available actions.`),
-          project: z.string().optional().describe("Conversation-scoped primary project or folder selected in lca_input. Relative paths and default discovery use it only for this tool call."),
+          project: z.string().optional().describe("Exact configured project name or existing absolute directory. Reuse the resolved project on every call; relative paths and defaults use this scope."),
           arguments: z.record(z.any()).optional().describe("Arguments forwarded unchanged to the selected backend tool.")
         }
       },

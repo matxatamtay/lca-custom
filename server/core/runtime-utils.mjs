@@ -40,14 +40,14 @@ export function parseExtraRoots(startupProfile = null) {
       if (!Array.isArray(parsed) || parsed.some((p) => typeof p !== "string")) {
         throw new Error("AGENT_EXTRA_ROOTS_JSON must be a JSON string array.");
       }
-      return dedupe([...parsed, ...(Array.isArray(startupProfile?.extraRoots) ? STARTUP_PROFILE.extraRoots : [])]).map((p) => path.resolve(p));
+      return dedupe([...parsed, ...(Array.isArray(startupProfile?.extraRoots) ? startupProfile.extraRoots : [])]).map((p) => path.resolve(p));
     } catch (err) {
       console.warn(`Invalid AGENT_EXTRA_ROOTS_JSON ignored: ${err?.message || err}`);
     }
   }
   return dedupe([
     ...(process.env.AGENT_EXTRA_ROOTS || "").split(";"),
-    ...(Array.isArray(startupProfile?.extraRoots) ? STARTUP_PROFILE.extraRoots : [])
+    ...(Array.isArray(startupProfile?.extraRoots) ? startupProfile.extraRoots : [])
   ])
     .map((s) => s.trim())
     .filter(Boolean)

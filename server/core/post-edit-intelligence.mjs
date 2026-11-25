@@ -11,7 +11,8 @@ export function createPostEditIntelligence(options) {
     runShellCommand,
     resolveFormatter = detectFormatter,
     readState = readPathState,
-    changeAwareVerification
+    changeAwareVerification,
+    onContextPrewarm
   } = options;
 
   async function analyze(changedPaths) {
@@ -59,7 +60,10 @@ export function createPostEditIntelligence(options) {
       const verification = await buildVerificationPlan(root, rootFiles);
       try {
         const runtime = await getNextApplicationRuntime();
-        runtime?.invalidateContext?.(root, rootFiles);
+        const warmed = runtime?.invalidateContext?.(root, rootFiles);
+        if (warmed && typeof warmed.then === "function") {
+          void warmed.then((receipt) => onContextPrewarm?.(root, rootFiles, receipt)).catch(() => {});
+        }
       } catch {
         // Cache invalidation/prewarm is an optimization and must never change edit success.
       }

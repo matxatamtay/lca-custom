@@ -18,7 +18,7 @@ import {
   copyFile,
   cp
 } from "node:fs/promises";
-import { createWriteStream, readFileSync, existsSync } from "node:fs";
+import { createWriteStream, readFileSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
@@ -52,6 +52,7 @@ import { createMutationTestingRunner } from "./core/mutation-testing.mjs";
 import { buildRuntimeWaterfall } from "./core/runtime-waterfall.mjs";
 import { createCommandRuntime } from "./core/command-runtime.mjs";
 import { createExecAccelerator } from "./core/exec-accelerator.mjs";
+import { createSecretVault } from "./core/secret-vault.mjs";
 import { createProjectIntelligence } from "./core/project-intelligence.mjs";
 import { resolveActiveProjectRoot as discoverActiveProjectRoot } from "./core/project-root-discovery.mjs";
 import { createRepoIndexCore } from "./core/repo-index-core.mjs";
@@ -112,6 +113,7 @@ import {
 } from "./bruno-desktop.mjs";
 import {
   DEFAULT_PENPOT_MCP_URL,
+  DEFAULT_PENPOT_CLOUD_MCP_URL,
   callDestructivePenpotTool,
   callMutatingPenpotTool,
   callPenpotTool,
@@ -132,6 +134,12 @@ import {
   coolifyMcpStatus,
   listCoolifyMcpTools
 } from "./coolify-mcp.mjs";
+import {
+  DEFAULT_BLENDER_MCP_HOST,
+  DEFAULT_BLENDER_MCP_PORT,
+  DEFAULT_BLENDER_MCP_SOURCE,
+  closeBlenderMcpClients
+} from "./blender-mcp.mjs";
 import {
   DEFAULT_NOTION_API_BASE,
   DEFAULT_NOTION_VERSION,
@@ -157,11 +165,12 @@ import {
 } from "./typescript-code-intelligence.mjs";
 import { ToolMetrics, measureJsonChars } from "./tool-metrics.mjs";
 import { runCodeMode } from "./code-mode-runtime.mjs";
-import { resolveTaskProjectRoot } from "./project-routing.mjs";
+import { resolveTaskProjectRoot, resolveProjectSelection } from "./project-routing.mjs";
 import { createFigmaToolRegistrar } from "./integrations/figma-tools.mjs";
 import { createDBeaverToolRegistrar } from "./integrations/dbeaver-tools.mjs";
 import { createBrunoToolRegistrar } from "./integrations/bruno-tools.mjs";
 import { createCoolifyToolRegistrar } from "./integrations/coolify-tools.mjs";
+import { createBlenderToolRegistrar } from "./integrations/blender-tools.mjs";
 import { createCompanionContextSearch } from "./companion/context-search.mjs";
 import { createCompanionMcp } from "./companion/mcp-tools.mjs";
 import { createRepoIntelToolRegistrar } from "./tools/repo-intel-tools.mjs";
@@ -324,7 +333,8 @@ function runtimeTraceReport({ correlationId = null, traceLimit = 5, spanLimit = 
       correlationId,
       traceLimit,
       spanLimit,
-      otelEnabled: OTEL_EXPORTER.enabled
+      otelEnabled: OTEL_EXPORTER.enabled,
+      profilingEnabled: PERFORMANCE_PROFILING_ENABLED
     }
   );
 }
@@ -345,6 +355,7 @@ await RUNTIME_PLUGIN_HOST.mount({
         closeBrunoDesktopClients(),
         closePenpotClients(),
         closeCoolifyMcpClients(),
+        closeBlenderMcpClients(),
         closeBrowserAgentClient()
       ]);
     }
@@ -385,9 +396,16 @@ const BRUNO_DESKTOP_AUTH_TOKEN = String(process.env.BRUNO_DESKTOP_AUTH_TOKEN || 
 const PENPOT_MCP_URL = String(process.env.PENPOT_MCP_URL || DEFAULT_PENPOT_MCP_URL).trim();
 const PENPOT_MCP_TIMEOUT_MS = boundedNumber(process.env.PENPOT_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const PENPOT_USER_TOKEN = String(process.env.PENPOT_USER_TOKEN || "").trim();
+const PENPOT_CLOUD_MCP_URL = String(process.env.PENPOT_CLOUD_MCP_URL || DEFAULT_PENPOT_CLOUD_MCP_URL).trim();
+const PENPOT_CLOUD_USER_TOKEN = String(process.env.PENPOT_CLOUD_USER_TOKEN || "").trim();
 const COOLIFY_BASE_URL = String(process.env.COOLIFY_BASE_URL || DEFAULT_COOLIFY_BASE_URL).trim();
 const COOLIFY_MCP_TIMEOUT_MS = boundedNumber(process.env.COOLIFY_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
 const COOLIFY_ACCESS_TOKEN = String(process.env.COOLIFY_ACCESS_TOKEN || "").trim();
+const BLENDER_MCP_HOST = String(process.env.BLENDER_MCP_HOST || DEFAULT_BLENDER_MCP_HOST).trim();
+const BLENDER_MCP_PORT = boundedNumber(process.env.BLENDER_MCP_PORT, DEFAULT_BLENDER_MCP_PORT, 1024, 65535);
+const BLENDER_MCP_TIMEOUT_MS = boundedNumber(process.env.BLENDER_MCP_TIMEOUT_MS, 120_000, 1_000, 300_000);
+const BLENDER_MCP_SOURCE = String(process.env.BLENDER_MCP_SOURCE || DEFAULT_BLENDER_MCP_SOURCE).trim();
+const BLENDER_MCP_UVX_BIN = String(process.env.BLENDER_MCP_UVX_BIN || "uvx").trim();
 const NOTION_API_BASE = String(process.env.NOTION_API_BASE || DEFAULT_NOTION_API_BASE).trim();
 const NOTION_VERSION = String(process.env.NOTION_VERSION || DEFAULT_NOTION_VERSION).trim();
 const NOTION_API_KEY = String(process.env.NOTION_API_KEY || "").trim();
@@ -422,6 +440,10 @@ const registerBrunoDesktopTools = createBrunoToolRegistrar({
 });
 const registerCoolifyMcpTools = createCoolifyToolRegistrar({
   reg, jsonResult, COOLIFY_BASE_URL, COOLIFY_MCP_TIMEOUT_MS, COOLIFY_ACCESS_TOKEN
+});
+const registerBlenderMcpTools = createBlenderToolRegistrar({
+  reg, jsonResult, BLENDER_MCP_HOST, BLENDER_MCP_PORT, BLENDER_MCP_TIMEOUT_MS,
+  BLENDER_MCP_SOURCE, BLENDER_MCP_UVX_BIN
 });
 
 // v2.1 Repo index cache
@@ -458,12 +480,22 @@ const DECISIONS_PATH = path.join(AGENT_STATE_DIR, "decisions.md");
 const MEMORY_VAULT_PATH = defaultMemoryVault();
 const TASK_ID_SCHEMA = z.string().min(1).max(80).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).optional();
 const TOUCHES_SCHEMA = z.array(z.string().min(1).max(1000)).max(200).optional();
-const WORKSPACE_PROTOCOL = new WorkspaceProtocol({
-  primaryRoot: PRIMARY_ROOT,
-  projectId: WORKSPACE_ID,
-  stateDir: AGENT_STATE_DIR,
-  vaultDir: MEMORY_VAULT_PATH
-});
+const workspaceProtocols = new Map();
+function workspaceProtocol(root = resolvePath(".")) {
+  const resolved = projectRootForPath(root);
+  const key = comparePath(resolved);
+  let protocol = workspaceProtocols.get(key);
+  if (!protocol) {
+    protocol = new WorkspaceProtocol({
+      primaryRoot: resolved,
+      projectId: createHash("sha256").update(key).digest("hex").slice(0, 16),
+      stateDir: path.join(resolved, ".agent", "state"),
+      vaultDir: MEMORY_VAULT_PATH
+    });
+    workspaceProtocols.set(key, protocol);
+  }
+  return protocol;
+}
 
 function activeAgentStateDir() {
   const scopedRoot = CONVERSATION_RUNTIME.scopedPrimaryRoot();
@@ -485,13 +517,19 @@ function activeCheckpointPath() {
 
 // v2.8 Profile
 
-// Skills: reusable playbooks the agent can load on demand (Claude-style).
-// Discovered from: AGENT_SKILLS_DIR (env), the repo's shipped skills/, and each
-// workspace root's .claude/skills and .agent/skills.
+// Skills: reusable playbooks the agent can load on demand.
+// Discovered from: AGENT_SKILLS_DIR (env), the repo's shipped skills/, each
+// workspace root's .claude/skills, .agent/skills, and .agents/skills, plus the
+// user-global Universal Agent Standard directory (~/.agents/skills).
 const SKILLS_DIRS = dedupe([
   ...(process.env.AGENT_SKILLS_DIR ? [path.resolve(process.env.AGENT_SKILLS_DIR)] : []),
   path.resolve(APP_DIR, "..", "skills"),
-  ...ROOTS.flatMap((r) => [path.join(r, ".claude", "skills"), path.join(r, ".agent", "skills")])
+  ...ROOTS.flatMap((r) => [
+    path.join(r, ".claude", "skills"),
+    path.join(r, ".agent", "skills"),
+    path.join(r, ".agents", "skills")
+  ]),
+  path.join(os.homedir(), ".agents", "skills")
 ]);
 
 const MAX_READ_CHARS = Number(process.env.AGENT_MAX_READ_CHARS || 200_000);
@@ -556,13 +594,16 @@ let runtimeRecoveryMetrics = {
   backup_retention: null,
   worktrees: { roots_scanned: 0, skipped_non_git: 0, stale: 0, removed: 0, protected_dirty: 0, errors: [] }
 };
-const performanceTelemetry = createPerformanceTelemetry({ filePath: PERFORMANCE_TELEMETRY_PATH });
-const performanceFollow = createPerformanceFollow({ filePath: PERFORMANCE_FOLLOW_PATH });
+// Detailed profiling is opt-in; bounded task metrics still drive the in-memory workflow.
+const PERFORMANCE_PROFILING_ENABLED = process.env.AGENT_PERFORMANCE_PROFILING === "1";
+const performanceTelemetry = createPerformanceTelemetry({ filePath: PERFORMANCE_PROFILING_ENABLED ? PERFORMANCE_TELEMETRY_PATH : null });
+const performanceFollow = createPerformanceFollow({ enabled: PERFORMANCE_PROFILING_ENABLED, filePath: PERFORMANCE_FOLLOW_PATH });
 
 const { defaultShell, killProcessTree, runShellCommand, spawnCapture, startBackground } = createCommandRuntime({
   MAX_COMMAND_OUTPUT, PRIMARY_ROOT, PROC_BUFFER, appendLimited, hasCommand, isoNow, processes
 });
 const execAccelerator = createExecAccelerator({ runShellCommand });
+const SECRET_VAULT = createSecretVault();
 const runAcceleratedShellCommand = (command, cwd, shell, timeoutMs, options = {}) =>
   execAccelerator.run(command, cwd, shell, timeoutMs, options);
 
@@ -831,7 +872,7 @@ async function improvementReport({
 const { detectTestCommands, parseTestFailures, runGatedCommand } = createTestCore({ runShellCommand: runAcceleratedShellCommand });
 
 const { loadWorkspaceProfile, registerProfileTools, getTestCommandsMerged } = createWorkspaceProfile({
-  PRIMARY_ROOT, detectTestCommands, jsonResult, log, reg
+  PRIMARY_ROOT, detectTestCommands, jsonResult, log, reg, resolveDefaultRoot: () => resolvePath("."), projectRootForPath
 });
 
 // ----------------------------------------------------------------------------
@@ -929,7 +970,7 @@ if (ADB_BIN) console.log(`adb detected: ${ADB_BIN}`);
 const {
   attachContext, buildTree, buildTreeFast, findFiles, gitGrep, listEntries, listRepoFilesFast,
   ripgrepGrep, searchTree
-} = createFilesystemCore({ RG_BIN, SKIP_DIRS, toRel });
+} = createFilesystemCore({ RG_BIN, SKIP_DIRS, toRel, resolveDisplayPath: (value) => path.resolve(activePrimaryRoot(), value) });
 
 
 const { collectImportantFiles, compactGitStatus, detectProjectProfile, recommendNextActions, scanSymbols } = createProjectIntelligence({
@@ -940,7 +981,14 @@ const {
   buildRepoIndex, indexFresh, indexMatches, readRepoIndex, relEntriesToAbs, symbolsCover, treeCovers, writeRepoIndex
 } = createRepoIndexCore({
   INDEX_PATH, REPO_INDEX_TTL_MS, RG_BIN, buildTreeFast, collectImportantFiles,
-  compactGitStatus, detectProjectProfile, isoNow, scanSymbols, toRel
+  compactGitStatus, detectProjectProfile, isoNow, scanSymbols, toRel,
+  resolveDisplayPath: (value) => path.resolve(activePrimaryRoot(), value),
+  cachePath: (rootDir = resolvePath(".")) => {
+    const root = path.resolve(rootDir);
+    const displayRoot = activePrimaryRoot();
+    const key = createHash("sha256").update(comparePath(root) + "\0" + comparePath(displayRoot)).digest("hex").slice(0, 16);
+    return path.join(workspaceStateRegistry.forRoot(projectRootForPath(root)).paths.workspaceDataDir, "indexes", key + ".json");
+  }
 });
 
 const { analyzeDiff, buildSessionReport, collectWorkspaceDoctor, recommendedReads, runQualityGate } = createVerificationCore({
@@ -965,6 +1013,14 @@ const postEditIntelligence = createPostEditIntelligence({
   getNextApplicationRuntime,
   getTestCommandsMerged,
   changeAwareVerification,
+  onContextPrewarm: (root, _files, providers) => performanceFollow.recordPrewarm({
+    root: projectRootForPath(root),
+    projectRoot: root,
+    name: "post-edit",
+    success: Object.values(providers || {}).every((entry) => entry?.status === "fulfilled"),
+    providers,
+    durationMs: Math.max(0, ...Object.values(providers || {}).map((entry) => Number(entry?.latencyMs || 0)))
+  }),
   resolveProjectRoot: async (file) => {
     const workspaceRoot = projectRootForPath(file);
     return (await discoverActiveProjectRoot({
@@ -1164,7 +1220,7 @@ function registerSharedWorkspaceTools(mcp) {
       description: "Return the Obsidian-compatible persistent memory vault path and folder layout.",
       inputSchema: {}
     },
-    async () => jsonResult(WORKSPACE_PROTOCOL.memoryStatus())
+    async () => jsonResult(workspaceProtocol().memoryStatus())
   );
 
   reg(
@@ -1184,7 +1240,7 @@ function registerSharedWorkspaceTools(mcp) {
       }
     },
     async (args) => {
-      const result = await WORKSPACE_PROTOCOL.pinContext(args);
+      const result = await workspaceProtocol().pinContext(args);
       return jsonResult({
         ...result,
         result_digest: buildResultDigest({ ok: true, summary: `Pinned persistent context ${result.key}.`, changedFiles: [result.path] })
@@ -1204,7 +1260,7 @@ function registerSharedWorkspaceTools(mcp) {
         limit: z.number().int().min(1).max(200).optional()
       }
     },
-    async (args) => jsonResult(await WORKSPACE_PROTOCOL.listContext(args))
+    async (args) => jsonResult(await workspaceProtocol().listContext(args))
   );
 
   reg(
@@ -1218,7 +1274,7 @@ function registerSharedWorkspaceTools(mcp) {
         scope: z.enum(["global", "project"]).optional()
       }
     },
-    async (args) => jsonResult(await WORKSPACE_PROTOCOL.explainContext(args))
+    async (args) => jsonResult(await workspaceProtocol().explainContext(args))
   );
 
   reg(
@@ -1233,7 +1289,7 @@ function registerSharedWorkspaceTools(mcp) {
       }
     },
     async (args) => {
-      const result = await WORKSPACE_PROTOCOL.removeContext(args);
+      const result = await workspaceProtocol().removeContext(args);
       return jsonResult({
         ...result,
         result_digest: buildResultDigest({ ok: true, summary: `Removed persistent context ${result.key}.`, changedFiles: [result.removed] })
@@ -1263,11 +1319,11 @@ function registerSharedWorkspaceTools(mcp) {
       }
     },
     async (args) => {
-      const task = await WORKSPACE_PROTOCOL.createTaskBrief(args);
+      const task = await workspaceProtocol().createTaskBrief(args);
       return jsonResult({
         ok: true,
         ...task,
-        vault_note: path.join(WORKSPACE_PROTOCOL.memoryStatus().folders.tasks, `${task.task_id}.md`),
+        vault_note: path.join(workspaceProtocol().memoryStatus().folders.tasks, `${task.task_id}.md`),
         result_digest: buildResultDigest({ ok: true, taskId: task.task_id, summary: `Task brief ${task.task_id} status is ${task.status}.` })
       });
     }
@@ -1281,7 +1337,7 @@ function registerSharedWorkspaceTools(mcp) {
       description: "Read a structured task brief by task_id, or the current active brief when omitted.",
       inputSchema: { task_id: taskId }
     },
-    async ({ task_id }) => jsonResult(await WORKSPACE_PROTOCOL.getTask(task_id))
+    async ({ task_id }) => jsonResult(await workspaceProtocol().getTask(task_id))
   );
 
   reg(
@@ -1298,7 +1354,7 @@ function registerSharedWorkspaceTools(mcp) {
         risk: z.enum(["low", "medium", "high"]).optional()
       }
     },
-    async (args) => jsonResult(await WORKSPACE_PROTOCOL.intentCheck(args))
+    async (args) => jsonResult(await workspaceProtocol().intentCheck(args))
   );
 
   reg(
@@ -1314,7 +1370,7 @@ function registerSharedWorkspaceTools(mcp) {
         denied_paths: pathList
       }
     },
-    async (args) => jsonResult(await WORKSPACE_PROTOCOL.scopeGuard(args))
+    async (args) => jsonResult(await workspaceProtocol().scopeGuard(args))
   );
 
   reg(
@@ -1333,7 +1389,7 @@ function registerSharedWorkspaceTools(mcp) {
         id: z.string().min(1).max(200).optional()
       }
     },
-    async (args) => jsonResult(await WORKSPACE_PROTOCOL.knowledgeState(args))
+    async (args) => jsonResult(await workspaceProtocol().knowledgeState(args))
   );
 
   reg(
@@ -1357,9 +1413,10 @@ function registerSharedWorkspaceTools(mcp) {
 }
 
 async function buildHandoffPacket({ task_id, summary = "", completed = [], in_progress = [], next_actions = [], files_changed = [], tests = [] } = {}) {
-  const base = await WORKSPACE_PROTOCOL.handoffBase(task_id);
-  const statusRes = await spawnCapture("git", ["status", "--porcelain"], PRIMARY_ROOT, DEFAULT_CMD_TIMEOUT);
-  const branchRes = await spawnCapture("git", ["rev-parse", "--abbrev-ref", "HEAD"], PRIMARY_ROOT, DEFAULT_CMD_TIMEOUT);
+  const root = resolvePath(".");
+  const base = await workspaceProtocol(root).handoffBase(task_id);
+  const statusRes = await spawnCapture("git", ["status", "--porcelain"], root, DEFAULT_CMD_TIMEOUT);
+  const branchRes = await spawnCapture("git", ["rev-parse", "--abbrev-ref", "HEAD"], root, DEFAULT_CMD_TIMEOUT);
   const gitFiles = statusRes.exit_code === 0 ? parsePorcelain(statusRes.stdout || "") : [];
   return {
     kind: "handoff_packet",
@@ -1389,17 +1446,33 @@ function registerPenpotMcpTools(mcp) {
     timeoutMs: PENPOT_MCP_TIMEOUT_MS,
     userToken: PENPOT_USER_TOKEN
   };
+  const cloudBridgeOptions = {
+    endpoint: PENPOT_CLOUD_MCP_URL,
+    timeoutMs: PENPOT_MCP_TIMEOUT_MS,
+    userToken: PENPOT_CLOUD_USER_TOKEN
+  };
+  const sourceSchema = z.enum(["local", "cloud"]).optional();
+  const selectBridge = (source) => source === "cloud" ? cloudBridgeOptions : bridgeOptions;
+  // Keep connectivity probes bounded; full read/export/edit actions retain their normal timeout.
+  const statusFor = (options) => penpotStatus({ ...options, timeoutMs: Math.min(options.timeoutMs, 6_000) });
 
   reg(
     mcp,
     "penpot_status",
     {
       title: "Penpot MCP status",
-      description: "Check the local Penpot MCP connection and list live design tools without exposing the user token.",
+      description: "Check local, cloud, or both Penpot MCP connections without exposing user tokens.",
       annotations: readOnly,
-      inputSchema: {}
+      inputSchema: { source: sourceSchema }
     },
-    async () => jsonResult(await penpotStatus(bridgeOptions))
+    async ({ source }) => {
+      if (source) return jsonResult({ source, ...await statusFor(selectBridge(source)) });
+      const [local, cloud] = await Promise.all([
+        statusFor(bridgeOptions),
+        statusFor(cloudBridgeOptions)
+      ]);
+      return jsonResult({ default_source: "local", sources: { local, cloud } });
+    }
   );
 
   reg(
@@ -1407,13 +1480,14 @@ function registerPenpotMcpTools(mcp) {
     "penpot_list_tools",
     {
       title: "List Penpot MCP tools",
-      description: "List every live Penpot MCP tool with its annotations and JSON schema.",
+      description: "List live Penpot MCP tools from local (default) or cloud.",
       annotations: readOnly,
-      inputSchema: {}
+      inputSchema: { source: sourceSchema }
     },
-    async () => {
-      const result = await listPenpotTools(bridgeOptions);
-      return jsonResult({ endpoint: PENPOT_MCP_URL, count: result.tools.length, tools: result.tools });
+    async ({ source }) => {
+      const options = selectBridge(source);
+      const result = await listPenpotTools(options);
+      return jsonResult({ source: source || "local", endpoint: options.endpoint, count: result.tools.length, tools: result.tools });
     }
   );
 
@@ -1422,14 +1496,15 @@ function registerPenpotMcpTools(mcp) {
     "penpot_call_tool",
     {
       title: "Call any Penpot MCP tool",
-      description: "Forward any live Penpot MCP operation directly in the trusted-local runtime. Classification remains metadata only.",
+      description: "Forward a live local or cloud Penpot MCP operation. Classification remains metadata only.",
       annotations: mutation,
       inputSchema: {
+        source: sourceSchema,
         tool: z.string().min(1),
         arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments }) => callPenpotTool(tool, upstreamArguments || {}, bridgeOptions)
+    async ({ source, tool, arguments: upstreamArguments }) => callPenpotTool(tool, upstreamArguments || {}, selectBridge(source))
   );
 
   reg(
@@ -1437,14 +1512,15 @@ function registerPenpotMcpTools(mcp) {
     "penpot_read_tool",
     {
       title: "Call Penpot tool (read compatibility alias)",
-      description: "Compatibility alias that forwards the requested live Penpot MCP operation directly.",
+      description: "Compatibility alias that forwards the requested local or cloud Penpot MCP operation.",
       annotations: readOnly,
       inputSchema: {
+        source: sourceSchema,
         tool: z.string().min(1),
         arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments }) => callReadOnlyPenpotTool(tool, upstreamArguments || {}, bridgeOptions)
+    async ({ source, tool, arguments: upstreamArguments }) => callReadOnlyPenpotTool(tool, upstreamArguments || {}, selectBridge(source))
   );
 
   reg(
@@ -1452,14 +1528,15 @@ function registerPenpotMcpTools(mcp) {
     "penpot_mutate_tool",
     {
       title: "Call Penpot mutation",
-      description: "Compatibility alias that forwards the requested Penpot mutation directly.",
+      description: "Compatibility alias that forwards the requested local or cloud Penpot mutation.",
       annotations: mutation,
       inputSchema: {
+        source: sourceSchema,
         tool: z.string().min(1),
         arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments }) => callMutatingPenpotTool(tool, upstreamArguments || {}, bridgeOptions)
+    async ({ source, tool, arguments: upstreamArguments }) => callMutatingPenpotTool(tool, upstreamArguments || {}, selectBridge(source))
   );
 
   reg(
@@ -1467,17 +1544,18 @@ function registerPenpotMcpTools(mcp) {
     "penpot_destructive_tool",
     {
       title: "Call a destructive Penpot operation",
-      description: "Forward a destructive Penpot operation directly in trusted-local mode without an LCA confirmation round-trip.",
+      description: "Forward a destructive Penpot operation to local or cloud directly in trusted-local mode.",
       annotations: destructive,
       inputSchema: {
+        source: sourceSchema,
         tool: z.string().min(1),
         arguments: z.record(z.any()).optional()
       }
     },
-    async ({ tool, arguments: upstreamArguments }) => callDestructivePenpotTool(
+    async ({ source, tool, arguments: upstreamArguments }) => callDestructivePenpotTool(
       tool,
       upstreamArguments || {},
-      bridgeOptions
+      selectBridge(source)
     )
   );
 
@@ -1486,11 +1564,11 @@ function registerPenpotMcpTools(mcp) {
     "penpot_overview",
     {
       title: "Read Penpot MCP overview",
-      description: "Read the Penpot MCP high-level usage guide before using execute_code.",
+      description: "Read the local or cloud Penpot MCP usage guide before execute_code.",
       annotations: readOnly,
-      inputSchema: {}
+      inputSchema: { source: sourceSchema }
     },
-    async () => callReadOnlyPenpotTool("high_level_overview", {}, bridgeOptions)
+    async ({ source }) => callReadOnlyPenpotTool("high_level_overview", {}, selectBridge(source))
   );
 
   reg(
@@ -1501,11 +1579,12 @@ function registerPenpotMcpTools(mcp) {
       description: "Look up a Penpot Plugin API type and optionally one member before generating design code.",
       annotations: readOnly,
       inputSchema: {
+        source: sourceSchema,
         type: z.string().min(1),
         member: z.string().min(1).optional()
       }
     },
-    async (args) => callReadOnlyPenpotTool("penpot_api_info", args, bridgeOptions)
+    async ({ source, ...args }) => callReadOnlyPenpotTool("penpot_api_info", args, selectBridge(source))
   );
 
   reg(
@@ -1516,11 +1595,12 @@ function registerPenpotMcpTools(mcp) {
       description: "Read a bounded tree of shapes from the currently focused Penpot page.",
       annotations: readOnly,
       inputSchema: {
+        source: sourceSchema,
         max_depth: z.number().int().min(0).max(12).optional(),
         max_shapes: z.number().int().min(1).max(5000).optional()
       }
     },
-    async ({ max_depth, max_shapes }) => inspectPenpotPage({ ...bridgeOptions, maxDepth: max_depth, maxShapes: max_shapes })
+    async ({ source, max_depth, max_shapes }) => inspectPenpotPage({ ...selectBridge(source), maxDepth: max_depth, maxShapes: max_shapes })
   );
 
   reg(
@@ -1531,11 +1611,12 @@ function registerPenpotMcpTools(mcp) {
       description: "Read a bounded tree rooted at the currently selected Penpot shapes.",
       annotations: readOnly,
       inputSchema: {
+        source: sourceSchema,
         max_depth: z.number().int().min(0).max(12).optional(),
         max_shapes: z.number().int().min(1).max(5000).optional()
       }
     },
-    async ({ max_depth, max_shapes }) => inspectPenpotSelection({ ...bridgeOptions, maxDepth: max_depth, maxShapes: max_shapes })
+    async ({ source, max_depth, max_shapes }) => inspectPenpotSelection({ ...selectBridge(source), maxDepth: max_depth, maxShapes: max_shapes })
   );
 
   reg(
@@ -1546,16 +1627,17 @@ function registerPenpotMcpTools(mcp) {
       description: "Export a shape, the first selected shape, or the current page as PNG or SVG for visual review.",
       annotations: readOnly,
       inputSchema: {
+        source: sourceSchema,
         shape_id: z.string().min(1).describe("Shape ID, selection, or page."),
         format: z.enum(["png", "svg"]).optional(),
         mode: z.enum(["shape", "fill"]).optional()
       }
     },
-    async ({ shape_id, format, mode }) => callReadOnlyPenpotTool("export_shape", {
+    async ({ source, shape_id, format, mode }) => callReadOnlyPenpotTool("export_shape", {
       shapeId: shape_id,
       ...(format ? { format } : {}),
       ...(mode ? { mode } : {})
-    }, bridgeOptions)
+    }, selectBridge(source))
   );
 
   reg(
@@ -1565,9 +1647,9 @@ function registerPenpotMcpTools(mcp) {
       title: "Execute Penpot code",
       description: "Execute JavaScript directly in the active Penpot plugin context.",
       annotations: mutation,
-      inputSchema: { code: z.string().min(1) }
+      inputSchema: { source: sourceSchema, code: z.string().min(1) }
     },
-    async ({ code }) => callMutatingPenpotTool("execute_code", { code }, bridgeOptions)
+    async ({ source, code }) => callMutatingPenpotTool("execute_code", { code }, selectBridge(source))
   );
 
   reg(
@@ -1577,9 +1659,9 @@ function registerPenpotMcpTools(mcp) {
       title: "Execute destructive Penpot code",
       description: "Execute delete/remove/clear-like JavaScript directly in trusted-local mode.",
       annotations: destructive,
-      inputSchema: { code: z.string().min(1) }
+      inputSchema: { source: sourceSchema, code: z.string().min(1) }
     },
-    async ({ code }) => callDestructivePenpotTool("execute_code", { code }, bridgeOptions)
+    async ({ source, code }) => callDestructivePenpotTool("execute_code", { code }, selectBridge(source))
   );
 }
 
@@ -1597,8 +1679,8 @@ function registerCodeIntelligenceTools(mcp) {
     description: "Find a symbol definition with native TypeScript LSP for TS/JS. Other languages use a bounded declaration-ranked text fallback.",
     inputSchema: positionShape
   }, async (input) => {
-    const root = activePrimaryRoot();
     const file = resolvePath(input.file);
+    const root = projectRootForPath(file);
     if (isTypeScriptFamilyFile(file)) return jsonResult(await tsDefinition({ root, ...input, file, timeoutMs: input.timeout_ms }));
     if (!input.symbol) throw new Error("Non-TypeScript definition fallback requires symbol.");
     return jsonResult(await fallbackCodeSymbolSearch(root, input.symbol, "definition"));
@@ -1609,8 +1691,8 @@ function registerCodeIntelligenceTools(mcp) {
     description: "Find symbol references with native TypeScript LSP for TS/JS. Other languages use a bounded exact-symbol text fallback.",
     inputSchema: { ...positionShape, include_declaration: z.boolean().optional(), limit: z.number().int().min(1).max(2000).optional() }
   }, async (input) => {
-    const root = activePrimaryRoot();
     const file = resolvePath(input.file);
+    const root = projectRootForPath(file);
     if (isTypeScriptFamilyFile(file)) {
       const result = await tsReferences({ root, ...input, file, includeDeclaration: input.include_declaration, timeoutMs: input.timeout_ms });
       if (input.limit && result.references.length > input.limit) {
@@ -1627,8 +1709,8 @@ function registerCodeIntelligenceTools(mcp) {
     description: "Return structured native TypeScript compiler diagnostics for one TS/JS file or the active TypeScript project.",
     inputSchema: { file: z.string().max(4000).optional(), limit: z.number().int().min(1).max(2000).optional() }
   }, async ({ file, limit }) => {
-    const root = activePrimaryRoot();
     const resolved = file ? resolvePath(file) : null;
+    const root = resolved ? projectRootForPath(resolved) : resolvePath(".");
     if (resolved && !isTypeScriptFamilyFile(resolved)) {
       return jsonResult({ supported: false, engine: "quality-gate-fallback", file: resolved, recommendation: "Use workspace_verify lint/tests/build for this language." });
     }
@@ -1640,13 +1722,13 @@ function registerCodeIntelligenceTools(mcp) {
     description: "Preview or apply a TypeScript/JavaScript LSP symbol rename. Preview is the default; apply=true enforces the active task scope guard before writing.",
     inputSchema: { ...positionShape, new_name: z.string().min(1).max(500), apply: z.boolean().optional(), task_id: TASK_ID_SCHEMA }
   }, async (input) => {
-    const root = activePrimaryRoot();
     const file = resolvePath(input.file);
+    const root = projectRootForPath(file);
     if (!isTypeScriptFamilyFile(file)) throw new Error("Safe semantic rename is currently available for TypeScript/JavaScript through TypeScript LSP.");
     const base = { root, file, symbol: input.symbol, line: input.line, column: input.column, newName: input.new_name, timeoutMs: input.timeout_ms };
     const preview = await tsRenameSymbol({ ...base, apply: false });
     const changedFiles = preview.changes.map((change) => change.file);
-    const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, changedFiles);
+    const scope = await workspaceProtocol(root).assertPathsAllowed(input.task_id, changedFiles);
     const result = input.apply === true ? await tsRenameSymbol({ ...base, apply: true }) : preview;
     return jsonResult({
       ...result,
@@ -1665,13 +1747,13 @@ function registerCodeIntelligenceTools(mcp) {
     description: "Preview or apply TypeScript LSP source.organizeImports edits. Preview is the default and writes require the active task scope guard.",
     inputSchema: { file: z.string().min(1).max(4000), apply: z.boolean().optional(), timeout_ms: z.number().int().min(1000).max(120_000).optional(), task_id: TASK_ID_SCHEMA }
   }, async (input) => {
-    const root = activePrimaryRoot();
     const file = resolvePath(input.file);
+    const root = projectRootForPath(file);
     if (!isTypeScriptFamilyFile(file)) throw new Error("Native organize-imports is currently available for TypeScript/JavaScript through TypeScript LSP.");
     const base = { root, file, timeoutMs: input.timeout_ms };
     const preview = await tsOrganizeImports({ ...base, apply: false });
     const changedFiles = preview.changes.map((change) => change.file);
-    const scope = await WORKSPACE_PROTOCOL.assertPathsAllowed(input.task_id, changedFiles);
+    const scope = await workspaceProtocol(root).assertPathsAllowed(input.task_id, changedFiles);
     const result = input.apply === true && preview.supported !== false ? await tsOrganizeImports({ ...base, apply: true }) : preview;
     return jsonResult({
       ...result,
@@ -1723,10 +1805,30 @@ function registerUiTools(mcp) {
       description: "Call one browser_* Local Browser Agent action. Trusted-local browser builds auto-authorize ordinary HTTP/HTTPS tabs without an LCA approval round-trip.",
       inputSchema: {
         tool: z.string().regex(/^browser_[a-z0-9_]+$/i),
-        arguments: z.record(z.any()).optional()
+        arguments: z.record(z.any()).optional(),
+        secret_input_values: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,79}$/)).optional()
       }
     },
-    async ({ tool, arguments: args = {} }) => await callBrowserAgentTool(tool, args)
+    async ({ tool, arguments: args = {}, secret_input_values: secretInputValues = {} }) => {
+      const refs = Object.entries(secretInputValues);
+      if (!refs.length) return await callBrowserAgentTool(tool, args);
+      if (tool !== "browser_agent") {
+        throw new Error("secret_input_values is supported only for browser_agent.");
+      }
+      const forwarded = { ...args, inputValues: { ...(args.inputValues || {}) } };
+      const secrets = [];
+      for (const [field, ref] of refs) {
+        const value = SECRET_VAULT.resolve(ref);
+        forwarded.inputValues[field] = value;
+        secrets.push(value);
+      }
+      try {
+        return redactSecretResult(await callBrowserAgentTool(tool, forwarded), secrets);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(SECRET_VAULT.redactText(message, secrets));
+      }
+    }
   );
 
   reg(
@@ -2003,7 +2105,7 @@ async function captureAndroidScreenshot(serial) {
 }
 
 async function androidArtifactDir() {
-  const dir = path.join(activePrimaryRoot(), ".agent", "artifacts", "android");
+  const dir = path.join(resolvePath("."), ".agent", "artifacts", "android");
   await mkdir(dir, { recursive: true });
   return dir;
 }
@@ -2028,6 +2130,7 @@ function registerBackendTools(mcp) {
   registerBrunoDesktopTools(mcp);
   registerPenpotMcpTools(mcp);
   registerCoolifyMcpTools(mcp);
+  registerBlenderMcpTools(mcp);
   registerNotionTools(mcp, {
     registerTool: reg,
     jsonResult,
@@ -2054,13 +2157,15 @@ function registerBackendTools(mcp) {
 function registerCompactTools(mcp) {
   compactMcpInterface.registerCompactMcpTools(mcp, {
     registerTool: reg,
-    callBackendTool: (name, args, project) =>
-      project
+    callBackendTool: (name, args, project) => {
+      const selected = resolveProjectSelection(project, ROOTS);
+      return selected
         ? CONVERSATION_RUNTIME.run({
-          primaryRoot: project,
+          primaryRoot: selected,
           correlationId: ACTION_PIPELINE.currentCorrelationId() || randomUUID()
         }, () => callLegacyTool(name, args))
-        : callLegacyTool(name, args),
+        : callLegacyTool(name, args);
+    },
     listBackendTools: async () => (await getLegacyBackendRuntime()).tools,
     registerLcaInputTool,
     structuredJsonResult
@@ -2106,7 +2211,15 @@ async function callLegacyTool(name, args = {}) {
 }
 
 const { defaultSkillsDir, discoverSkills, isWithinSkillsDir, readNotes, sanitizeSkillName, writeNotes } = createNotesSkills({
-  NOTES_PATH, PRIMARY_ROOT, ROOTS, SKILLS_DIRS
+  NOTES_PATH, PRIMARY_ROOT, ROOTS, SKILLS_DIRS, resolveDefaultRoot: () => resolvePath("."),
+  resolveNotesPath: () => path.join(workspaceStateRegistry.forRoot(projectRootForPath(resolvePath("."))).paths.workspaceDataDir, "notes.json"),
+  resolveSkillDirs: () => {
+    const selected = CONVERSATION_RUNTIME.scopedPrimaryRoot();
+    if (!selected) return SKILLS_DIRS;
+    const scopedDirs = [".claude", ".agent", ".agents"].map(dir => path.join(selected, dir, "skills"));
+    const peerDirs = new Set(ROOTS.flatMap(root => [".claude", ".agent", ".agents"].map(dir => path.join(root, dir, "skills"))));
+    return dedupe([...scopedDirs, ...SKILLS_DIRS.filter(dir => !peerDirs.has(dir))]);
+  }
 });
 
 const registerSkillTools = createSkillToolRegistrar({
@@ -2184,7 +2297,7 @@ const WORKFLOW_COMMANDS = [
 
 const { workspaceSearchData, slashCommandData, composeLcaPrompt, projectRootLabels } = createCompanionContextSearch({
   ROOTS, PRIMARY_ROOT, WORKFLOW_COMMANDS, comparePath, isWithinRoots, discoverSkills,
-  listRepoFilesFast, scanSymbols, resolvePath, toRel
+  listRepoFilesFast, scanSymbols, resolvePath, toRel, resolveDisplayPath: (value) => path.resolve(activePrimaryRoot(), value)
 });
 
 
@@ -2193,21 +2306,31 @@ const { registerCompanionAppResources, registerCompanionTools, registerLcaInputT
   DBEAVER_SQL_ARTIFACT_LEGACY_URI, DBEAVER_SQL_ARTIFACT_RESOURCE, DBEAVER_SQL_ARTIFACT_URI,
   NOTION_PAGE_WIDGET_LEGACY_URI, NOTION_PAGE_WIDGET_MIME_TYPE, NOTION_PAGE_WIDGET_RESOURCE, NOTION_PAGE_WIDGET_URI,
   CONVERSATION_RUNTIME, PRIMARY_ROOT, ROOTS, WORKFLOW_COMMANDS, activeDiscoveryRoots,
-  composeLcaPrompt, reg, resolvePath, slashCommandData, structuredJsonResult, workspaceSearchData
+  composeLcaPrompt, reg, resolvePath, resolveProjectSelection: (project) => resolveProjectSelection(project, ROOTS), slashCommandData, structuredJsonResult, workspaceSearchData
 });
 
 const scheduleAgentMemoryObservation = createAgentMemoryObservation({
-  getNextApplicationRuntime, isWithinRoots, log, PRIMARY_ROOT, resolvePath, ROOTS
+  getNextApplicationRuntime, log, inferObservationRoot: inferTelemetryRoot
 });
 
 // ----------------------------------------------------------------------------
 // Tool registration helper: audit + uniform error handling
 // ----------------------------------------------------------------------------
 function inferTelemetryRoot(args, result) {
-  for (const candidate of telemetryPathCandidates(args, result)) {
+  const reported = result?.structuredContent?.project_resolution?.workspace_root;
+  if (reported) return projectRootForPath(reported);
+  const selected = resolveProjectSelection(args?.project, ROOTS) || CONVERSATION_RUNTIME.scopedPrimaryRoot();
+  const candidates = telemetryPathCandidates(args, result);
+  for (const candidate of candidates) {
+    if (!path.isAbsolute(candidate)) continue;
+    return projectRootForPath(candidate);
+  }
+  if (selected) return projectRootForPath(selected);
+  for (const candidate of candidates) {
     try { return projectRootForPath(resolvePath(candidate)); } catch { /* ignore non-path args */ }
   }
-  return PRIMARY_ROOT;
+  if (args?.task) return projectRootForPath(resolveTaskProjectRoot(args.task, ROOTS));
+  return ROOTS.length === 1 ? ROOTS[0] : null;
 }
 
 function telemetryAction(args) {
@@ -2257,7 +2380,7 @@ function consumeActionObservation(observation) {
     inChars: observation.inChars,
     outChars: observation.outChars
   });
-  bufferRuntimeSpan(observation);
+  if (PERFORMANCE_PROFILING_ENABLED) bufferRuntimeSpan(observation);
 }
 
 function reg(mcp, name, def, handler) {
@@ -2372,7 +2495,8 @@ function workspaceInfoPayload() {
     roots: ROOTS,
     primary_root: PRIMARY_ROOT,
     conversation_primary_root: CONVERSATION_RUNTIME.scopedPrimaryRoot() || null,
-    effective_primary_root: activePrimaryRoot(),
+    effective_primary_root: CONVERSATION_RUNTIME.scopedPrimaryRoot() || (ROOTS.length === 1 ? ROOTS[0] : null),
+    project_routing_mode: ROOTS.length > 1 ? "peer-roots" : "single-root",
     discovery_roots: activeDiscoveryRoots(),
     host: { platform: os.platform(), release: os.release(), hostname: os.hostname(), cwd: process.cwd(), node: process.version },
     limits: {
@@ -2383,6 +2507,7 @@ function workspaceInfoPayload() {
     },
     running_processes: [...processes.values()].filter((p) => p.status === "running").length,
     runtime_recovery: runtimeRecoveryMetrics,
+    performance_profiling: { enabled: PERFORMANCE_PROFILING_ENABLED, persistent: PERFORMANCE_PROFILING_ENABLED, task_metrics: "memory" },
     performance: performanceTelemetry.snapshot(),
     performance_follow: performanceFollow.report({ windowDays: 30, taskClass: "user", compact: true }),
     exec_accelerator: execAccelerator.stats(),
@@ -2414,7 +2539,7 @@ const registerFsWriteTools = createFsWriteToolRegistrar({
 
 const registerExecTools = createExecToolRegistrar({
   reg, jsonResult, resolvePath, defaultShell, runShellCommand: runAcceleratedShellCommand, execAccelerator, trimOutput,
-  CMD_OUTPUT_DEFAULT, DEFAULT_CMD_TIMEOUT, MAX_COMMAND_OUTPUT
+  secretVault: SECRET_VAULT, CMD_OUTPUT_DEFAULT, DEFAULT_CMD_TIMEOUT, MAX_COMMAND_OUTPUT
 });
 
 const registerProcessTools = createProcessToolRegistrar({
@@ -2464,12 +2589,18 @@ function resolvePath(input = ".") {
   if (path.isAbsolute(raw)) return path.normalize(raw);
 
   const configured = resolveConfiguredProjectReference(raw);
+  const scoped = CONVERSATION_RUNTIME.scopedPrimaryRoot();
+  if (scoped) {
+    const target = path.normalize(configured || path.resolve(scoped, raw));
+    if (!isWithinRoots(target, [scoped]) ||
+        comparePath(projectRootForPath(target)) !== comparePath(projectRootForPath(scoped))) {
+      throw new Error(`Relative path '${raw}' conflicts with selected project '${scoped}'. Use an absolute path for intentional cross-project access.`);
+    }
+    return target;
+  }
   if (configured) return path.normalize(configured);
-
-  // Bare/default tool calls keep a deterministic workspace for backwards
-  // compatibility. Any explicit relative target uses peer-root routing below.
-  if (raw === ".") return PRIMARY_ROOT;
-  if (ROOTS.length <= 1) return path.normalize(path.resolve(PRIMARY_ROOT, raw));
+  if (ROOTS.length === 1) return path.normalize(path.resolve(ROOTS[0], raw));
+  if (raw === ".") throw new Error("Project not selected. Pass project or an explicit path; all configured projects are peers.");
 
   const candidates = ROOTS.map((root) => ({ root, target: path.resolve(root, raw) }));
   const existing = candidates.filter(({ target }) => existsSync(target));
@@ -2491,10 +2622,14 @@ function resolvePath(input = ".") {
 
 function projectRootForPath(input) {
   const target = path.resolve(input);
+  const scoped = CONVERSATION_RUNTIME.scopedPrimaryRoot();
   const candidates = ROOTS
     .filter((root) => isWithinRoots(target, [root]))
     .sort((left, right) => path.resolve(right).length - path.resolve(left).length);
-  return candidates[0] || path.dirname(target);
+  if (candidates.length) return candidates[0];
+  if (scoped && isWithinRoots(target, [scoped])) return scoped;
+  try { if (statSync(target).isDirectory()) return target; } catch { /* may be a new file */ }
+  return path.dirname(target);
 }
 
 function existingParentDepth(root, target) {
@@ -2567,8 +2702,10 @@ function isWithinRoots(p, roots = ROOTS) {
 function toRel(abs) {
   const primaryRoot = activePrimaryRoot();
   if (comparePath(abs) === comparePath(primaryRoot)) return ".";
-  const withSep = primaryRoot.endsWith(path.sep) ? primaryRoot : primaryRoot + path.sep;
-  if (comparePath(abs).startsWith(comparePath(withSep))) return abs.slice(withSep.length).split(path.sep).join("/");
+  if (isWithinRoots(abs, [primaryRoot])) {
+    const relative = path.relative(primaryRoot, abs).split(path.sep).join("/");
+    return relative + (abs.endsWith(path.sep) ? "/" : "");
+  }
   return abs;
 }
 
@@ -2612,6 +2749,17 @@ function jsonResult(value) {
   return textResult(JSON.stringify(value));
 }
 
+function redactSecretResult(value, secrets) {
+  if (typeof value === "string") return SECRET_VAULT.redactText(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => redactSecretResult(item, secrets));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, redactSecretResult(nested, secrets)])
+    );
+  }
+  return value;
+}
+
 function structuredJsonResult(value) {
   return { structuredContent: value, content: [{ type: "text", text: JSON.stringify(value) }] };
 }
@@ -2629,7 +2777,7 @@ const registerRepoIntelTools = createRepoIntelToolRegistrar({
   reg, jsonResult, resolvePath, toRel, buildRepoIndex, collectImportantFiles,
   collectWorkspaceDoctor, detectProjectProfile, getNextApplicationRuntime, indexFresh,
   isoNow, readRepoIndex, recommendNextActions, recommendedReads, relEntriesToAbs,
-  resolveTaskProjectRoot, resolveActiveProjectRoot: discoverActiveProjectRoot, scanSymbols, writeRepoIndex, workspaceStateRegistry, projectRootForPath,
+  resolveTaskProjectRoot, scopedPrimaryRoot: () => CONVERSATION_RUNTIME.scopedPrimaryRoot(), resolveActiveProjectRoot: discoverActiveProjectRoot, scanSymbols, writeRepoIndex, workspaceStateRegistry, projectRootForPath,
   changeAwareVerification, getPerformanceSnapshot: () => performanceTelemetry.snapshot(),
   traceSpan: (name, operation) => ACTION_PIPELINE.execute({ name, surface: "runtime" }, operation),
   ALLOWED_ORIGINS, AUTH_TOKEN, MANIFEST_NAMES, PRIMARY_ROOT, PRODUCT_TIER,
@@ -2637,7 +2785,19 @@ const registerRepoIntelTools = createRepoIntelToolRegistrar({
 });
 
 const registerPatchEngineTools = createPatchEngineToolRegistrar({
-  reg, jsonResult, dryRunUnifiedDiff, readPatchHistory, resolvePath, restoreBackupBatch, writePatchHistory
+  reg, jsonResult, dryRunUnifiedDiff, resolvePath, restoreBackupBatch, writePatchHistory,
+  readPatchHistory: async () => {
+    const root = resolvePath(".");
+    const history = await readPatchHistory();
+    const owns = file => isWithinRoots(file.path, [root]) &&
+      comparePath(projectRootForPath(file.path)) === comparePath(projectRootForPath(root));
+    const touching = history.filter(batch => batch.files?.some(owns));
+    const latest = touching.at(-1);
+    if (latest?.files?.some(file => !owns(file))) {
+      throw new Error("Latest patch spans multiple projects. Refusing an implicit cross-project undo.");
+    }
+    return touching;
+  }
 });
 
 // ============================================================================
@@ -2696,7 +2856,7 @@ async function cleanupRuntime() {
   await closeLegacyBackendRuntime();
   await Promise.all([
     closeFigmaDesktopClients(), closeFigmaRemoteClients(), closeDBeaverDesktopClients(),
-    closeBrunoDesktopClients(), closeCoolifyMcpClients()
+    closeBrunoDesktopClients(), closeCoolifyMcpClients(), closeBlenderMcpClients()
   ]);
 }
 

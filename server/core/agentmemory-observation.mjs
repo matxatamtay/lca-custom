@@ -1,7 +1,7 @@
 import { firstText } from "./runtime-utils.mjs";
 
 export function createAgentMemoryObservation(options) {
-  const { getNextApplicationRuntime, isWithinRoots, log, PRIMARY_ROOT, resolvePath, ROOTS } = options;
+  const { getNextApplicationRuntime, log, inferObservationRoot } = options;
 
   function scheduleAgentMemoryObservation(name, args, result, success, durationMs, outChars, errText) {
     const structured = result?.structuredContent && typeof result.structuredContent === "object"
@@ -10,9 +10,13 @@ export function createAgentMemoryObservation(options) {
     const task = name === "workspace_context" && typeof args?.task === "string" ? args.task.trim() : undefined;
     const evidence = Array.isArray(structured?.evidence) ? structured.evidence : [];
     const coverage = structured?.coverage && typeof structured.coverage === "object" ? structured.coverage : undefined;
+    // Ambiguous/global requests must not contaminate an unrelated project's memory.
+    let root;
+    try { root = inferObservationRoot(args, result); } catch { return; }
+    if (!root) return;
     const observation = {
       tool: name,
-      root: inferObservationRoot(args),
+      root,
       argsSummary: memorySafeArgsSummary(args),
       outputSummary: name === "workspace_context"
         ? firstText(result).slice(0, 500)
@@ -49,21 +53,6 @@ export function createAgentMemoryObservation(options) {
     const why = typeof forwarded.why === "string" ? forwarded.why.trim() : "";
     if (!decision || !why) return null;
     return { root, decision, why };
-  }
-
-  function inferObservationRoot(args) {
-    const nested = args?.arguments && typeof args.arguments === "object" ? args.arguments : {};
-    const candidates = [args?.root, args?.path, args?.cwd, nested.root, nested.path, nested.cwd];
-    for (const candidate of candidates) {
-      if (typeof candidate !== "string" || !candidate.trim()) continue;
-      try {
-        const resolved = resolvePath(candidate);
-        return ROOTS.find((root) => isWithinRoots(resolved, [root])) || PRIMARY_ROOT;
-      } catch {
-        // Ignore optional path-like arguments that are not workspace paths.
-      }
-    }
-    return PRIMARY_ROOT;
   }
 
   function memorySafeArgsSummary(args) {

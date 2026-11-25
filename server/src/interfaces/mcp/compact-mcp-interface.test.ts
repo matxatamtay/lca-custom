@@ -43,6 +43,14 @@ test("every alias resolves to a tool allowed by its facade", () => {
 test("workspace_edit batch alias resolves to transactional apply_patch", () => {
   assert.equal(resolveCompactAction("workspace_edit", "batch", backendTools), "apply_patch");
   assert.match(COMPACT_SERVER_INSTRUCTIONS, /action=batch\/apply_patch/);
+  assert.match(COMPACT_SERVER_INSTRUCTIONS, /workspace_exec action=many with parallel=true/);
+});
+
+test("workspace_ui exposes Blender without adding another public facade", () => {
+  assert.equal(resolveCompactAction("workspace_ui", "blender", backendTools), "blender_status");
+  assert.equal(resolveCompactAction("workspace_ui", "blender_actions", backendTools), "blender_list_tools");
+  assert.equal(resolveCompactAction("workspace_ui", "blender_call", backendTools), "blender_call_tool");
+  assert.match(COMPACT_SERVER_INSTRUCTIONS, /workspace_ui blender_\* actions for Blender/);
 });
 
 test("unknown and cross-facade actions are rejected", () => {

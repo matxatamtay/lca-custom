@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type {
   ContextEvidence,
   ContextRanking,
@@ -12,12 +14,13 @@ export const DEFAULT_JEV_API_URL = "https://api.typesafe.ai/v1/systemone";
 export const DEFAULT_JEV_MODEL = "jev-latest";
 
 const DEFAULT_TIMEOUT_MS = 1_500;
-const DEFAULT_MAX_CANDIDATES = 24;
+const DEFAULT_MAX_CANDIDATES = 12;
 const DEFAULT_MAX_STATE_CHARS = 24_000;
 const DEFAULT_SCORE_WEIGHT = 30;
 const DEFAULT_MIN_CONFIDENCE = 0.35;
 const DEFAULT_CIRCUIT_FAILURES = 3;
 const DEFAULT_CIRCUIT_OPEN_MS = 30_000;
+const DEFAULT_RESULT_CACHE_LIMIT = 64;
 
 type FetchLike = typeof globalThis.fetch;
 
@@ -96,6 +99,7 @@ export class JevContextReranker implements ContextRerankerPort {
   private readonly now: () => number;
   private consecutiveFailures = 0;
   private circuitOpenUntil = 0;
+  private readonly resultCache = new Map<string, ContextRerankResult>();
 
   constructor(options: JevContextRerankerOptions) {
     const apiToken = String(options.apiToken ?? "").trim();
@@ -173,6 +177,13 @@ export class JevContextReranker implements ContextRerankerPort {
         };
       }
 
+      const cacheKey = resultCacheKey(request, activeCandidates, prepared.payload, this.model);
+      const cached = this.resultCache.get(cacheKey);
+      if (cached) {
+        this.touchResultCache(cacheKey, cached);
+        return reuseCachedResult(cached, evidence);
+      }
+
       const response = await fetchWithTimeout(
         this.fetchImpl,
         this.endpoint,
@@ -246,10 +257,9 @@ export class JevContextReranker implements ContextRerankerPort {
       }
 
       if (accepted === 0) throw new JevFallbackError("low-confidence");
-
       this.consecutiveFailures = 0;
       this.circuitOpenUntil = 0;
-      return {
+      const result: ContextRerankResult = {
         evidence: evidence.map((item) => replacements.get(selectionKey(item)) ?? item),
         ranking: {
           provider: "jev",
@@ -264,6 +274,8 @@ export class JevContextReranker implements ContextRerankerPort {
           ...(sufficiency ? { sufficiencyConfidence: round(sufficiencyConfidence!) } : {})
         }
       };
+      this.storeResultCache(cacheKey, result);
+      return result;
     } catch (error) {
       const reason = fallbackReason(error);
       this.consecutiveFailures += 1;
@@ -285,6 +297,72 @@ export class JevContextReranker implements ContextRerankerPort {
       };
     }
   }
+
+  private storeResultCache(key: string, value: ContextRerankResult): void {
+    this.resultCache.delete(key);
+    this.resultCache.set(key, value);
+    while (this.resultCache.size > DEFAULT_RESULT_CACHE_LIMIT) {
+      const oldest = this.resultCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.resultCache.delete(oldest);
+    }
+  }
+
+  private touchResultCache(key: string, value: ContextRerankResult): void {
+    this.resultCache.delete(key);
+    this.resultCache.set(key, value);
+  }
+}
+
+function resultCacheKey(
+  request: TaskContextRequest,
+  candidates: readonly ContextEvidence[],
+  payload: Readonly<Record<string, unknown>>,
+  model: string
+): string {
+  const hash = createHash("sha256");
+  hash.update(model);
+  hash.update("\u0000");
+  hash.update(request.root);
+  hash.update("\u0000");
+  hash.update(String(payload.state ?? ""));
+  for (const candidate of candidates) {
+    hash.update("\u0000");
+    hash.update(selectionKey(candidate));
+    hash.update("\u0000");
+    hash.update(String(candidate.score ?? 0));
+  }
+  return hash.digest("hex");
+}
+
+function reuseCachedResult(
+  cached: ContextRerankResult,
+  evidence: readonly ContextEvidence[]
+): ContextRerankResult {
+  const cachedByKey = new Map(cached.evidence.map((item) => [selectionKey(item), item]));
+  return {
+    evidence: evidence.map((item) => {
+      const previous = cachedByKey.get(selectionKey(item));
+      const jevRerank = previous?.metadata?.jevRerank;
+      if (!previous || !jevRerank || typeof jevRerank !== "object") return item;
+      return {
+        ...item,
+        ...(previous.score !== undefined ? { score: previous.score } : {}),
+        metadata: {
+          ...(item.metadata ?? {}),
+          jevRerank: {
+            ...(jevRerank as Readonly<Record<string, unknown>>),
+            cache_hit: true,
+            cache_layer: "jev-exact"
+          }
+        }
+      };
+    }),
+    ranking: {
+      ...cached.ranking,
+      latencyMs: 0
+    }
+  };
 }
 
 function buildRequestPayload(

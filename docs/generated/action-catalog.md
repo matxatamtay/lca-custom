@@ -82,17 +82,20 @@ Aliases:
 
 ## `workspace_exec`
 
-Run bounded foreground commands. Common actions: one or many.
+Run bounded foreground commands. Default to action=many for related commands; set parallel=true for independent work and use id + depends_on for dependency DAGs. Reserve action=one for a genuinely single command.
 
 - Default: `run_commands`
 - Prefix: none
-- Explicit backend actions: `parallel_tasks`, `run_code`, `run_command`, `run_commands`
+- Explicit backend actions: `parallel_tasks`, `run_code`, `run_command`, `run_commands`, `secret_forget`, `secret_prompt`, `secret_status`
 
 Aliases:
 - `code` → `run_code`
+- `forget_secret` → `secret_forget`
 - `many` → `run_commands`
 - `one` → `run_command`
 - `parallel` → `parallel_tasks`
+- `secret` → `secret_prompt`
+- `secrets` → `secret_status`
 
 ## `workspace_process`
 
@@ -155,14 +158,18 @@ Aliases:
 
 ## `workspace_ui`
 
-Inspect and control trusted-local browser tabs and connected Android devices.
+Inspect and control trusted-local browser tabs, connected Android devices, and the pinned Blender MCP integration. Blender actions: blender, blender_status, blender_actions, blender_call.
 
 - Default: `ui_status`
 - Prefix: `ui_*`
-- Explicit backend actions: `ui_android_adb`, `ui_android_devices`, `ui_android_hierarchy`, `ui_android_input`, `ui_android_logcat`, `ui_android_record`, `ui_android_screenshot`, `ui_browser_actions`, `ui_browser_call`, `ui_status`
+- Explicit backend actions: `blender_call_tool`, `blender_list_tools`, `blender_status`, `ui_android_adb`, `ui_android_devices`, `ui_android_hierarchy`, `ui_android_input`, `ui_android_logcat`, `ui_android_record`, `ui_android_screenshot`, `ui_browser_actions`, `ui_browser_call`, `ui_status`
 
 Aliases:
 - `adb` → `ui_android_adb`
+- `blender` → `blender_status`
+- `blender_actions` → `blender_list_tools`
+- `blender_call` → `blender_call_tool`
+- `blender_status` → `blender_status`
 - `browser_actions` → `ui_browser_actions`
 - `browser_call` → `ui_browser_call`
 - `devices` → `ui_android_devices`
@@ -259,7 +266,7 @@ Aliases:
 
 ## `penpot`
 
-Use the local Penpot MCP integration. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.
+Use Penpot Cloud and local MCP concurrently. Pass arguments.source=cloud or local for any action; status without source shows both; other actions default to local. Common actions: status, actions, read, inspect, selection, export, mutate, destructive, call, or an exact penpot_* backend action.
 
 - Default: `penpot_status`
 - Prefix: `penpot_*`

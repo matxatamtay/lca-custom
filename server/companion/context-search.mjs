@@ -4,7 +4,7 @@ import path from "node:path";
 export function createCompanionContextSearch(options) {
   const {
     ROOTS, PRIMARY_ROOT, WORKFLOW_COMMANDS, comparePath, isWithinRoots, discoverSkills,
-    listRepoFilesFast, scanSymbols, resolvePath, toRel
+    listRepoFilesFast, scanSymbols, resolvePath, toRel, resolveDisplayPath = (value) => path.resolve(PRIMARY_ROOT, value)
   } = options;
 
   function normalizePickerQuery(value, prefix = "@") {
@@ -227,7 +227,7 @@ export function createCompanionContextSearch(options) {
       if (wanted.has("symbol")) {
         const symbols = await scanSymbols(rootDir, { maxFiles: 600, maxMatches: 2000, files: listed.files });
         for (const sym of symbols) {
-          const abs = path.isAbsolute(sym.path) ? sym.path : path.resolve(PRIMARY_ROOT, sym.path);
+          const abs = path.isAbsolute(sym.path) ? sym.path : resolveDisplayPath(sym.path);
           const rel = projectRelativePath(projectRoot, abs);
           const display = `${project}/${rel}`;
           const symbolMention = `${project}:${sym.name}`;

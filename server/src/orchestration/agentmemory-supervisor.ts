@@ -161,6 +161,7 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
   private stderrTail = "";
   private readonly cliPath: string;
   private readonly runtimeDirectory: string;
+  private readonly packageDirectory: string;
   private readonly enginePort: number;
 
   constructor(private readonly options: AgentMemoryCliControllerOptions) {
@@ -174,6 +175,7 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
       "dist",
       "cli.mjs"
     );
+    this.packageDirectory = path.dirname(path.dirname(this.cliPath));
   }
 
   async start(): Promise<void> {
@@ -188,7 +190,7 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
     await this.recoverOrphanEngine();
 
     const child = spawn(process.execPath, [this.cliPath], {
-      cwd: this.runtimeDirectory,
+      cwd: this.packageDirectory,
       env: this.runtimeEnvironment(),
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
@@ -283,7 +285,7 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
     } catch {}
 
     await execFileAsync(process.execPath, [this.cliPath, "init"], {
-      cwd: this.runtimeDirectory,
+      cwd: this.packageDirectory,
       env: { ...process.env, CI: "1", ...(this.options.env ?? {}) },
       timeout: 30_000,
       maxBuffer: 1024 * 1024,
@@ -323,7 +325,7 @@ export class AgentMemoryCliController implements AgentMemoryRuntimeController {
 
   private async stopRuntime(): Promise<void> {
     await execFileAsync(process.execPath, [this.cliPath, "stop", "--force"], {
-      cwd: this.runtimeDirectory,
+      cwd: this.packageDirectory,
       env: this.runtimeEnvironment(),
       timeout: 120_000,
       maxBuffer: 2 * 1024 * 1024,

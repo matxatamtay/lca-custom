@@ -9,11 +9,11 @@ Total compact tools: **19**.
 | 2 | `workspace_search` | Search files, text, symbols, graph relationships, and remembered project context. |
 | 3 | `workspace_read` | Read one or many files and targeted line ranges. |
 | 4 | `workspace_edit` | Apply related edits and optionally verify changed files in the same call. |
-| 5 | `workspace_exec` | Run bounded foreground commands. |
+| 5 | `workspace_exec` | Run bounded foreground commands; batch independent commands in parallel and express dependencies as a DAG. |
 | 6 | `workspace_process` | Start, inspect, and stop managed background processes. |
 | 7 | `workspace_git` | Run Git operations and return compact repository state. |
 | 8 | `workspace_verify` | Detect and run focused lint, typecheck, test, and build gates. |
-| 9 | `workspace_ui` | Inspect and control trusted-local browser tabs and connected Android devices without LCA approval round-trips. |
+| 9 | `workspace_ui` | Inspect and control trusted-local browser tabs, Android devices, and Blender without LCA approval round-trips. |
 | 10 | `workspace_status` | Return runtime, dependency, project, graph-index, and memory health. |
 | 11 | `workspace_skill` | Discover, read, create, and delete reusable project skills. |
 | 12 | `figma` | Call the persistent Figma Desktop integration through named actions. |

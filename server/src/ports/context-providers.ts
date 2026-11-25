@@ -56,6 +56,7 @@ export interface SemanticContextPort {
 
 export interface MemoryPort {
   recall(request: TaskContextRequest): Promise<readonly ContextEvidence[]>;
+  telemetry?(root: string): Readonly<Record<string, unknown>> | undefined;
 }
 
 export interface ContextRerankResult {

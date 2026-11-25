@@ -59,7 +59,8 @@ async function startServer(workspace) {
       AGENT_EXTRA_ROOTS_JSON: "[]",
       AGENTMEMORY_RECORD_SESSIONS: "0",
       MCP_AUTH_TOKEN: "",
-      AGENT_AUDIT: "0"
+      AGENT_AUDIT: "0",
+      AGENT_PERFORMANCE_PROFILING: "1"
     },
     windowsHide: true,
     stdio: ["ignore", "ignore", "pipe"]
@@ -133,7 +134,10 @@ try {
 
   const duplicated = [...assigned.entries()].filter(([, groups]) => groups.length !== 1);
   assert.deepEqual(duplicated, [], `hidden tools assigned to multiple facades: ${JSON.stringify(duplicated)}`);
-  assert.equal(assigned.size, 176, `expected complete merged internal backend coverage, received ${assigned.size} actions`);
+  assert.equal(assigned.size, 179, `expected complete merged internal backend coverage, received ${assigned.size} actions`);
+  for (const action of ["secret_prompt", "secret_status", "secret_forget"]) {
+    assert.deepEqual(assigned.get(action), ["workspace_exec"], `${action} must stay behind workspace_exec`);
+  }
   for (const action of ["worktree_create", "worktree_status", "worktree_diff", "worktree_check", "worktree_gc", "worktree_cleanup"]) {
     assert.deepEqual(assigned.get(action), ["workspace_git"], `${action} must stay behind workspace_git`);
   }

@@ -44,10 +44,12 @@ export function classifyCommandFamily(command) {
 
 export function createPerformanceFollow(options = {}) {
   const {
-    filePath = null,
+    filePath: requestedFilePath = null,
+    enabled = true,
     now = () => Date.now(),
     maxSamples = DEFAULT_MAX_SAMPLES
   } = options;
+  const filePath = enabled ? requestedFilePath : null;
   const state = { version: VERSION, samples: [], last_error: null, sequence: 0 };
   let flushTimer = null;
   let flushPromise = null;
@@ -66,6 +68,7 @@ export function createPerformanceFollow(options = {}) {
   }
 
   function recordToolCall(input = {}) {
+    if (!enabled) return;
     const timestamp = now();
     const root = safeText(input.root, 500);
     const trace = input.trace || {};
@@ -146,7 +149,7 @@ export function createPerformanceFollow(options = {}) {
           duration_ms: round(value?.latencyMs || 0),
           hits: boundedNumber(value?.hits),
           success: value?.status !== "error",
-          ...cacheFields(providerEvidence),
+          ...cacheFields([providerEvidence, value?.details]),
           ...(value?.details && typeof value.details === "object" ? { details: sanitizeDetails(value.details) } : {})
         });
       }
@@ -188,6 +191,7 @@ export function createPerformanceFollow(options = {}) {
   }
 
   function recordRuntimeSpans(input = {}) {
+    if (!enabled) return { recorded: 0 };
     const root = safeText(input.root, 500);
     const trace = input.trace || {};
     const spans = Array.isArray(input.spans) ? input.spans : [];
@@ -223,6 +227,7 @@ export function createPerformanceFollow(options = {}) {
   }
 
   function recordPrewarm(input = {}) {
+    if (!enabled) return;
     const root = safeText(input.root, 500);
     if (!root) return;
     append({
@@ -333,7 +338,7 @@ export function createPerformanceFollow(options = {}) {
       cache_efficiency: {
         checks: cacheChecks,
         hits: cacheHits,
-        hit_ratio: cacheChecks ? round(cacheHits / cacheChecks) : null
+        hit_ratio: cacheChecks ? roundRatio(cacheHits / cacheChecks) : null
       },
       provider_cache: providerCacheSummary(samples),
       prewarm: prewarmSummary(contexts, prewarms),
@@ -363,7 +368,12 @@ export function createPerformanceFollow(options = {}) {
       test_duration_ms: metrics(testCommands),
       codegraph: {
         index_ms: metrics(codegraphIndex),
-        query_ms: metrics(codegraphQuery)
+        query_ms: metrics(codegraphQuery),
+        stage_cache: {
+          sampled_contexts: codegraphProviders.length,
+          contexts_with_reuse: codegraphProviders.filter((sample) => Number(sample.details?.stage_cache_hits || 0) > 0).length,
+          total_stage_hits: codegraphProviders.reduce((sum, sample) => sum + Math.max(0, Number(sample.details?.stage_cache_hits || 0)), 0)
+        }
       },
       semgrep: {
         samples: semgrepSensors.length,
@@ -429,9 +439,10 @@ export function createPerformanceFollow(options = {}) {
       providers: providers.slice(0, compact ? 4 : 10),
       ...(includeTimeline ? { timeline: buildTimeline(samples) } : {}),
       storage: {
+        enabled,
         persisted: Boolean(filePath),
         retained_samples: state.samples.length,
-        max_samples: maxSamples,
+        max_samples: enabled ? maxSamples : 0,
         oldest_ts: oldest,
         newest_ts: newest
       },
@@ -603,9 +614,10 @@ function providerCacheSummary(samples) {
   const providers = samples.filter((sample) => sample.kind === "provider");
   return Object.fromEntries([...new Set(providers.map((sample) => sample.name))].map((name) => {
     const group = providers.filter((sample) => sample.name === name);
-    const checks = group.reduce((sum, sample) => sum + Number(sample.cache_checks || (typeof sample.cache_hit === "boolean" ? 1 : 0)), 0);
-    const hits = group.reduce((sum, sample) => sum + Number(sample.cache_hits || (sample.cache_hit === true ? 1 : 0)), 0);
-    return [name, { checks, hits, hit_ratio: checks ? round(hits / checks) : null }];
+    const checked = group.filter((sample) => typeof sample.cache_hit === "boolean");
+    const checks = checked.length;
+    const hits = checked.filter((sample) => sample.cache_hit === true).length;
+    return [name, { checks, hits, hit_ratio: checks ? roundRatio(hits / checks) : null }];
   }));
 }
 
@@ -654,7 +666,7 @@ function sanitizePrewarmProviders(value) {
 function sanitizeDetails(value) {
   const allowed = {};
   for (const [key, item] of Object.entries(value || {})) {
-    if (!["index_ms", "query_ms", "prewarm_ms", "route", "cache_hit", "index_synced", "language", "engine", "state", "available"].includes(key)) continue;
+    if (!["index_ms", "query_ms", "prewarm_ms", "route", "cache_hit", "index_cache_hit", "prewarm_cache_hit", "index_synced", "stage_cache_hits", "language", "engine", "state", "available"].includes(key)) continue;
     if (typeof item === "string" || typeof item === "number" || typeof item === "boolean" || item === null) allowed[key] = item;
   }
   return allowed;
@@ -704,7 +716,7 @@ function metrics(samples) {
     p95_ms: percentile(durations, 0.95),
     max_ms: durations.length ? round(durations[durations.length - 1]) : 0,
     failures: samples.filter((sample) => sample.success === false).length,
-    cache_hit_ratio: cacheSamples.length ? round(cacheSamples.filter((sample) => sample.cache_hit).length / cacheSamples.length) : null
+    cache_hit_ratio: cacheSamples.length ? roundRatio(cacheSamples.filter((sample) => sample.cache_hit).length / cacheSamples.length) : null
   };
 }
 
@@ -719,7 +731,7 @@ function cacheFields(value) {
       return;
     }
     for (const [key, item] of Object.entries(node)) {
-      if (["cache_hit", "prefetch_hit", "cached"].includes(key) && typeof item === "boolean") signals.push(item);
+      if (["cache_hit", "prefetch_hit", "cached", "index_cache_hit"].includes(key) && typeof item === "boolean") signals.push(item);
       else if (item && typeof item === "object") visit(item, depth + 1);
     }
   };

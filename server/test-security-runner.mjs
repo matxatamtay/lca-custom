@@ -23,6 +23,7 @@ const server = spawn(process.execPath, ["server.mjs"], {
     AGENT_HOST: "127.0.0.1",
     AGENT_WORKSPACE: workspace,
     AGENT_EXTRA_ROOTS: "",
+    AGENT_EXTRA_ROOTS_JSON: "[]",
     AGENTMEMORY_RECORD_SESSIONS: "0",
     AGENT_AUDIT: "1",
     AGENT_HTTP_LOG: "0",

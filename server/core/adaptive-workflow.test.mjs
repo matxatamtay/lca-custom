@@ -35,6 +35,8 @@ test("high-signal implementation chooses one batch edit with fused changed verif
   }]);
   assert.ok(workflow.reasons.some((reason) => reason.startsWith("telemetry:high-roundtrips")));
   assert.ok(workflow.reasons.some((reason) => reason.startsWith("telemetry:batch-edits")));
+  assert.equal(workflow.batching.avoid_exec_one, true);
+  assert.equal(workflow.batching.parallel_independent_exec, true);
 });
 
 test("debug and low-signal tasks inspect the smallest target set before batch editing", () => {
@@ -51,6 +53,7 @@ test("debug and low-signal tasks inspect the smallest target set before batch ed
   assert.equal(workflow.roundtrip_target, 2);
   assert.equal(workflow.recommended_calls[0].tool, "workspace_read");
   assert.deepEqual(workflow.recommended_calls[0].paths, ["/repo/src/a.ts", "/repo/src/b.ts"]);
+  assert.equal(workflow.recommended_calls[0].concurrency, 2);
   assert.equal(workflow.recommended_calls[1].action, "batch");
 });
 
